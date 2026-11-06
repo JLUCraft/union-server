@@ -8,6 +8,8 @@ Keep sibling `union-core` and `minecraftd` checkouts available. The production e
 
 ## Network operations
 
+League discovery exposes `Discovered::to_json()` for terminal adapters. Its `services` array contains objects with `id`, `name`, and `protocol`; service metadata is omitted.
+
 The `services.operations` service manages the locally configured Minecraft instances. In addition to lifecycle and recent-output operations, its request schema exposes capabilities, host/instance metrics, single-line game console commands, paginated jobs and audit records, and backup creation, verification, restoration, listing, and deletion. The schema is defined only in `union-core/crates/protocol/src/lib.rs`.
 
 ```json

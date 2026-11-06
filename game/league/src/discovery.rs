@@ -25,6 +25,25 @@ pub struct Discovered {
     pub services: Vec<crate::protocol::ServiceRecord>,
 }
 
+impl Discovered {
+    /// Terminal discovery payload; service metadata stays outside this public view.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "peer": self.peer.to_string(),
+            "address": self.address,
+            "federation": self.federation,
+            "genesis": self.genesis,
+            "genesis_hash": self.genesis_hash,
+            "application": self.application,
+            "services": self.services.iter().map(|service| serde_json::json!({
+                "id": service.id,
+                "name": service.name,
+                "protocol": service.protocol,
+            })).collect::<Vec<_>>(),
+        })
+    }
+}
+
 /// mDNS announcements hand out every local interface, including unreachable virtual
 /// ones. Probe each candidate with a throwaway node and keep the first that answers.
 async fn probe_address(peer: PeerId, candidates: Vec<crate::Multiaddr>) -> Option<String> {
@@ -136,6 +155,49 @@ pub async fn connect_pinned(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_json_preserves_fields_and_projects_services() {
+        let mut server = Discovered {
+            federation: "JLUCraft".into(),
+            peer: Identity::generate().peer_id(),
+            address: "/ip4/127.0.0.1/udp/40000/quic-v1".into(),
+            genesis: TrustGenesis {
+                federation: "JLUCraft".into(),
+                founders: Vec::new(),
+                quorum: 1,
+            },
+            genesis_hash: "a".repeat(64),
+            application: Some("b".repeat(64)),
+            services: vec![crate::protocol::ServiceRecord {
+                id: "operations".into(),
+                name: "Server operations".into(),
+                protocol: "/operations/1".into(),
+                metadata: b"private metadata".to_vec(),
+            }],
+        };
+        assert_eq!(
+            server.to_json(),
+            serde_json::json!({
+                "peer": server.peer.to_string(),
+                "address": server.address,
+                "federation": "JLUCraft",
+                "genesis": {"federation": "JLUCraft", "founders": [], "quorum": 1},
+                "genesis_hash": "a".repeat(64),
+                "application": "b".repeat(64),
+                "services": [{
+                    "id": "operations",
+                    "name": "Server operations",
+                    "protocol": "/operations/1",
+                }],
+            })
+        );
+        server.services.clear();
+        server.application = None;
+        let value = server.to_json();
+        assert_eq!(value["services"], serde_json::json!([]));
+        assert_eq!(value["application"], serde_json::Value::Null);
+    }
 
     #[tokio::test]
     async fn failed_candidate_does_not_cancel_a_reachable_probe() -> Result<()> {
