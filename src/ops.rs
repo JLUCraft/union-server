@@ -395,22 +395,30 @@ fn authorize_operation(
         }
         OpsOp::RestoreBackup { .. } => "restore",
     };
+    let mut authority_unavailable = None;
     for permission in ["manage", permission] {
         let requirement = node::protocol::TrustRequirement {
             clubs: Default::default(),
             permission: Some(permission.into()),
         };
-        if view
-            .authorize(
-                &peer.to_string(),
-                &audience.to_string(),
-                &service.to_string(),
-                &requirement,
-            )
-            .is_ok()
-        {
-            return Ok(());
+        match view.authorize(
+            &peer.to_string(),
+            &audience.to_string(),
+            &service.to_string(),
+            &requirement,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(error @ node::protocol::Error::AuthorityUnavailable) => {
+                authority_unavailable = Some(error);
+            }
+            Err(_) => {}
         }
+    }
+    if let Some(error) = authority_unavailable {
+        return Err(crate::ops_extended::fault(
+            node::protocol::OpsErrorCode::AuthorityUnavailable,
+            error.to_string(),
+        ));
     }
     Err(crate::ops_extended::fault(
         node::protocol::OpsErrorCode::PermissionDenied,
@@ -451,7 +459,11 @@ fn authorize_request(
             },
         )
         .map_err(|error| {
-            crate::ops_extended::fault(OpsErrorCode::PermissionDenied, error.to_string())
+            let code = match error {
+                node::protocol::Error::AuthorityUnavailable => OpsErrorCode::AuthorityUnavailable,
+                _ => OpsErrorCode::PermissionDenied,
+            };
+            crate::ops_extended::fault(code, error.to_string())
         })?;
         let now = authority::journal::now_ms()?;
         let signed_request =
@@ -692,6 +704,117 @@ mod tests {
             crate::ops_extended::error_response(&result.unwrap_err()).code,
             code
         );
+    }
+
+    #[test]
+    fn ops_read_with_stale_identity_returns_authority_unavailable() -> Result<()> {
+        let fixture = DelegationFixture::new("mcp_relay");
+        let view = fixture.identities.log.view(Duration::from_secs(60))?;
+        let request = OpsRequest {
+            op: OpsOp::ListInstances {},
+            delegation: None,
+        };
+        let cache = identity::mcp_envelope::ReplayCache::default();
+        fixture.identities.log.mark_stale();
+        let error = authorize_request(
+            &view,
+            fixture.host.peer_id(),
+            fixture.service,
+            fixture.signer.peer_id(),
+            &request,
+            &cache,
+        )
+        .unwrap_err();
+        let response = crate::ops_extended::error_response(&error);
+        assert_eq!(
+            response.code,
+            node::protocol::OpsErrorCode::AuthorityUnavailable
+        );
+        assert_eq!(
+            response.message,
+            node::protocol::Error::AuthorityUnavailable.to_string()
+        );
+        let json = serde_json::to_value(&response)?;
+        assert_eq!(json["code"], "authority_unavailable");
+        assert_eq!(
+            serde_json::from_value::<node::protocol::OpsError>(json)?,
+            response
+        );
+
+        fixture.identities.log.mark_current()?;
+        assert_eq!(
+            authorize_request(
+                &view,
+                fixture.host.peer_id(),
+                fixture.service,
+                fixture.signer.peer_id(),
+                &request,
+                &cache,
+            )?,
+            fixture.signer.peer_id()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ops_read_without_permission_returns_permission_denied() -> Result<()> {
+        let fixture = DelegationFixture::new("mcp_relay");
+        let view = fixture.identities.log.view(Duration::from_secs(60))?;
+        let error = authorize_request(
+            &view,
+            fixture.host.peer_id(),
+            fixture.service,
+            fixture.relay.peer_id(),
+            &OpsRequest {
+                op: OpsOp::ListInstances {},
+                delegation: None,
+            },
+            &Default::default(),
+        )
+        .unwrap_err();
+        let response = crate::ops_extended::error_response(&error);
+        assert_eq!(
+            response.code,
+            node::protocol::OpsErrorCode::PermissionDenied
+        );
+        assert_eq!(
+            response.message,
+            "operation requires manage or read permission"
+        );
+        assert_eq!(
+            serde_json::to_value(&response)?["code"],
+            "permission_denied"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn delegation_relay_with_stale_identity_returns_authority_unavailable() -> Result<()> {
+        let fixture = DelegationFixture::new("mcp_relay");
+        let request = fixture.request("ops_capabilities", serde_json::json!({}));
+        let cache = identity::mcp_envelope::ReplayCache::default();
+        fixture.identities.log.mark_stale();
+        let error = fixture.authorize(&request, &cache).unwrap_err();
+        let response = crate::ops_extended::error_response(&error);
+        assert_eq!(
+            response.code,
+            node::protocol::OpsErrorCode::AuthorityUnavailable
+        );
+        assert_eq!(
+            response.message,
+            node::protocol::Error::AuthorityUnavailable.to_string()
+        );
+        assert_eq!(
+            serde_json::to_value(&response)?["code"],
+            "authority_unavailable"
+        );
+
+        fixture.identities.log.mark_current()?;
+        assert_eq!(
+            fixture.authorize(&request, &cache)?,
+            fixture.signer.peer_id()
+        );
+        Ok(())
     }
 
     #[test]
