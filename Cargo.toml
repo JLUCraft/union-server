@@ -1,5 +1,6 @@
 [package]
 name = "federated-server"
+default-run = "federated-server"
 version = "0.2.0"
 edition = "2024"
 authors = ["JLUCraft"]
@@ -63,6 +64,10 @@ server = ["authority/consensus"]
 name = "federated-server"
 path = "src/main.rs"
 required-features = ["server"]
+
+[[bin]]
+name = "jlucraft-agent"
+path = "src/bin/jlucraft-agent/main.rs"
 
 # Explicitly built acceptance fixture, never installed as a production terminal.
 [[example]]

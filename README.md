@@ -105,3 +105,40 @@ FOUNDER_MANIFEST="$PWD/tests/fixtures/founders.json" cargo test --locked -- --te
 ```
 
 Read [AGENTS.md](AGENTS.md) before making changes.
+
+## Local agent signing
+
+Build the second binary with `cargo build --locked --bin jlucraft-agent`. Keep the
+identity key on the agent's machine, outside the repository and service host.
+
+```sh
+jlucraft-agent keygen --out /absolute/private/path/agent.key
+jlucraft-agent public --key /absolute/private/path/agent.key
+jlucraft-agent sign-command --key /absolute/private/path/agent.key --input command.json
+jlucraft-agent sign-record --key /absolute/private/path/agent.key --input - < record.json
+```
+
+`keygen` creates an Ed25519 key in the existing protobuf key format, with mode
+0600 on Unix, and refuses to overwrite an existing path. On Windows, use a
+directory protected by the user's ACL. Both `keygen` and `public` return
+`{"peer":"<peer-id>","public_key":"<base64pad>"}`; the public key is protobuf-encoded.
+Private key material is written only to the key file.
+
+Both signing commands accept a JSON file path, an inline JSON object, or `-` for
+stdin. `sign-command` reads `TrustedCommand<league::application::Application>`
+with `genesis`, `previous`, `identity`, and `command` fields. Use the trusted
+snapshot's genesis hash, journal head, identity checkpoint, and revision; set
+`command.expires_ms` and `command.action` before signing. Its output contains
+`payload`, `public_key`, and `signature`, all in standard padded base64. Supply
+this object as `application_submit`'s `command` argument.
+
+`sign-record` reads a `TrustRecord` and adds the local signature while retaining
+existing signatures. Its output uses the identity log's original JSON format,
+including byte arrays in `signatures`, and can be sent directly as
+`identity_submit` arguments or as the `record` in `TrustRequest::Append`.
+Duplicate signatures from the same key are rejected. Review the record against
+your trusted identity history before signing; signing alone does not establish
+authorization or freshness. Request envelopes are signed separately.
+
+Successful operations write one JSON object to stdout. Failures exit nonzero
+with diagnostics on stderr and no JSON output.
