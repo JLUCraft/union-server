@@ -26,6 +26,7 @@ use sysinfo::{Disks, Pid, ProcessesToUpdate, System};
 use tokio::{sync::Mutex, task::JoinSet, time::timeout};
 
 const MAX_COMMAND_BYTES: usize = 1024;
+const COMMAND_OUTPUT_LINES: usize = 100;
 const MAX_IDEMPOTENCY_BYTES: usize = 128;
 const MAX_LABEL_BYTES: usize = 128;
 const MAX_JOBS: usize = 256;
@@ -630,24 +631,44 @@ async fn execute_command(fleet: &Fleet, instance: &str, command: &str) -> Result
         .clone()
         .try_lock_owned()
         .map_err(|_| fault(OpsErrorCode::Busy, "instance operation already in progress"))?;
-    let before = managed.instance.recent_output(100).await?;
+    let (before_start, before) = managed
+        .instance
+        .recent_output_with_offset(COMMAND_OUTPUT_LINES)
+        .await?;
+    let before_end = before_start + before.len() as u64;
     managed.instance.send_command(command.into()).await?;
     timeout(COMMAND_OUTPUT_TIMEOUT, async {
         loop {
-            let after = managed.instance.recent_output(100).await?;
-            let common = before
-                .iter()
-                .zip(&after)
-                .take_while(|(before, after)| before == after)
-                .count();
-            if after != before && after.len() > common {
-                return Ok(after[common..].join("\n"));
+            let (after_start, after) = managed
+                .instance
+                .recent_output_with_offset(COMMAND_OUTPUT_LINES)
+                .await?;
+            if let Some(output) = command_output_since(before_end, after_start, &after) {
+                return Ok(output);
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
     .await
     .unwrap_or_else(|_| Ok(String::new()))
+}
+
+fn command_output_since(before_end: u64, after_start: u64, after: &[String]) -> Option<String> {
+    let skip = before_end
+        .saturating_sub(after_start)
+        .min(after.len() as u64) as usize;
+    if skip == after.len() {
+        return None;
+    }
+    let output = after[skip..].join("\n");
+    if after_start > before_end {
+        let dropped = after_start - before_end;
+        Some(format!(
+            "[output lines dropped before this window: {dropped}]\n{output}"
+        ))
+    } else {
+        Some(output)
+    }
 }
 
 struct MetricSeed {
@@ -1109,4 +1130,119 @@ async fn wait_state(managed: &Managed, expected: InstanceState) -> Result<()> {
     })
     .await
     .map_err(|_| fault(OpsErrorCode::Timeout, "instance operation timed out"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rooms::InstanceConfig;
+    use minecraftd::{
+        core::event::TokioBroadcastBus,
+        instance::{
+            base::Instance, builder::InstanceBuilder, path::InstancePath, server::ServerConfig,
+        },
+        process::local::LocalSpawner,
+        service::{instance::InstanceService, restart::RestartPolicy},
+    };
+
+    async fn console_fixture(directory: &Path, existing: usize) -> Result<Arc<Fleet>> {
+        let config = InstanceConfig {
+            id: "console".into(),
+            directory: directory.join("instance"),
+            backend: "127.0.0.1:25565".parse()?,
+            server: ServerConfig {
+                start_command:
+                    r#"sh -c 'while IFS= read -r line; do printf "%s\n%s\n" "$line" "$line"; done'"#
+                        .into(),
+                ..Default::default()
+            },
+        };
+        std::fs::create_dir_all(&config.directory)?;
+        let mut instance =
+            InstanceBuilder::new(config.id.clone(), InstancePath::new(&config.directory))
+                .spawner(LocalSpawner::new())
+                .event_bus(TokioBroadcastBus::new())
+                .build_server(config.server.clone());
+        instance.setup_output_ring(COMMAND_OUTPUT_LINES);
+        let ring = instance
+            .core
+            .output_ring
+            .as_ref()
+            .context("missing output ring")?;
+        for line in 0..existing {
+            ring.push_str(&format!("old-{line}\n"));
+        }
+        let instance = InstanceService::new(instance, RestartPolicy::never());
+        instance.start().await?;
+        let managed = Managed {
+            config,
+            instance,
+            operation: Arc::new(Mutex::new(())),
+        };
+        Ok(Arc::new(Fleet {
+            instances: BTreeMap::from([("console".into(), Arc::new(managed))]),
+            extended: Extended::new(
+                directory.join("jobs.json"),
+                directory.join("audit.jsonl"),
+                ArchiveConfig {
+                    base_dir: directory.join("archives"),
+                    ..Default::default()
+                },
+            )?,
+        }))
+    }
+
+    #[tokio::test]
+    async fn command_after_saturated_ring_returns_only_two_new_lines() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let fleet = console_fixture(directory.path(), COMMAND_OUTPUT_LINES).await?;
+        let result = execute_command(&fleet, "console", "save-all").await;
+        fleet.shutdown().await?;
+        assert_eq!(result?, "save-all\nsave-all");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn command_before_saturation_returns_only_two_new_lines() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let fleet = console_fixture(directory.path(), 2).await?;
+        let result = execute_command(&fleet, "console", "save-all").await;
+        fleet.shutdown().await?;
+        assert_eq!(result?, "save-all\nsave-all");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn consecutive_commands_do_not_repeat_previous_output() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let fleet = console_fixture(directory.path(), COMMAND_OUTPUT_LINES).await?;
+        let first = execute_command(&fleet, "console", "first").await?;
+        let second = execute_command(&fleet, "console", "second").await?;
+        let repeated = execute_command(&fleet, "console", "second").await;
+        fleet.shutdown().await?;
+        assert_eq!(first, "first\nfirst");
+        assert_eq!(second, "second\nsecond");
+        assert_eq!(repeated?, "second\nsecond");
+        Ok(())
+    }
+
+    #[test]
+    fn command_output_uses_offsets_for_disjoint_and_dropped_windows() {
+        let before_end = COMMAND_OUTPUT_LINES as u64;
+        let after = vec!["same".into(); COMMAND_OUTPUT_LINES];
+        assert_eq!(command_output_since(before_end, 0, &after), None);
+        assert_eq!(
+            command_output_since(before_end, before_end, &after),
+            Some(after.join("\n"))
+        );
+        assert_eq!(
+            command_output_since(before_end, before_end + 1, &after),
+            Some(format!(
+                "[output lines dropped before this window: 1]\n{}",
+                after.join("\n")
+            ))
+        );
+        assert_eq!(after.len(), COMMAND_OUTPUT_LINES);
+        assert_eq!(command_output_since(before_end, before_end + 1, &[]), None);
+    }
 }
