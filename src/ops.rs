@@ -345,7 +345,14 @@ pub(crate) fn access(view: authority::trust::TrustView) -> node::AccessPolicy {
     node::AccessPolicy::TrustAny {
         view,
         requirements: [
-            "manage", "read", "logs", "operate", "console", "backup", "restore",
+            "manage",
+            "read",
+            "logs",
+            "operate",
+            "console",
+            "backup",
+            "restore",
+            "mcp_relay",
         ]
         .into_iter()
         .map(|permission| node::protocol::TrustRequirement {
@@ -407,6 +414,87 @@ fn authorize_operation(
     ))
 }
 
+fn delegation_error(error: identity::mcp_envelope::Error) -> anyhow::Error {
+    use identity::mcp_envelope::Error;
+    use node::protocol::OpsErrorCode;
+    let code = match error {
+        Error::Digest => OpsErrorCode::InvalidRequest,
+        Error::Replay => OpsErrorCode::Conflict,
+        Error::CacheFull | Error::CacheUnavailable => OpsErrorCode::Busy,
+        _ => OpsErrorCode::PermissionDenied,
+    };
+    crate::ops_extended::fault(code, error.to_string())
+}
+
+fn authorize_request(
+    view: &authority::trust::TrustView,
+    audience: node::PeerId,
+    service: ServiceId,
+    peer: node::PeerId,
+    request: &OpsRequest,
+    replay: &identity::mcp_envelope::ReplayCache,
+) -> Result<node::PeerId> {
+    use identity::mcp_envelope::{self as mcp, Expected, ReplayCache};
+    use node::protocol::{OpsErrorCode, TrustRequirement};
+    let device = if let Some(delegation) = &request.delegation {
+        view.authorize(
+            &peer.to_string(),
+            &audience.to_string(),
+            &service.to_string(),
+            &TrustRequirement {
+                clubs: Default::default(),
+                permission: Some("mcp_relay".into()),
+            },
+        )
+        .map_err(|error| {
+            crate::ops_extended::fault(OpsErrorCode::PermissionDenied, error.to_string())
+        })?;
+        let now = authority::journal::now_ms()?;
+        let signed_request = serde_json::json!({
+            "method": "tools/call",
+            "params": {"name": delegation.tool, "arguments": delegation.arguments},
+        });
+        // verify also inserts a nonce. Use a disposable cache until the tool/op
+        // binding passes, then claim it atomically in this service's shared cache.
+        let verification_cache = ReplayCache::new(1);
+        let verified = mcp::verify(
+            &delegation.envelope,
+            now,
+            &Expected {
+                gateway: &peer.to_string(),
+                peer: &audience.to_string(),
+                service: &service.to_string(),
+                tool: &delegation.tool,
+                allowed_drift_ms: mcp::REPLAY_RETENTION_MS,
+                request: &signed_request,
+                replay_cache: &verification_cache,
+            },
+        )
+        .map_err(delegation_error)?;
+        let op = client::ops::tool_request(&delegation.tool, delegation.arguments.clone())
+            .map_err(|error| {
+                crate::ops_extended::fault(OpsErrorCode::InvalidRequest, error.to_string())
+            })?;
+        if op != request.op {
+            return Err(crate::ops_extended::fault(
+                OpsErrorCode::InvalidRequest,
+                "delegated tool does not match operation",
+            ));
+        }
+        let claims = verified.claims();
+        replay
+            .check_and_insert(&claims.signer, &claims.nonce, claims.exp_ms, now)
+            .map_err(delegation_error)?;
+        claims.signer.parse().map_err(|_| {
+            crate::ops_extended::fault(OpsErrorCode::PermissionDenied, "invalid delegated signer")
+        })?
+    } else {
+        peer
+    };
+    authorize_operation(view, audience, service, device, &request.op)?;
+    Ok(device)
+}
+
 pub async fn serve(
     node: &Node,
     mut incoming: tokio::sync::mpsc::Receiver<node::IncomingSession>,
@@ -415,6 +503,7 @@ pub async fn serve(
     view: authority::trust::TrustView,
 ) -> Result<()> {
     let mut tasks = JoinSet::new();
+    let replay = Arc::new(identity::mcp_envelope::ReplayCache::default());
     loop {
         tokio::select! {
             session = incoming.recv() => {
@@ -422,13 +511,14 @@ pub async fn serve(
                 let fleet = fleet.clone();
                 let view = view.clone();
                 let audience = node.peer_id();
+                let replay = replay.clone();
                 tasks.spawn(async move {
                     timeout(OP_TIMEOUT, async {
                         let frame: JsonFrame = read_frame(&mut session.stream).await?;
                         ensure!(frame.sequence == 0 && frame.last, "invalid ops envelope");
                         let result = match serde_json::from_slice::<OpsRequest>(&frame.json) {
-                            Ok(request) => match authorize_operation(&view, audience, service, session.peer, &request.op) {
-                                Ok(()) => fleet.execute_tracked(request, &session.peer.to_string()).await,
+                            Ok(request) => match authorize_request(&view, audience, service, session.peer, &request, &replay) {
+                                Ok(device) => fleet.execute_tracked(request, &device.to_string()).await,
                                 Err(error) => Err(error),
                             }
                             Err(error) => Err(crate::ops_extended::fault(
@@ -485,12 +575,563 @@ mod tests {
         Ok((fleet, instance))
     }
 
+    struct DelegationFixture {
+        identities: crate::test_identity::Identities,
+        host: identity::Identity,
+        relay: identity::Identity,
+        signer: identity::Identity,
+        service: ServiceId,
+    }
+
+    impl DelegationFixture {
+        fn new(relay_permission: &str) -> Self {
+            let host = identity::Identity::generate();
+            let relay = identity::Identity::generate();
+            let signer = identity::Identity::generate();
+            let mut identities = crate::test_identity::Identities::new(
+                &[
+                    (&host, "host", "club"),
+                    (&relay, "relay", "club"),
+                    (&signer, "signer", "club"),
+                ],
+                "host",
+            );
+            let service = ServiceId::new();
+            identities.service(&host, &service.to_string(), "signer", "manage");
+            let root = identities.root("club");
+            identities.append(
+                node::protocol::TrustAction::GrantPermission {
+                    id: "relay-permission".into(),
+                    member: "relay".into(),
+                    service: service.to_string(),
+                    permission: relay_permission.into(),
+                },
+                &[&root],
+            );
+            identities.log.mark_current().unwrap();
+            Self {
+                identities,
+                host,
+                relay,
+                signer,
+                service,
+            }
+        }
+
+        fn request(&self, tool: &str, arguments: serde_json::Value) -> OpsRequest {
+            use base64::Engine;
+            use identity::mcp_envelope as mcp;
+            let now = authority::journal::now_ms().unwrap();
+            let request = serde_json::json!({"method": "tools/call", "params": {
+                "name": tool, "arguments": arguments,
+            }});
+            OpsRequest {
+                op: client::ops::tool_request(tool, arguments.clone()).unwrap(),
+                delegation: Some(node::protocol::OpsDelegation {
+                    envelope: mcp::sign(
+                        node::protocol::McpClaims {
+                            signer: self.signer.peer_id().to_string(),
+                            public_key: base64::engine::general_purpose::STANDARD
+                                .encode(self.signer.public_key().encode_protobuf()),
+                            aud: node::protocol::McpAudience {
+                                gateway: self.relay.peer_id().to_string(),
+                                peer: self.host.peer_id().to_string(),
+                                service: self.service.to_string(),
+                                tool: tool.into(),
+                            },
+                            iat_ms: now,
+                            exp_ms: now + mcp::MAX_LIFETIME_MS,
+                            nonce: ServiceId::new().to_string(),
+                            digest: mcp::request_digest(&request).unwrap(),
+                        },
+                        &self.signer,
+                    )
+                    .unwrap(),
+                    tool: tool.into(),
+                    arguments,
+                }),
+            }
+        }
+
+        fn authorize(
+            &self,
+            request: &OpsRequest,
+            cache: &identity::mcp_envelope::ReplayCache,
+        ) -> Result<node::PeerId> {
+            authorize_request(
+                &self.identities.log.view(Duration::from_secs(60))?,
+                self.host.peer_id(),
+                self.service,
+                self.relay.peer_id(),
+                request,
+                cache,
+            )
+        }
+    }
+
+    fn assert_code<T: std::fmt::Debug>(result: Result<T>, code: node::protocol::OpsErrorCode) {
+        assert_eq!(
+            crate::ops_extended::error_response(&result.unwrap_err()).code,
+            code
+        );
+    }
+
+    #[test]
+    fn legacy_requests_without_delegation_keep_device_authorization() -> Result<()> {
+        let fixture = DelegationFixture::new("mcp_relay");
+        let request: OpsRequest = serde_json::from_str(r#"{"op":{"op":"capabilities"}}"#)?;
+        assert!(request.delegation.is_none());
+        assert_eq!(
+            serde_json::to_string(&request)?,
+            r#"{"op":{"op":"capabilities"}}"#
+        );
+        let view = fixture.identities.log.view(Duration::from_secs(60))?;
+        let cache = identity::mcp_envelope::ReplayCache::new(0);
+        assert_eq!(
+            authorize_request(
+                &view,
+                fixture.host.peer_id(),
+                fixture.service,
+                fixture.signer.peer_id(),
+                &request,
+                &cache
+            )?,
+            fixture.signer.peer_id()
+        );
+        assert_code(
+            fixture.authorize(&request, &cache),
+            node::protocol::OpsErrorCode::PermissionDenied,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn delegation_authorizes_signer_with_an_independent_ops_cache() -> Result<()> {
+        use identity::mcp_envelope::{self as mcp, Expected, ReplayCache};
+        let fixture = DelegationFixture::new("mcp_relay");
+        let request = fixture.request("ops_capabilities", serde_json::json!({}));
+        let delegation = request.delegation.as_ref().unwrap();
+        let claims = &delegation.envelope.claims;
+        let gateway_cache = ReplayCache::default();
+        mcp::verify(
+            &delegation.envelope,
+            authority::journal::now_ms()?,
+            &Expected {
+                gateway: &claims.aud.gateway,
+                peer: &claims.aud.peer,
+                service: &claims.aud.service,
+                tool: &delegation.tool,
+                allowed_drift_ms: mcp::REPLAY_RETENTION_MS,
+                request: &serde_json::json!({"method": "tools/call", "params": {
+                    "name": delegation.tool, "arguments": delegation.arguments,
+                }}),
+                replay_cache: &gateway_cache,
+            },
+        )?;
+        assert_eq!(
+            fixture.authorize(&request, &ReplayCache::default())?,
+            fixture.signer.peer_id()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn delegation_requires_mcp_relay_even_for_manage() {
+        let fixture = DelegationFixture::new("manage");
+        let request = fixture.request("ops_capabilities", serde_json::json!({}));
+        assert_code(
+            fixture.authorize(&request, &Default::default()),
+            node::protocol::OpsErrorCode::PermissionDenied,
+        );
+    }
+
+    #[test]
+    fn delegation_rejects_tool_op_mismatch_without_consuming_nonce() -> Result<()> {
+        let fixture = DelegationFixture::new("mcp_relay");
+        let mut request = fixture.request("ops_capabilities", serde_json::json!({}));
+        request.op = OpsOp::ListInstances {};
+        let cache = identity::mcp_envelope::ReplayCache::default();
+        assert_code(
+            fixture.authorize(&request, &cache),
+            node::protocol::OpsErrorCode::InvalidRequest,
+        );
+        request.op = OpsOp::Capabilities {};
+        assert_eq!(
+            fixture.authorize(&request, &cache)?,
+            fixture.signer.peer_id()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn delegation_replay_returns_conflict() -> Result<()> {
+        let fixture = DelegationFixture::new("mcp_relay");
+        let request = fixture.request("ops_capabilities", serde_json::json!({}));
+        let cache = identity::mcp_envelope::ReplayCache::default();
+        fixture.authorize(&request, &cache)?;
+        assert_code(
+            fixture.authorize(&request, &cache),
+            node::protocol::OpsErrorCode::Conflict,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn delegation_maps_digest_signature_time_audience_and_capacity_errors() -> Result<()> {
+        use identity::mcp_envelope::{self as mcp, ReplayCache};
+        use node::protocol::OpsErrorCode;
+        let fixture = DelegationFixture::new("mcp_relay");
+        let original = fixture.request("ops_status", serde_json::json!({"instance": "test"}));
+        let cache = ReplayCache::default();
+        let mut changed = original.clone();
+        changed.delegation.as_mut().unwrap().arguments["instance"] = "changed".into();
+        assert_code(
+            fixture.authorize(&changed, &cache),
+            OpsErrorCode::InvalidRequest,
+        );
+        let mut changed = original.clone();
+        changed
+            .delegation
+            .as_mut()
+            .unwrap()
+            .envelope
+            .signature
+            .clear();
+        assert_code(
+            fixture.authorize(&changed, &cache),
+            OpsErrorCode::PermissionDenied,
+        );
+        for field in ["gateway", "peer", "service", "tool", "expired", "future"] {
+            let mut changed = original.clone();
+            let envelope = &mut changed.delegation.as_mut().unwrap().envelope;
+            let claims = &mut envelope.claims;
+            match field {
+                "gateway" => claims.aud.gateway = fixture.signer.peer_id().to_string(),
+                "peer" => claims.aud.peer = fixture.relay.peer_id().to_string(),
+                "service" => claims.aud.service = ServiceId::new().to_string(),
+                "tool" => claims.aud.tool = "ops_start".into(),
+                "expired" => {
+                    claims.iat_ms = 0;
+                    claims.exp_ms = mcp::MAX_LIFETIME_MS;
+                }
+                "future" => {
+                    claims.iat_ms += mcp::MAX_LIFETIME_MS;
+                    claims.exp_ms += mcp::MAX_LIFETIME_MS;
+                }
+                _ => unreachable!(),
+            }
+            *envelope = mcp::sign(claims.clone(), &fixture.signer)?;
+            assert_code(
+                fixture.authorize(&changed, &cache),
+                OpsErrorCode::PermissionDenied,
+            );
+        }
+        assert_code(
+            fixture.authorize(&original, &ReplayCache::new(0)),
+            OpsErrorCode::Busy,
+        );
+        // All rejected variants leave the valid nonce available.
+        fixture.authorize(&original, &cache)?;
+        Ok(())
+    }
+
+    #[test]
+    fn delegation_signer_still_requires_operation_permission() -> Result<()> {
+        let mut fixture = DelegationFixture::new("mcp_relay");
+        let request = fixture.request("ops_capabilities", serde_json::json!({}));
+        let root = fixture.identities.root("club");
+        fixture.identities.append(
+            node::protocol::TrustAction::RevokePermission {
+                id: format!("{}-signer", fixture.service),
+            },
+            &[&root],
+        );
+        fixture.identities.log.mark_current()?;
+        assert_code(
+            fixture.authorize(&request, &Default::default()),
+            node::protocol::OpsErrorCode::PermissionDenied,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delegation_audit_records_signer_relay_and_nonce() -> Result<()> {
+        let identity = DelegationFixture::new("mcp_relay");
+        let directory = tempfile::tempdir()?;
+        let (fleet, config) = fixture(directory.path(), "/nonexistent/delegation-audit")?;
+        std::fs::write(
+            config.directory.join(node::protocol::GAME_SESSION_FILE),
+            serde_json::to_vec(&node::protocol::GameSession {
+                protocol_version: node::protocol::GAME_ADAPTER_VERSION,
+                league: "league".into(),
+            })?,
+        )?;
+        let request = identity.request(
+            "ops_stop_league",
+            serde_json::json!({
+                "instance": "test", "league": "league",
+            }),
+        );
+        let actor = identity.authorize(&request, &Default::default())?;
+        assert!(
+            fleet
+                .execute_tracked(request.clone(), &actor.to_string())
+                .await?
+                .ok
+        );
+        // Also cover command failures, delete failures, and asynchronous job completion.
+        for (tool, arguments) in [
+            (
+                "ops_command",
+                serde_json::json!({"instance": "test", "command": "list"}),
+            ),
+            (
+                "ops_delete_backup",
+                serde_json::json!({"instance": "test", "backup": "missing"}),
+            ),
+        ] {
+            let request = identity.request(tool, arguments);
+            let actor = identity.authorize(&request, &Default::default())?;
+            assert!(
+                fleet
+                    .execute_tracked(request, &actor.to_string())
+                    .await
+                    .is_err()
+            );
+        }
+        let backup = identity.request(
+            "ops_create_backup",
+            serde_json::json!({
+                "instance": "test", "label": "delegated", "idempotency_key": "same-job",
+            }),
+        );
+        let actor = identity
+            .authorize(&backup, &Default::default())?
+            .to_string();
+        let job = fleet
+            .execute_tracked(backup.clone(), &actor)
+            .await?
+            .job
+            .unwrap();
+        wait_job(&fleet, &job.id).await?;
+        fleet.shutdown().await?;
+        // A new nonce and a legacy request must resolve to the original job and digest.
+        let retry = identity.request(
+            "ops_create_backup",
+            backup.delegation.as_ref().unwrap().arguments.clone(),
+        );
+        assert_eq!(
+            fleet.execute_tracked(retry, &actor).await?.job.unwrap().id,
+            job.id
+        );
+        let legacy = OpsRequest {
+            op: backup.op.clone(),
+            delegation: None,
+        };
+        assert_eq!(
+            fleet
+                .execute_tracked(legacy.clone(), &actor)
+                .await?
+                .job
+                .unwrap()
+                .id,
+            job.id
+        );
+        assert_eq!(
+            job.request_digest,
+            node::protocol::digest(&serde_json::to_vec(&legacy)?)
+        );
+        let records: Vec<node::protocol::OpsAuditRecord> =
+            std::fs::read_to_string(directory.path().join("audit.jsonl"))?
+                .lines()
+                .map(serde_json::from_str)
+                .collect::<std::result::Result<_, _>>()?;
+        assert_eq!(records.len(), 4);
+        for record in &records {
+            assert_eq!(record.actor, actor);
+            assert_eq!(
+                record.relay.as_deref(),
+                Some(identity.relay.peer_id().to_string().as_str())
+            );
+            assert!(record.nonce.is_some());
+        }
+        assert_eq!(
+            records[0].nonce.as_deref(),
+            Some(
+                request
+                    .delegation
+                    .as_ref()
+                    .unwrap()
+                    .envelope
+                    .claims
+                    .nonce
+                    .as_str()
+            )
+        );
+        assert_eq!(
+            records[3].nonce.as_deref(),
+            Some(
+                backup
+                    .delegation
+                    .as_ref()
+                    .unwrap()
+                    .envelope
+                    .claims
+                    .nonce
+                    .as_str()
+            )
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delegation_session_returns_errors_and_audits_the_signer() -> Result<()> {
+        timeout(Duration::from_secs(30), async {
+            use node::protocol::OpsErrorCode;
+            use node::{NodeConfig, Service};
+            let fixture_identity = DelegationFixture::new("mcp_relay");
+            let directory = tempfile::tempdir()?;
+            let (fleet, config) = fixture(directory.path(), "/nonexistent/delegation-session")?;
+            std::fs::write(
+                config.directory.join(node::protocol::GAME_SESSION_FILE),
+                serde_json::to_vec(&node::protocol::GameSession {
+                    protocol_version: node::protocol::GAME_ADAPTER_VERSION,
+                    league: "league".into(),
+                })?,
+            )?;
+            let mut host =
+                Node::start(fixture_identity.host.clone(), NodeConfig::default()).await?;
+            let incoming = host.take_incoming()?;
+            let service = fixture_identity.service;
+            let view = fixture_identity
+                .identities
+                .log
+                .view(Duration::from_secs(60))?;
+            host.publish(Service {
+                id: service,
+                name: "Delegation fixture".into(),
+                protocol: node::protocol::OPS_PROTOCOL.into(),
+                metadata: vec![],
+                access: access(view.clone()),
+            })
+            .await?;
+            let relay = Node::start(fixture_identity.relay.clone(), NodeConfig::default()).await?;
+            let signer =
+                Node::start(fixture_identity.signer.clone(), NodeConfig::default()).await?;
+            relay.dial(host.addresses()[0].clone()).await?;
+            signer.dial(host.addresses()[0].clone()).await?;
+            let host = Arc::new(host);
+            let serving = host.clone();
+            let managed = fleet.clone();
+            let task =
+                tokio::spawn(
+                    async move { serve(&serving, incoming, service, managed, view).await },
+                );
+            let legacy: OpsRequest = serde_json::from_str(r#"{"op":{"op":"capabilities"}}"#)?;
+            assert!(
+                client::ops::execute(&signer, host.peer_id(), service, &legacy)
+                    .await?
+                    .ok
+            );
+            let request = fixture_identity.request("ops_capabilities", serde_json::json!({}));
+            let mut wrong = request.clone();
+            wrong.op = OpsOp::ListInstances {};
+            assert_eq!(
+                client::ops::execute(&relay, host.peer_id(), service, &wrong)
+                    .await?
+                    .error
+                    .unwrap()
+                    .code,
+                OpsErrorCode::InvalidRequest
+            );
+            assert!(
+                client::ops::execute(&relay, host.peer_id(), service, &request)
+                    .await?
+                    .ok
+            );
+            assert_eq!(
+                client::ops::execute(&relay, host.peer_id(), service, &request)
+                    .await?
+                    .error
+                    .unwrap()
+                    .code,
+                OpsErrorCode::Conflict
+            );
+            let mut denied = fixture_identity.request("ops_capabilities", serde_json::json!({}));
+            let envelope = &mut denied.delegation.as_mut().unwrap().envelope;
+            envelope.claims.aud.gateway = signer.peer_id().to_string();
+            *envelope =
+                identity::mcp_envelope::sign(envelope.claims.clone(), &fixture_identity.signer)?;
+            assert_eq!(
+                client::ops::execute(&signer, host.peer_id(), service, &denied)
+                    .await?
+                    .error
+                    .unwrap()
+                    .code,
+                OpsErrorCode::PermissionDenied
+            );
+            let stop = fixture_identity.request(
+                "ops_stop_league",
+                serde_json::json!({
+                    "instance": "test", "league": "league",
+                }),
+            );
+            assert!(
+                client::ops::execute(&relay, host.peer_id(), service, &stop)
+                    .await?
+                    .ok
+            );
+            let audit = client::ops::execute(
+                &signer,
+                host.peer_id(),
+                service,
+                &OpsRequest {
+                    op: OpsOp::ListAudit {
+                        offset: 0,
+                        limit: None,
+                    },
+                    delegation: None,
+                },
+            )
+            .await?
+            .audit;
+            assert_eq!(audit.len(), 1);
+            assert_eq!(audit[0].actor, signer.peer_id().to_string());
+            assert_eq!(audit[0].relay, Some(relay.peer_id().to_string()));
+            assert_eq!(
+                audit[0].nonce.as_deref(),
+                Some(
+                    stop.delegation
+                        .as_ref()
+                        .unwrap()
+                        .envelope
+                        .claims
+                        .nonce
+                        .as_str()
+                )
+            );
+            task.abort();
+            let _ = task.await;
+            host.withdraw(service).await;
+            fleet.shutdown().await?;
+            relay.shutdown().await?;
+            signer.shutdown().await?;
+            Arc::try_unwrap(host)
+                .map_err(|_| anyhow::anyhow!("delegation task still owns host"))?
+                .shutdown()
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?
+    }
+
     async fn wait_job(fleet: &Arc<Fleet>, id: &str) -> Result<node::protocol::OpsJob> {
         timeout(Duration::from_secs(15), async {
             loop {
                 let response = fleet
                     .execute(
                         OpsRequest {
+                            delegation: None,
                             op: OpsOp::GetJob { job: id.into() },
                         },
                         "test",
@@ -547,6 +1188,7 @@ mod tests {
         let list = fleet
             .execute(
                 OpsRequest {
+                    delegation: None,
                     op: OpsOp::ListInstances {},
                 },
                 "test",
@@ -559,6 +1201,7 @@ mod tests {
             fleet
                 .execute(
                     OpsRequest {
+                        delegation: None,
                         op: OpsOp::Status {
                             instance: "unknown".into()
                         }
@@ -572,6 +1215,7 @@ mod tests {
             fleet
                 .execute(
                     OpsRequest {
+                        delegation: None,
                         op: OpsOp::Start {
                             instance: "test".into()
                         }
@@ -690,6 +1334,7 @@ mod tests {
                 host.peer_id(),
                 service,
                 &OpsRequest {
+                    delegation: None,
                     op: OpsOp::Capabilities {},
                 },
             )
@@ -700,6 +1345,7 @@ mod tests {
                 host.peer_id(),
                 service,
                 &OpsRequest {
+                    delegation: None,
                     op: OpsOp::Status {
                         instance: "missing".into(),
                     },
@@ -717,6 +1363,7 @@ mod tests {
                 host.peer_id(),
                 service,
                 &OpsRequest {
+                    delegation: None,
                     op: OpsOp::ListInstances {},
                 },
             )
@@ -727,6 +1374,7 @@ mod tests {
                 host.peer_id(),
                 service,
                 &OpsRequest {
+                    delegation: None,
                     op: OpsOp::Start {
                         instance: "test".into(),
                     },
@@ -759,6 +1407,7 @@ mod tests {
         let capabilities = fleet
             .execute(
                 OpsRequest {
+                    delegation: None,
                     op: OpsOp::Capabilities {},
                 },
                 "test",
@@ -772,6 +1421,7 @@ mod tests {
         let metrics = fleet
             .execute(
                 OpsRequest {
+                    delegation: None,
                     op: OpsOp::Metrics {
                         instance: Some("test".into()),
                     },
@@ -788,6 +1438,7 @@ mod tests {
                 fleet
                     .execute(
                         OpsRequest {
+                            delegation: None,
                             op: OpsOp::Command {
                                 instance: "test".into(),
                                 command: command.into()
@@ -802,6 +1453,7 @@ mod tests {
         let audit = fleet
             .execute(
                 OpsRequest {
+                    delegation: None,
                     op: OpsOp::ListAudit {
                         offset: 0,
                         limit: Some(10),
@@ -823,6 +1475,7 @@ mod tests {
         std::fs::create_dir(instance.directory.join("world"))?;
         std::fs::write(instance.directory.join("world/level.dat"), b"original")?;
         let request = OpsRequest {
+            delegation: None,
             op: OpsOp::CreateBackup {
                 instance: "test".into(),
                 label: "before update".into(),
@@ -845,6 +1498,7 @@ mod tests {
         let verify = fleet
             .execute(
                 OpsRequest {
+                    delegation: None,
                     op: OpsOp::VerifyBackup {
                         instance: "test".into(),
                         backup: backup.id.clone(),
@@ -867,6 +1521,7 @@ mod tests {
         let listed = fleet
             .execute(
                 OpsRequest {
+                    delegation: None,
                     op: OpsOp::ListBackups {
                         instance: "test".into(),
                         offset: 0,
@@ -884,6 +1539,7 @@ mod tests {
         let persisted = reopened
             .execute(
                 OpsRequest {
+                    delegation: None,
                     op: OpsOp::GetJob { job: id },
                 },
                 "test",
@@ -896,6 +1552,7 @@ mod tests {
         let deleted = reopened
             .execute(
                 OpsRequest {
+                    delegation: None,
                     op: OpsOp::DeleteBackup {
                         instance: "test".into(),
                         backup: backup.id,
@@ -908,6 +1565,7 @@ mod tests {
         let empty = reopened
             .execute(
                 OpsRequest {
+                    delegation: None,
                     op: OpsOp::ListBackups {
                         instance: "test".into(),
                         offset: 0,
@@ -929,6 +1587,7 @@ mod tests {
         fleet
             .execute(
                 OpsRequest {
+                    delegation: None,
                     op: OpsOp::Start {
                         instance: "test".into(),
                     },
@@ -939,6 +1598,7 @@ mod tests {
         let response = fleet
             .execute(
                 OpsRequest {
+                    delegation: None,
                     op: OpsOp::Command {
                         instance: "test".into(),
                         command: "save-all".into(),
@@ -976,6 +1636,7 @@ mod tests {
         let response = fleet
             .execute(
                 OpsRequest {
+                    delegation: None,
                     op: OpsOp::GetJob {
                         job: "interrupted".into(),
                     },
@@ -1043,6 +1704,7 @@ mod tests {
         let create = fleet
             .execute(
                 OpsRequest {
+                    delegation: None,
                     op: OpsOp::CreateBackup {
                         instance: "test".into(),
                         label: "original world".into(),
@@ -1066,6 +1728,7 @@ mod tests {
         let restore = fleet
             .execute(
                 OpsRequest {
+                    delegation: None,
                     op: OpsOp::RestoreBackup {
                         instance: "test".into(),
                         backup: backup.id,
@@ -1089,6 +1752,7 @@ mod tests {
         let backups = fleet
             .execute(
                 OpsRequest {
+                    delegation: None,
                     op: OpsOp::ListBackups {
                         instance: "test".into(),
                         offset: 0,
@@ -1124,6 +1788,7 @@ mod tests {
         let create = fleet
             .execute(
                 OpsRequest {
+                    delegation: None,
                     op: OpsOp::CreateBackup {
                         instance: "test".into(),
                         label: "unstartable restore".into(),
@@ -1149,6 +1814,7 @@ mod tests {
         fleet
             .execute(
                 OpsRequest {
+                    delegation: None,
                     op: OpsOp::Start {
                         instance: "test".into(),
                     },
@@ -1159,6 +1825,7 @@ mod tests {
         let restore = fleet
             .execute(
                 OpsRequest {
+                    delegation: None,
                     op: OpsOp::RestoreBackup {
                         instance: "test".into(),
                         backup: backup.id,

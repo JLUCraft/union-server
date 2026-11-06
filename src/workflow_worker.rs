@@ -264,7 +264,10 @@ async fn ops(key: &Identity, r: &GameResource, op: OpsOp) -> Result<node::protoc
             &node,
             r.peer.parse()?,
             r.operations_service.parse()?,
-            &OpsRequest { op },
+            &OpsRequest {
+                delegation: None,
+                op,
+            },
         )
         .await
         .map_err(anyhow::Error::from)

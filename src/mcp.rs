@@ -12,9 +12,12 @@ use axum::{
     middleware::{self, Next},
     response::{IntoResponse, Response},
 };
+use base64::Engine;
 use client::Identity;
 use futures::FutureExt;
-use node::protocol::{OpsOp, OpsRequest, OpsResponse};
+#[cfg(test)]
+use node::protocol::OpsOp;
+use node::protocol::{McpAudience, McpClaims, OpsDelegation, OpsRequest, OpsResponse};
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     handler::server::{router::Router as ToolRouter, tool::ToolCallContext, tool::ToolRoute},
@@ -37,7 +40,6 @@ use std::{
 use subtle::ConstantTimeEq;
 
 const MAX_TOKEN_BYTES: u64 = 1024;
-const MAX_PAGE_LIMIT: u32 = node::protocol::OPS_PAGE_LIMIT;
 /// League reconnect window applied when the caller omits it, matching the manager app.
 const DEFAULT_RECONNECT_MIN_MS: u64 = 15_000;
 const DEFAULT_RECONNECT_MAX_MS: u64 = 90_000;
@@ -746,205 +748,10 @@ fn routes() -> Vec<ToolRoute<Context>> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EmptyArgs {}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct InstanceArgs {
-    instance: String,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LeagueArgs {
-    instance: String,
-    league: String,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MetricsArgs {
-    instance: Option<String>,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CommandArgs {
-    instance: String,
-    command: String,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PageArgs {
-    #[serde(default)]
-    offset: u32,
-    limit: Option<u32>,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BackupArgs {
-    instance: String,
-    backup: String,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CreateBackupArgs {
-    instance: String,
-    label: String,
-    idempotency_key: String,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct JobBackupArgs {
-    instance: String,
-    backup: String,
-    idempotency_key: String,
-}
 
 fn parse<T: for<'de> Deserialize<'de>>(arguments: JsonObject) -> Result<T, McpError> {
     serde_json::from_value(serde_json::Value::Object(arguments))
         .map_err(|error| McpError::invalid_params(error.to_string(), None))
-}
-
-fn page(arguments: JsonObject) -> Result<(u32, Option<u32>), McpError> {
-    let page: PageArgs = parse(arguments)?;
-    if page
-        .limit
-        .is_some_and(|limit| limit == 0 || limit > MAX_PAGE_LIMIT)
-    {
-        return Err(McpError::invalid_params("invalid page limit", None));
-    }
-    Ok((page.offset, page.limit))
-}
-
-fn ops_request(name: &str, arguments: JsonObject) -> Result<OpsRequest, McpError> {
-    let instance =
-        |arguments: JsonObject| parse::<InstanceArgs>(arguments).map(|args| args.instance);
-    let backup = |arguments: JsonObject| parse::<BackupArgs>(arguments);
-    let op = match name {
-        "ops_capabilities" => {
-            let _: EmptyArgs = parse(arguments)?;
-            OpsOp::Capabilities {}
-        }
-        "ops_list_instances" => {
-            let _: EmptyArgs = parse(arguments)?;
-            OpsOp::ListInstances {}
-        }
-        "ops_status" => OpsOp::Status {
-            instance: instance(arguments)?,
-        },
-        "ops_metrics" => OpsOp::Metrics {
-            instance: parse::<MetricsArgs>(arguments)?.instance,
-        },
-        "ops_logs" => OpsOp::Logs {
-            instance: instance(arguments)?,
-        },
-        "ops_command" => {
-            let args: CommandArgs = parse(arguments)?;
-            OpsOp::Command {
-                instance: args.instance,
-                command: args.command,
-            }
-        }
-        "ops_start" => OpsOp::Start {
-            instance: instance(arguments)?,
-        },
-        "ops_stop" => OpsOp::Stop {
-            instance: instance(arguments)?,
-        },
-        "ops_start_league" => {
-            let args: LeagueArgs = parse(arguments)?;
-            OpsOp::StartLeague {
-                instance: args.instance,
-                league: args.league,
-            }
-        }
-        "ops_stop_league" => {
-            let args: LeagueArgs = parse(arguments)?;
-            OpsOp::StopLeague {
-                instance: args.instance,
-                league: args.league,
-            }
-        }
-        "ops_restart" => OpsOp::Restart {
-            instance: instance(arguments)?,
-        },
-        "ops_kill" => OpsOp::Kill {
-            instance: instance(arguments)?,
-        },
-        "ops_list_jobs" => {
-            let (offset, limit) = page(arguments)?;
-            OpsOp::ListJobs { offset, limit }
-        }
-        "ops_get_job" => {
-            #[derive(Deserialize)]
-            #[serde(deny_unknown_fields)]
-            struct Args {
-                job: String,
-            }
-            OpsOp::GetJob {
-                job: parse::<Args>(arguments)?.job,
-            }
-        }
-        "ops_list_audit" => {
-            let (offset, limit) = page(arguments)?;
-            OpsOp::ListAudit { offset, limit }
-        }
-        "ops_list_backups" => {
-            #[derive(Deserialize)]
-            #[serde(deny_unknown_fields)]
-            struct Args {
-                instance: String,
-                #[serde(default)]
-                offset: u32,
-                limit: Option<u32>,
-            }
-            let args: Args = parse(arguments)?;
-            if args
-                .limit
-                .is_some_and(|limit| limit == 0 || limit > MAX_PAGE_LIMIT)
-            {
-                return Err(McpError::invalid_params("invalid page limit", None));
-            }
-            OpsOp::ListBackups {
-                instance: args.instance,
-                offset: args.offset,
-                limit: args.limit,
-            }
-        }
-        "ops_create_backup" => {
-            let args: CreateBackupArgs = parse(arguments)?;
-            OpsOp::CreateBackup {
-                instance: args.instance,
-                label: args.label,
-                idempotency_key: args.idempotency_key,
-            }
-        }
-        "ops_verify_backup" => {
-            let args: JobBackupArgs = parse(arguments)?;
-            OpsOp::VerifyBackup {
-                instance: args.instance,
-                backup: args.backup,
-                idempotency_key: args.idempotency_key,
-            }
-        }
-        "ops_restore_backup" => {
-            let args: JobBackupArgs = parse(arguments)?;
-            OpsOp::RestoreBackup {
-                instance: args.instance,
-                backup: args.backup,
-                idempotency_key: args.idempotency_key,
-            }
-        }
-        "ops_delete_backup" => {
-            let args: BackupArgs = backup(arguments)?;
-            OpsOp::DeleteBackup {
-                instance: args.instance,
-                backup: args.backup,
-            }
-        }
-        _ => {
-            return Err(McpError::method_not_found::<
-                rmcp::model::CallToolRequestMethod,
-            >());
-        }
-    };
-    Ok(OpsRequest { op })
 }
 
 // ---------------------------------------------------------------------------
@@ -982,7 +789,43 @@ async fn invoke(
             .dial(target.address.clone())
             .await
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        let request = ops_request(name, arguments)?;
+        let arguments = serde_json::Value::Object(arguments);
+        let op = client::ops::tool_request(name, arguments.clone())
+            .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let now = authority::journal::now_ms()
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        let signed_request = serde_json::json!({
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        });
+        let envelope = identity::mcp_envelope::sign(
+            McpClaims {
+                signer: caller.identity.peer_id().to_string(),
+                public_key: base64::engine::general_purpose::STANDARD
+                    .encode(caller.identity.public_key().encode_protobuf()),
+                aud: McpAudience {
+                    gateway: caller.node.peer_id().to_string(),
+                    peer: target.peer.to_string(),
+                    service: target.service.to_string(),
+                    tool: name.into(),
+                },
+                iat_ms: now,
+                exp_ms: now.saturating_add(identity::mcp_envelope::MAX_LIFETIME_MS),
+                nonce: node::ServiceId::new().to_string(),
+                digest: identity::mcp_envelope::request_digest(&signed_request)
+                    .map_err(|error| McpError::invalid_params(error.to_string(), None))?,
+            },
+            &caller.identity,
+        )
+        .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        let request = OpsRequest {
+            op,
+            delegation: Some(OpsDelegation {
+                envelope,
+                tool: name.into(),
+                arguments,
+            }),
+        };
         let response =
             client::ops::execute(&caller.node, target.peer, target.service, &request).await;
         return Ok(ops_result(response));
@@ -1468,9 +1311,7 @@ mod tests {
             );
             let arguments = serde_json::json!({"instance": "survival", "league": "league-1"});
             assert_eq!(
-                ops_request(name, arguments.as_object().unwrap().clone())
-                    .unwrap()
-                    .op,
+                client::ops::tool_request(name, arguments.clone()).unwrap(),
                 expected,
                 "{name}"
             );
@@ -1482,7 +1323,7 @@ mod tests {
                 serde_json::json!({"instance": "survival", "league": "league-1", "extra": true}),
             ] {
                 assert!(
-                    ops_request(name, invalid.as_object().unwrap().clone()).is_err(),
+                    client::ops::tool_request(name, invalid.clone()).is_err(),
                     "{name} accepted {invalid}"
                 );
             }
@@ -1491,26 +1332,23 @@ mod tests {
 
     #[test]
     fn operations_requests_are_typed_and_reject_unknown() {
-        let parsed = ops_request(
+        let parsed = client::ops::tool_request(
             "ops_create_backup",
             serde_json::json!({
                 "instance": "survival", "label": "before update", "idempotency_key": "request-1"
-            })
-            .as_object()
-            .unwrap()
-            .clone(),
+            }),
         )
         .unwrap();
         assert_eq!(
-            parsed.op,
+            parsed,
             OpsOp::CreateBackup {
                 instance: "survival".into(),
                 label: "before update".into(),
                 idempotency_key: "request-1".into(),
             }
         );
-        assert!(ops_request("ops_start", JsonObject::new()).is_err());
-        assert!(ops_request("unknown", JsonObject::new()).is_err());
+        assert!(client::ops::tool_request("ops_start", serde_json::json!({})).is_err());
+        assert!(client::ops::tool_request("unknown", serde_json::json!({})).is_err());
     }
 
     #[test]
@@ -1575,6 +1413,17 @@ mod tests {
             let incoming = host.take_incoming()?;
             let service = node::ServiceId::new();
             identities.service(&host_key, &service.to_string(), "agent", "manage");
+            let root = identities.root("club");
+            identities.append(
+                node::protocol::TrustAction::GrantPermission {
+                    id: "mcp-relay".into(),
+                    member: "agent".into(),
+                    service: service.to_string(),
+                    permission: "mcp_relay".into(),
+                },
+                &[&root],
+            );
+            identities.log.mark_current()?;
             let view = identities.log.view(std::time::Duration::from_secs(60))?;
             host.publish(node::Service {
                 id: service,

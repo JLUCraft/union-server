@@ -267,7 +267,7 @@ async fn application_commands_share_one_journal_and_revocation() -> Result {
         assert_eq!(combined.revision, initial_revision + 2);
         assert!(combined.domain.events.contains_key("activity"));
         assert!(combined.domain.leagues.contains_key("competition"));
-        let response = client::ops::execute(&node,host_key.peer_id(),operations,&node::protocol::OpsRequest {op:node::protocol::OpsOp::ListInstances{}}).await?;
+        let response = client::ops::execute(&node,host_key.peer_id(),operations,&node::protocol::OpsRequest { delegation: None,op:node::protocol::OpsOp::ListInstances{}}).await?;
         assert!(response.ok && response.instances.is_empty());
         let mut stream=node.open_service(host_key.peer_id(),operations).await?;
         let mut record=cache.state().draft(node::protocol::TrustAction::RevokeDevice{member:"alice".into(),device:member.peer_id().to_string()});

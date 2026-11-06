@@ -78,7 +78,20 @@ fn now_ms() -> Result<u64> {
 }
 
 fn request_digest(request: &OpsRequest) -> Result<String> {
-    Ok(digest(&serde_json::to_vec(request)?))
+    Ok(digest(&serde_json::to_vec(&OpsRequest {
+        op: request.op.clone(),
+        delegation: None,
+    })?))
+}
+
+fn delegation_metadata(request: &OpsRequest) -> (Option<String>, Option<String>) {
+    request
+        .delegation
+        .as_ref()
+        .map_or((None, None), |delegation| {
+            let claims = &delegation.envelope.claims;
+            (Some(claims.aud.gateway.clone()), Some(claims.nonce.clone()))
+        })
 }
 
 pub(crate) fn is_extended(op: &OpsOp) -> bool {
@@ -441,10 +454,13 @@ pub(crate) async fn audit_legacy(
         | OpsOp::Kill { instance } => Some(instance.clone()),
         _ => None,
     };
+    let (relay, nonce) = delegation_metadata(request);
     fleet
         .extended
         .audit
         .record(OpsAuditRecord {
+            relay,
+            nonce,
             timestamp_ms: now_ms()?,
             actor: actor.into(),
             action,
@@ -463,6 +479,7 @@ pub(crate) async fn execute(
     request: OpsRequest,
     actor: &str,
 ) -> Result<OpsResponse> {
+    let (relay, nonce) = delegation_metadata(&request);
     let mut response = OpsResponse {
         ok: true,
         ..Default::default()
@@ -493,6 +510,8 @@ pub(crate) async fn execute(
                 .extended
                 .audit
                 .record(OpsAuditRecord {
+                    relay,
+                    nonce,
                     timestamp_ms: now_ms()?,
                     actor: actor.into(),
                     action: "command".into(),
@@ -565,6 +584,8 @@ pub(crate) async fn execute(
                 .extended
                 .audit
                 .record(OpsAuditRecord {
+                    relay,
+                    nonce,
                     timestamp_ms: now_ms()?,
                     actor: actor.into(),
                     action: "delete_backup".into(),
@@ -815,6 +836,7 @@ async fn submit(fleet: &Arc<Fleet>, request: &OpsRequest, actor: &str) -> Result
             request_digest: digest,
         })
         .await?;
+    let (relay, nonce) = delegation_metadata(request);
     let running = fleet.clone();
     let running_job = job.clone();
     fleet.extended.tasks.lock().await.spawn(async move {
@@ -828,6 +850,8 @@ async fn submit(fleet: &Arc<Fleet>, request: &OpsRequest, actor: &str) -> Result
         match completed {
             Ok(job) => {
                 let record = now_ms().map(|timestamp_ms| OpsAuditRecord {
+                    relay,
+                    nonce,
                     timestamp_ms,
                     actor: job.actor.clone(),
                     action: match job.kind {
