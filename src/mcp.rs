@@ -441,6 +441,10 @@ fn specs() -> Vec<Spec> {
 fn operations_specs() -> Vec<Spec> {
     let empty = schema(&[], &[]);
     let instance = schema(&[("instance", "string")], &["instance"]);
+    let league = schema(
+        &[("instance", "string"), ("league", "string")],
+        &["instance", "league"],
+    );
     let page = schema(&[("offset", "integer"), ("limit", "integer")], &[]);
     let backup = schema(
         &[("instance", "string"), ("backup", "string")],
@@ -489,6 +493,16 @@ fn operations_specs() -> Vec<Spec> {
             name: "ops_stop",
             description: "Stop an instance gracefully",
             schema: instance.clone(),
+        },
+        Spec {
+            name: "ops_start_league",
+            description: "Start a league on an instance",
+            schema: league.clone(),
+        },
+        Spec {
+            name: "ops_stop_league",
+            description: "Stop a league on an instance gracefully",
+            schema: league,
         },
         Spec {
             name: "ops_restart",
@@ -734,6 +748,12 @@ struct InstanceArgs {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct LeagueArgs {
+    instance: String,
+    league: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MetricsArgs {
     instance: Option<String>,
 }
@@ -822,6 +842,20 @@ fn ops_request(name: &str, arguments: JsonObject) -> Result<OpsRequest, McpError
         "ops_stop" => OpsOp::Stop {
             instance: instance(arguments)?,
         },
+        "ops_start_league" => {
+            let args: LeagueArgs = parse(arguments)?;
+            OpsOp::StartLeague {
+                instance: args.instance,
+                league: args.league,
+            }
+        }
+        "ops_stop_league" => {
+            let args: LeagueArgs = parse(arguments)?;
+            OpsOp::StopLeague {
+                instance: args.instance,
+                league: args.league,
+            }
+        }
         "ops_restart" => OpsOp::Restart {
             instance: instance(arguments)?,
         },
@@ -1231,7 +1265,7 @@ mod tests {
     #[test]
     fn catalog_is_strict_and_covers_three_services() {
         let specs = specs();
-        assert_eq!(specs.len(), 29);
+        assert_eq!(specs.len(), 31);
         assert!(
             specs
                 .iter()
@@ -1242,7 +1276,7 @@ mod tests {
                 .iter()
                 .filter(|spec| spec.name.starts_with("ops_"))
                 .count(),
-            18
+            20
         );
         assert_eq!(
             specs
@@ -1258,6 +1292,62 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    #[test]
+    fn league_operations_have_strict_schemas_and_typed_requests() {
+        let specs = operations_specs();
+        for (name, expected) in [
+            (
+                "ops_start_league",
+                OpsOp::StartLeague {
+                    instance: "survival".into(),
+                    league: "league-1".into(),
+                },
+            ),
+            (
+                "ops_stop_league",
+                OpsOp::StopLeague {
+                    instance: "survival".into(),
+                    league: "league-1".into(),
+                },
+            ),
+        ] {
+            let spec = specs.iter().find(|spec| spec.name == name).unwrap();
+            assert_eq!(
+                serde_json::Value::Object(spec.schema.clone()),
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "instance": {"type": "string"},
+                        "league": {"type": "string"}
+                    },
+                    "required": ["instance", "league"],
+                    "additionalProperties": false
+                }),
+                "{name}"
+            );
+            let arguments = serde_json::json!({"instance": "survival", "league": "league-1"});
+            assert_eq!(
+                ops_request(name, arguments.as_object().unwrap().clone())
+                    .unwrap()
+                    .op,
+                expected,
+                "{name}"
+            );
+            for invalid in [
+                serde_json::json!({"instance": "survival"}),
+                serde_json::json!({"league": "league-1"}),
+                serde_json::json!({"instance": 1, "league": "league-1"}),
+                serde_json::json!({"instance": "survival", "league": 1}),
+                serde_json::json!({"instance": "survival", "league": "league-1", "extra": true}),
+            ] {
+                assert!(
+                    ops_request(name, invalid.as_object().unwrap().clone()).is_err(),
+                    "{name} accepted {invalid}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1444,7 +1534,7 @@ mod tests {
                 }),
             )
             .await?;
-            assert_eq!(listed["result"]["tools"].as_array().map(Vec::len), Some(29));
+            assert_eq!(listed["result"]["tools"].as_array().map(Vec::len), Some(31));
             let called = post(
                 &client,
                 &url,
