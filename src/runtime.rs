@@ -59,6 +59,7 @@ pub struct Services {
     pub notifications: Option<crate::notifications::Config>,
     pub report_board: Option<crate::report_board::Config>,
     pub operations: Option<Operations>,
+    pub mcp: Option<crate::mcp::Config>,
     pub member_rooms: Vec<rooms::HostConfig>,
     pub documents: Option<Documents>,
 }
@@ -204,6 +205,12 @@ pub struct Replication {
 pub struct Operations {
     pub service: String,
     pub instances: Vec<rooms::InstanceConfig>,
+    #[serde(default = "ops::default_state_path")]
+    pub state: PathBuf,
+    #[serde(default = "ops::default_audit_path")]
+    pub audit: PathBuf,
+    #[serde(default)]
+    pub archives: minecraftd::archive::manager::ArchiveConfig,
 }
 
 #[derive(Deserialize)]
@@ -296,7 +303,19 @@ impl Config {
                 }
             }
         }
+        if let Some(mcp) = &mut config.services.mcp {
+            for principal in &mut mcp.principals {
+                relative(base, &mut principal.key);
+                relative(base, &mut principal.token);
+                if let Some(path) = &mut principal.trust {
+                    relative(base, path);
+                }
+            }
+        }
         if let Some(o) = &mut config.services.operations {
+            relative(base, &mut o.state);
+            relative(base, &mut o.audit);
+            relative(base, &mut o.archives.base_dir);
             for instance in &mut o.instances {
                 relative(base, &mut instance.directory);
             }
@@ -393,6 +412,9 @@ impl Config {
                 scoring.bind.ip().is_loopback(),
                 "scoring adapter must bind loopback"
             );
+        }
+        if let Some(mcp) = &self.services.mcp {
+            mcp.validate()?;
         }
         let needs_governance = self.services.ai_worker.is_some()
             || self.services.activity_oracle.is_some()
@@ -855,22 +877,35 @@ impl Host {
             let service = o.service.parse()?;
             let fleet = Arc::new(ops::Fleet::new(ops::Config {
                 instances: o.instances,
+                state: o.state,
+                audit: o.audit,
+                archives: o.archives,
             })?);
             self.fleet = Some(fleet.clone());
+            let view = self
+                .identity
+                .as_ref()
+                .context("identity missing")?
+                .1
+                .clone();
             self.node()?
                 .publish(Service {
                     id: service,
                     name: "Operations".into(),
                     protocol: node::protocol::OPS_PROTOCOL.into(),
                     metadata: vec![],
-                    access: self.access("manage")?,
+                    access: ops::access(view.clone()),
                 })
                 .await?;
             let incoming = self.route(service);
             let node = self.node()?;
             self.tasks
-                .spawn(async move { ops::serve(&node, incoming, service, fleet).await });
+                .spawn(async move { ops::serve(&node, incoming, service, fleet, view).await });
             self.services.push(format!("operations:{service}"));
+        }
+        if let Some(config) = services.mcp.take() {
+            self.tasks.spawn(crate::mcp::serve(config));
+            self.services.push("mcp".into());
         }
         if let Some(d) = services.documents.take() {
             let service = d.service.parse()?;

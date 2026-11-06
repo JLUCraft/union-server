@@ -141,6 +141,43 @@ fn configuration_rejects_unknown_fields_missing_governance_and_colliding_service
     Ok(())
 }
 #[test]
+fn mcp_configuration_resolves_local_secret_paths_and_validates_target() -> Result {
+    let dir = tempfile::tempdir()?;
+    let peer = Identity::generate().peer_id().to_string();
+    let path = dir.path().join("node.json");
+    write(
+        &path,
+        &json!({"node":{"key":"node.key"},"services":{"mcp":{
+            "bind":"127.0.0.1:9090",
+            "operations":[{
+                "name":"ops",
+                "address":format!("/ip4/127.0.0.1/udp/40000/quic-v1/p2p/{peer}"),
+                "peer":peer,
+                "service":ServiceId::new().to_string()
+            }],
+            "principals":[{
+                "name":"alice",
+                "key":"mcp.key",
+                "token":"mcp.token",
+                "operations":["ops"]
+            }]
+        }}}),
+    )?;
+    std::fs::write(dir.path().join("mcp.token"), "secret")?;
+    std::fs::write(dir.path().join("mcp.key"), "key")?;
+    let config = Config::load(&path, None)?;
+    let mcp = config
+        .services
+        .mcp
+        .as_ref()
+        .ok_or("MCP configuration missing")?;
+    let principal = mcp.principals.first().ok_or("MCP principal missing")?;
+    assert_eq!(principal.key, dir.path().join("mcp.key"));
+    assert_eq!(principal.token, dir.path().join("mcp.token"));
+    Ok(())
+}
+
+#[test]
 fn application_configuration_has_one_genesis_and_journal() -> Result {
     let config: Config = serde_json::from_value(json!({"node":{"key":"node.key"},"services":{
         "identity":{"log":"identity.jsonl","writer":true,"max_staleness_seconds":60,"genesis_hash":"0".repeat(64)},

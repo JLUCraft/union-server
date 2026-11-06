@@ -51,6 +51,10 @@ impl InstanceConfig {
             !self.server.start_command.trim().is_empty(),
             "start command is missing"
         );
+        ensure!(
+            self.server.auto_restart_max_times >= -1,
+            "auto restart maximum must be -1 or greater"
+        );
         Ok(())
     }
     pub fn create(&self) -> crate::Result<InstanceService> {
@@ -63,7 +67,11 @@ impl InstanceConfig {
                 .spawner(LocalSpawner::new())
                 .event_bus(TokioBroadcastBus::new())
                 .build_server(self.server.clone()),
-            RestartPolicy::never(),
+            RestartPolicy {
+                enabled: self.server.auto_restart,
+                max_retries: self.server.auto_restart_max_times,
+                ..RestartPolicy::default()
+            },
         ))
     }
 }
