@@ -1,4 +1,6 @@
 use super::*;
+use crate::runtime::Application;
+type F = flows::FlowAction<events::EventsDomain>;
 use authority::journal::Journal;
 use client::protocol::Privacy;
 use node::{Node, NodeConfig};
@@ -194,4 +196,253 @@ async fn automatic_flow(replicated: bool, decision: Option<&'static str>) -> Res
         assert_eq!(calls.load(Ordering::SeqCst),1);
         Ok::<_,anyhow::Error>(())
     }).await?
+}
+
+// An office-only domain: no competitions, game resources or player points.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct OfficeDomain;
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct OfficeState {
+    files: events::office::files::FileStore,
+}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum OfficeAction {
+    PutBlock(node::protocol::IpldBlock),
+    Review(node::protocol::Cid),
+}
+impl state::Domain for OfficeDomain {
+    type State = OfficeState;
+    type Action = OfficeAction;
+
+    fn artifact(state: &Self::State, cid: &str) -> node::Result<Vec<u8>> {
+        state.files.read(&cid.parse()?)
+    }
+
+    fn review_artifact(_: &Self::State, action: &Self::Action) -> node::Result<String> {
+        match action {
+            OfficeAction::Review(cid) => Ok(cid.to_string()),
+            _ => Err(node::Error::Denied),
+        }
+    }
+
+    fn workflow_input(state: &Self::State, action: &Self::Action) -> node::Result<Vec<u8>> {
+        Self::artifact(state, &Self::review_artifact(state, action)?)
+    }
+
+    fn workflow_worker(_: &Self::State, _: &Self::Action) -> Option<String> {
+        Some("worker".into())
+    }
+
+    fn transition(
+        state: &mut Self::State,
+        _: &state::Context<'_>,
+        action: Self::Action,
+    ) -> node::Result<()> {
+        match action {
+            OfficeAction::PutBlock(block) => state.files.put(block),
+            OfficeAction::Review(_) => Ok(()),
+        }
+    }
+}
+impl AiDomain for OfficeDomain {
+    fn files(state: &Self::State) -> &events::office::files::FileStore {
+        &state.files
+    }
+
+    fn put_block(block: node::protocol::IpldBlock) -> Self::Action {
+        OfficeAction::PutBlock(block)
+    }
+}
+
+#[tokio::test]
+async fn office_domain_registers_worker_and_commits_file_versions() -> Result<()> {
+    type Office = flows::Flows<OfficeDomain>;
+    let dir = tempfile::tempdir()?;
+    let worker = Identity::generate();
+    let identities =
+        crate::test_identity::Identities::new(&[(&worker, "worker", "school")], "worker");
+    let genesis = identities.genesis::<Office>();
+    let authority = Authority::Local {
+        journal: Arc::new(Mutex::new(Journal::open(
+            dir.path().join("office"),
+            genesis,
+        )?)),
+        view: identities.log.view(std::time::Duration::from_secs(60))?,
+        log: Arc::new(Mutex::new(identities.log)),
+    };
+    let files = OfficeState::default();
+    let (input, blocks) = OfficeDomain::files(&files).version(None, b"office notes")?;
+    for block in blocks {
+        apply(
+            &authority,
+            &worker,
+            flows::FlowAction::Inner(OfficeDomain::put_block(block)),
+        )
+        .await?;
+    }
+    let snapshot = authority.state(worker.peer_id()).await?;
+    let (output, blocks) = OfficeDomain::files(&snapshot.domain.inner)
+        .version(Some(input.clone()), b"office summary")?;
+    for block in blocks {
+        apply(
+            &authority,
+            &worker,
+            flows::FlowAction::Inner(OfficeDomain::put_block(block)),
+        )
+        .await?;
+    }
+    let snapshot = authority.state(worker.peer_id()).await?;
+    let files = OfficeDomain::files(&snapshot.domain.inner);
+    assert_eq!(files.read(&input)?, b"office notes");
+    assert_eq!(files.read(&output)?, b"office summary");
+
+    let prepared = Prepared {
+        identity: worker.clone(),
+        providers: llm_gateway::Gateway::new(llm_gateway::Config {
+            providers: vec![serde_json::from_value(serde_json::json!({
+                "id":"fixture", "protocol":"chat_completions", "url":"http://127.0.0.1:1",
+                "models":["local"], "context_tokens":4096
+            }))?],
+            concurrency: 1,
+        })?,
+    };
+    let mut updates = authority.watch().await;
+    let task = tokio::spawn(serve(authority.clone(), prepared));
+    let registered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let snapshot = authority.state(worker.peer_id()).await?;
+            if let Some(worker) = snapshot.domain.ai_workers.get("worker") {
+                assert!(worker.active);
+                assert_eq!(worker.models, ["local".into()].into());
+                return Ok::<_, anyhow::Error>(());
+            }
+            updates.changed().await?;
+        }
+    })
+    .await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    registered??;
+    Ok(())
+}
+
+#[test]
+fn office_domain_review_checks_canonical_input_and_cancellation() -> Result<()> {
+    let worker = Identity::generate();
+    let identities =
+        crate::test_identity::Identities::new(&[(&worker, "worker", "school")], "worker");
+    let mut snapshot = identities.genesis::<flows::Flows<OfficeDomain>>();
+    let view = identities.log.view(std::time::Duration::from_secs(60))?;
+    let (input, blocks) = snapshot
+        .domain
+        .inner
+        .files
+        .version(None, b"review material")?;
+    for block in blocks {
+        snapshot.domain.inner.files.put(block)?;
+    }
+    let job = flows::AiJob {
+        mode: flows::AiMode::Review,
+        instance: "review".into(),
+        job: "job".into(),
+        attempt: 0,
+        input: input.clone(),
+        worker: "worker".into(),
+        model: "local".into(),
+        purpose: "office.review".into(),
+        privacy: Privacy::Sensitive,
+        max_tokens: 32,
+    };
+    snapshot.domain.flows.insert(
+        "review".into(),
+        flows::Instance {
+            workflow: None,
+            template: "review".into(),
+            template_epoch: 1,
+            payload: OfficeAction::Review(input.clone()),
+            input: Some(input),
+            proposer: "worker".into(),
+            proposer_device: worker.peer_id().to_string(),
+            started_ms: 0,
+            payer: node::protocol::PointAccount {
+                club: "school".into(),
+                member: "worker".into(),
+            },
+            allowance: Some(node::protocol::AiAllowance {
+                scope: "office".into(),
+                epoch: 1,
+            }),
+            current: 0,
+            records: vec![flows::StageRecord {
+                ai_runs: vec![flows::AiRun {
+                    review: None,
+                    retry_requested: false,
+                    job: "job".into(),
+                    device: worker.peer_id().to_string(),
+                    usage: None,
+                    charged_points: 0,
+                    refunded_points: 0,
+                    output: None,
+                    error: None,
+                }],
+                ..Default::default()
+            }],
+            status: flows::Status::Active,
+            deadline_ms: None,
+        },
+    );
+    assert!(running(&snapshot, &worker, &job, &view)?);
+    let (other, _) = snapshot
+        .domain
+        .inner
+        .files
+        .version(None, b"unrelated material")?;
+    snapshot.domain.flows.get_mut("review").unwrap().payload = OfficeAction::Review(other);
+    assert!(!running(&snapshot, &worker, &job, &view)?);
+    snapshot.domain.flows.get_mut("review").unwrap().payload =
+        OfficeAction::Review(job.input.clone());
+    snapshot.domain.flows.get_mut("review").unwrap().status = flows::Status::Cancelled;
+    assert!(!running(&snapshot, &worker, &job, &view)?);
+    snapshot.domain.flows.get_mut("review").unwrap().status = flows::Status::Active;
+    snapshot.domain.flows.get_mut("review").unwrap().deadline_ms = Some(0);
+    assert!(!running(&snapshot, &worker, &job, &view)?);
+    snapshot.domain.flows.get_mut("review").unwrap().deadline_ms = None;
+    identities.log.mark_stale();
+    assert!(running(&snapshot, &worker, &job, &view).is_err());
+    Ok(())
+}
+
+#[test]
+fn office_document_attachments_resolve_deduplicate_and_reject_unsupported_files() -> Result<()> {
+    let mut files = events::office::files::FileStore::default();
+    let (pdf, blocks) = files.version(None, b"%PDF-1.7\nfixture")?;
+    for block in blocks {
+        files.put(block)?;
+    }
+    let evidence = serde_json::json!({"first":{"cid":pdf,"requires_document_review":true},
+        "nested":[{"cid":pdf,"requires_document_review":true}]});
+    let (attachments, capabilities) =
+        document_attachments(&files, &serde_json::to_vec(&evidence)?)?;
+    assert_eq!(attachments.len(), 1);
+    assert_eq!(attachments[0].mime, "application/pdf");
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD.decode(&attachments[0].data)?,
+        b"%PDF-1.7\nfixture"
+    );
+    assert_eq!(
+        capabilities,
+        [
+            node::protocol::LlmCapability::Pdf,
+            node::protocol::LlmCapability::Vision
+        ]
+        .into()
+    );
+    let (text, blocks) = files.version(None, b"plain text")?;
+    for block in blocks {
+        files.put(block)?;
+    }
+    let unsupported = serde_json::json!({"cid":text,"requires_document_review":true});
+    assert!(document_attachments(&files, &serde_json::to_vec(&unsupported)?).is_err());
+    assert!(document_attachments(&files, b"plain input")?.0.is_empty());
+    Ok(())
 }

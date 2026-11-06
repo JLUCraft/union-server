@@ -1,13 +1,28 @@
 //! Automatic, serial execution of committed AI stages. Model I/O never runs in replay.
-use crate::runtime::Application;
 use anyhow::{Context, Result, bail};
 use authority::authority::Authority;
 use authority::journal::now_ms;
 use base64::Engine;
+use flows::FlowAction as F;
 use identity::Identity;
 use serde::Deserialize;
 use std::path::PathBuf;
-type F = flows::FlowAction<events::EventsDomain>;
+
+/// File storage capabilities needed in addition to the workflow hooks on `Domain`.
+pub(crate) trait AiDomain: state::Domain {
+    fn files(state: &Self::State) -> &events::office::files::FileStore;
+    fn put_block(block: node::protocol::IpldBlock) -> Self::Action;
+}
+
+impl AiDomain for events::EventsDomain {
+    fn files(state: &Self::State) -> &events::office::files::FileStore {
+        &state.files
+    }
+
+    fn put_block(block: node::protocol::IpldBlock) -> Self::Action {
+        events::EventAction::PutBlock { block }
+    }
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -30,13 +45,20 @@ pub(crate) fn prepare(config: Config) -> Result<Prepared> {
         })?,
     })
 }
-async fn apply(authority: &Authority<Application>, identity: &Identity, action: F) -> Result<()> {
+async fn apply<D: state::Domain>(
+    authority: &Authority<flows::Flows<D>>,
+    identity: &Identity,
+    action: F<D>,
+) -> Result<()> {
     authority
         .apply(identity, state::governance::Action::Domain(action))
         .await?;
     Ok(())
 }
-pub(crate) async fn serve(authority: Authority<Application>, prepared: Prepared) -> Result<()> {
+pub(crate) async fn serve<D: AiDomain>(
+    authority: Authority<flows::Flows<D>>,
+    prepared: Prepared,
+) -> Result<()> {
     let unified = authority.identity_view();
     let Prepared {
         identity,
@@ -191,7 +213,10 @@ pub(crate) async fn serve(authority: Authority<Application>, prepared: Prepared)
         .await;
     }
 }
-async fn recover(authority: &Authority<Application>, identity: &Identity) -> Result<()> {
+async fn recover<D: state::Domain>(
+    authority: &Authority<flows::Flows<D>>,
+    identity: &Identity,
+) -> Result<()> {
     let device = identity.peer_id().to_string();
     // A crash may leave an externally billed call without a committed receipt.
     // Record it as failed; explicit retry creates a new attempt instead of silently rebilling.
@@ -230,17 +255,17 @@ async fn recover(authority: &Authority<Application>, identity: &Identity) -> Res
     }
     Ok(())
 }
-async fn execute(
-    authority: &Authority<Application>,
+async fn execute<D: AiDomain>(
+    authority: &Authority<flows::Flows<D>>,
     providers: &llm_gateway::Gateway,
     identity: &Identity,
     job: &flows::AiJob,
     unified: &authority::trust::TrustView,
 ) -> Result<(client::protocol::Cid, client::protocol::LlmUsage)> {
     let snapshot = authority.state(identity.peer_id()).await?;
-    let input = snapshot.domain.inner.files.read(&job.input)?;
-    let (attachments, required_capabilities) =
-        document_attachments(&snapshot.domain.inner, &input)?;
+    let files = D::files(&snapshot.domain.inner);
+    let input = files.read(&job.input)?;
+    let (attachments, required_capabilities) = document_attachments(files, &input)?;
     let content = String::from_utf8(input).context("AI input must be UTF-8")?;
     let context = serde_json::to_string(
         &serde_json::json!({"task":job.purpose,"mode":job.mode,"job":job.job,"input":job.input,"material":content}),
@@ -283,24 +308,16 @@ async fn execute(
     if !running(&state, identity, job, unified)? {
         bail!("AI stage changed");
     }
-    let (cid, blocks) = state
-        .domain
-        .inner
-        .files
+    let (cid, blocks) = D::files(&state.domain.inner)
         .version(Some(job.input.clone()), completion.content.as_bytes())?;
     for block in blocks {
-        apply(
-            authority,
-            identity,
-            F::Inner(events::EventAction::PutBlock { block }),
-        )
-        .await?;
+        apply(authority, identity, F::Inner(D::put_block(block))).await?;
     }
     Ok((cid, completion.usage))
 }
 
-fn running(
-    state: &state::State<Application>,
+fn running<D: state::Domain>(
+    state: &state::State<flows::Flows<D>>,
     identity: &Identity,
     job: &flows::AiJob,
     unified: &authority::trust::TrustView,
@@ -316,19 +333,9 @@ fn running(
         }
     }
     if flow.allowance.is_some() {
-        let expected = <events::EventsDomain as state::Domain>::workflow_input(
-            &state.domain.inner,
-            &flow.payload,
-        );
-        let actual = <events::EventsDomain as state::Domain>::artifact(
-            &state.domain.inner,
-            &job.input.to_string(),
-        );
-        if <events::EventsDomain as state::Domain>::workflow_worker(
-            &state.domain.inner,
-            &flow.payload,
-        )
-        .as_deref()
+        let expected = D::workflow_input(&state.domain.inner, &flow.payload);
+        let actual = D::artifact(&state.domain.inner, &job.input.to_string());
+        if D::workflow_worker(&state.domain.inner, &flow.payload).as_deref()
             != Some(job.worker.as_str())
             || !matches!((expected,actual),(Ok(expected),Ok(actual)) if expected==actual)
         {
@@ -336,12 +343,9 @@ fn running(
         }
     }
     if job.mode == flows::AiMode::Review
-        && <events::EventsDomain as state::Domain>::review_artifact(
-            &state.domain.inner,
-            &flow.payload,
-        )
-        .ok()
-        .as_deref()
+        && D::review_artifact(&state.domain.inner, &flow.payload)
+            .ok()
+            .as_deref()
             != Some(job.input.to_string().as_str())
     {
         return Ok(false);
@@ -375,8 +379,8 @@ async fn wait_updates(
     Ok(())
 }
 
-fn effective_core(
-    state: &state::State<Application>,
+fn effective_core<D: state::Domain>(
+    state: &state::State<D>,
     unified: &authority::trust::TrustView,
 ) -> Result<state::governance::CoreState> {
     Ok(state.identity_core(unified.state()?.as_ref())?)
@@ -386,7 +390,7 @@ fn effective_core(
 mod tests;
 
 fn document_attachments(
-    state: &events::EventsState,
+    files: &events::office::files::FileStore,
     input: &[u8],
 ) -> Result<(
     Vec<node::protocol::LlmAttachment>,
@@ -422,7 +426,7 @@ fn document_attachments(
     let mut attachments = Vec::new();
     let mut capabilities = std::collections::BTreeSet::new();
     for cid in cids {
-        let bytes = state.files.read(&cid.parse()?)?;
+        let bytes = files.read(&cid.parse()?)?;
         let mime = node::protocol::llm_document_mime(&bytes)
             .context("unsupported office document format")?;
         let extension = match mime {
