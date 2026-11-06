@@ -46,11 +46,12 @@ Backup and restore submissions require an idempotency key and return a job ID. B
 
 ## MCP adapter
 
-Set `services.mcp` to expose the control-plane services through the Model Context Protocol over Streamable HTTP at `POST /mcp`. The adapter is optional and disabled by default and is a peer of the manager app: it consumes the same operations service and the same organization-application journal.
+Set `services.mcp` to expose the control-plane services through the Model Context Protocol over Streamable HTTP at `POST /mcp`. The adapter is optional and disabled by default and is a peer of the manager app: it consumes the operations and read-only identity services. Application tools are temporarily unavailable pending delegation support.
 
 ```json
 {
   "bind": "127.0.0.1:9090",
+  "relay_key": "relay.key",
   "operations": [
     {
       "name": "ops",
@@ -62,19 +63,27 @@ Set `services.mcp` to expose the control-plane services through the Model Contex
   "principals": [
     {
       "name": "alice",
-      "key": "alice.key",
-      "token": "alice.token",
+      "peer": "<alice-peer>",
       "operations": ["ops"],
-      "trust": "alice-trust.json",
       "identity": { "peer": "<identity-host-peer>", "address": "/ip4/127.0.0.1/udp/40000/quic-v1" }
     }
   ]
 }
 ```
 
-Each principal is a distinct caller: `token` is its Bearer secret, `key` is its signing identity, `operations` lists the operations endpoints it may use, `trust` supplies the per-caller trust configuration for organization-application requests, and `identity` is the optional identity service used for read-only genesis retrieval. Operations calls use `client::ops::tool_request` and carry a delegation envelope signed by the existing principal key. That principal's node must hold `mcp_relay` as well as the required operations permission. Principal configuration and private-key loading remain in place. Application calls continue to use that principal's signing identity, so server-side authorization and audit stay per caller; there is no shared executor. Set `allowed_hosts` (and `allowed_origins` if browsers connect directly) when the listener is reached through a LAN name or a reverse proxy; the library default accepts loopback hosts only. Keep key, token and trust files outside the repository with owner-only permissions. Use a TLS reverse proxy for remote clients; do not expose the plain HTTP listener directly to an untrusted network.
+The gateway loads only `relay_key` and starts one relay node. Each principal registers a distinct caller `peer`, an `operations` endpoint allowlist, and an optional `identity` endpoint for genesis retrieval. Principal peers must be valid, unique, and different from the relay peer. At most one operations endpoint may be assigned to each principal. Paths are relative to the host configuration file. Caller private keys stay with callers; the gateway has no caller key, token, or trust-file setting.
 
-The catalog contains 32 tools in three groups. The 20 `ops_*` tools cover capabilities, instance lifecycle, league start and stop, metrics, recent logs, game commands, jobs, audit, and backups. The 9 `application_*` tools read the application snapshot and submit league creation, event creation and amendment, flow approval and rejection, file upload, AI point requests, and general governance actions through the same dispatcher the manager app uses. `application_execute` takes one required JSON object, `action`, with a non-empty string `type`; it supports organization resources, league teams, disputes and seasons, flow AI retries and pokes, and other dispatcher actions. It rejects `local.files.upload`: uploads must use `application_upload_file` with inline bytes in `content_base64`. The 3 `identity_*` tools expose the caller's public identity, its pinned genesis, and history review. Tool arguments use strict schemas; a caller without the matching endpoint, trust configuration, or identity endpoint receives a clear tool error. Backup jobs require caller-supplied idempotency keys and return structured job data for `ops_get_job`. Tool-level failures preserve the operations error object instead of collapsing into an MCP transport error.
+Every request supplies `X-JLUCraft-Envelope`, an unpadded base64url encoding of the signed `McpEnvelope` JSON. The encoded header is limited to 4 KiB and the request body to 8 MiB. The signature binds the caller's Ed25519 public key and peer, audience, issue/expiry times, nonce, and canonical request digest. The shared `identity::mcp_envelope::canonical_request(method, arguments)` helper recursively sorts JSON keys and builds `{"method": method, "params": {"arguments": arguments}}`, omitting `arguments` when absent. For `tools/call`, the method is the tool name and arguments come from the original `params.arguments`; for other RPC methods, arguments are the original params. The gateway removes `params._meta` first; nested `_meta` keys remain signed. Omitted arguments and explicit `{}` have distinct digests. Hashing rejects floating-point parameters and batches. RPC IDs are outside the digest.
+
+`aud.gateway` always names the relay peer. For operations calls, `aud.peer` and `aud.service` name the configured operations host and service, and `aud.tool` is the tool name. For `initialize`, `tools/list`, `ping`, and `notifications/initialized`, use the relay peer, service `gateway`, and the method name. For `identity_*` and the currently unavailable `application_*` tools, use the relay peer, service `gateway`, and the tool name. The gateway independently verifies every request and places the verified principal, original envelope, and digest in the request context. It forwards the original caller signature and optional canonical arguments to operations through the relay node. Operations verifies the same canonical request before treating absent arguments as `{}` for tool mapping. Grant the relay device `mcp_relay` on that operations service; the caller still needs its own operation permission. The operations service verifies delegation and uses the signer for authorization and audit.
+
+Envelope lifetime is at most 60 seconds. The gateway allows 30 seconds of clock drift and retains each signer/nonce through `exp_ms + 30 seconds`, including that boundary. Its replay cache holds 65,536 entries, never evicts a live nonce, and is independent of the operations service cache. A fresh nonce is required for each HTTP attempt, including retries. Cache state is in memory; restarting the gateway clears it, so an unexpired envelope may be accepted again after restart. Keep clocks synchronized.
+
+Missing or malformed headers and malformed JSON return HTTP 400. Invalid signatures, time claims, request digests, and replayed nonces return 401. Unregistered signers, audience mismatches, and disallowed tools or operations targets return 403. Oversized headers or bodies return 413; replay-cache exhaustion or unavailability returns 503. Business failures remain tool results with their structured operations errors.
+
+The catalog keeps 32 tools: 20 `ops_*`, 9 `application_*`, and 3 `identity_*`. Operations cover capabilities, instance lifecycle, league start and stop, metrics, logs, commands, jobs, audit, and backups. Backup jobs require caller-supplied idempotency keys and can be queried with `ops_get_job`. `identity_public` returns the envelope signer's peer and public key in the existing response format; `identity_genesis` fetches genesis through the relay node, and `identity_review` verifies supplied history. Every `application_*` call currently returns an explicit unavailable tool error pointing to future application delegation support: the gateway no longer holds caller private keys and cannot sign application actions. The tool schemas remain available for discovery.
+
+Set `allowed_hosts` and, for browser clients, `allowed_origins` when connecting through a LAN name or reverse proxy; the library default accepts loopback hosts only. Keep the relay key outside the repository with owner-only permissions and use a TLS reverse proxy for remote clients.
 
 ## Validation
 

@@ -450,10 +450,8 @@ fn authorize_request(
             crate::ops_extended::fault(OpsErrorCode::PermissionDenied, error.to_string())
         })?;
         let now = authority::journal::now_ms()?;
-        let signed_request = serde_json::json!({
-            "method": "tools/call",
-            "params": {"name": delegation.tool, "arguments": delegation.arguments},
-        });
+        let signed_request =
+            mcp::canonical_request(&delegation.tool, delegation.arguments.as_ref());
         // verify also inserts a nonce. Use a disposable cache until the tool/op
         // binding passes, then claim it atomically in this service's shared cache.
         let verification_cache = ReplayCache::new(1);
@@ -471,10 +469,16 @@ fn authorize_request(
             },
         )
         .map_err(delegation_error)?;
-        let op = client::ops::tool_request(&delegation.tool, delegation.arguments.clone())
-            .map_err(|error| {
-                crate::ops_extended::fault(OpsErrorCode::InvalidRequest, error.to_string())
-            })?;
+        let op = client::ops::tool_request(
+            &delegation.tool,
+            delegation
+                .arguments
+                .clone()
+                .unwrap_or_else(|| serde_json::json!({})),
+        )
+        .map_err(|error| {
+            crate::ops_extended::fault(OpsErrorCode::InvalidRequest, error.to_string())
+        })?;
         if op != request.op {
             return Err(crate::ops_extended::fault(
                 OpsErrorCode::InvalidRequest,
@@ -619,14 +623,24 @@ mod tests {
         }
 
         fn request(&self, tool: &str, arguments: serde_json::Value) -> OpsRequest {
+            self.request_with_arguments(tool, Some(arguments))
+        }
+
+        fn request_with_arguments(
+            &self,
+            tool: &str,
+            arguments: Option<serde_json::Value>,
+        ) -> OpsRequest {
             use base64::Engine;
             use identity::mcp_envelope as mcp;
             let now = authority::journal::now_ms().unwrap();
-            let request = serde_json::json!({"method": "tools/call", "params": {
-                "name": tool, "arguments": arguments,
-            }});
+            let request = mcp::canonical_request(tool, arguments.as_ref());
             OpsRequest {
-                op: client::ops::tool_request(tool, arguments.clone()).unwrap(),
+                op: client::ops::tool_request(
+                    tool,
+                    arguments.clone().unwrap_or_else(|| serde_json::json!({})),
+                )
+                .unwrap(),
                 delegation: Some(node::protocol::OpsDelegation {
                     envelope: mcp::sign(
                         node::protocol::McpClaims {
@@ -722,9 +736,7 @@ mod tests {
                 service: &claims.aud.service,
                 tool: &delegation.tool,
                 allowed_drift_ms: mcp::REPLAY_RETENTION_MS,
-                request: &serde_json::json!({"method": "tools/call", "params": {
-                    "name": delegation.tool, "arguments": delegation.arguments,
-                }}),
+                request: &mcp::canonical_request(&delegation.tool, delegation.arguments.as_ref()),
                 replay_cache: &gateway_cache,
             },
         )?;
@@ -732,6 +744,50 @@ mod tests {
             fixture.authorize(&request, &ReplayCache::default())?,
             fixture.signer.peer_id()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn delegation_preserves_omitted_and_empty_arguments() -> Result<()> {
+        use identity::mcp_envelope::{self as mcp, ReplayCache};
+        use node::protocol::OpsErrorCode;
+        let fixture = DelegationFixture::new("mcp_relay");
+        let omitted = fixture.request_with_arguments("ops_capabilities", None);
+        let empty = fixture.request("ops_capabilities", serde_json::json!({}));
+        assert_eq!(omitted.op, empty.op);
+        assert_ne!(
+            omitted.delegation.as_ref().unwrap().envelope.claims.digest,
+            empty.delegation.as_ref().unwrap().envelope.claims.digest
+        );
+        for (request, arguments) in [(&omitted, Some(serde_json::json!({}))), (&empty, None)] {
+            let json = serde_json::to_value(request)?;
+            assert_eq!(
+                json["delegation"].get("arguments").is_none(),
+                arguments.is_some()
+            );
+            let decoded: OpsRequest = serde_json::from_value(json)?;
+            assert_eq!(&decoded, request);
+            let delegation = decoded.delegation.as_ref().unwrap();
+            assert_eq!(
+                delegation.envelope.claims.digest,
+                mcp::request_digest(&mcp::canonical_request(
+                    &delegation.tool,
+                    delegation.arguments.as_ref()
+                ))?
+            );
+            let cache = ReplayCache::default();
+            let mut changed = decoded.clone();
+            changed.delegation.as_mut().unwrap().arguments = arguments;
+            assert_code(
+                fixture.authorize(&changed, &cache),
+                OpsErrorCode::InvalidRequest,
+            );
+            assert_eq!(
+                fixture.authorize(&decoded, &cache)?,
+                fixture.signer.peer_id()
+            );
+            assert_code(fixture.authorize(&decoded, &cache), OpsErrorCode::Conflict);
+        }
         Ok(())
     }
 
@@ -784,7 +840,13 @@ mod tests {
         let original = fixture.request("ops_status", serde_json::json!({"instance": "test"}));
         let cache = ReplayCache::default();
         let mut changed = original.clone();
-        changed.delegation.as_mut().unwrap().arguments["instance"] = "changed".into();
+        changed
+            .delegation
+            .as_mut()
+            .unwrap()
+            .arguments
+            .as_mut()
+            .unwrap()["instance"] = "changed".into();
         assert_code(
             fixture.authorize(&changed, &cache),
             OpsErrorCode::InvalidRequest,
@@ -918,7 +980,13 @@ mod tests {
         // A new nonce and a legacy request must resolve to the original job and digest.
         let retry = identity.request(
             "ops_create_backup",
-            backup.delegation.as_ref().unwrap().arguments.clone(),
+            backup
+                .delegation
+                .as_ref()
+                .unwrap()
+                .arguments
+                .clone()
+                .unwrap(),
         );
         assert_eq!(
             fleet.execute_tracked(retry, &actor).await?.job.unwrap().id,

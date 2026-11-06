@@ -141,7 +141,7 @@ fn configuration_rejects_unknown_fields_missing_governance_and_colliding_service
     Ok(())
 }
 #[test]
-fn mcp_configuration_resolves_local_secret_paths_and_validates_target() -> Result {
+fn mcp_configuration_resolves_only_relay_key_and_validates_target() -> Result {
     let dir = tempfile::tempdir()?;
     let peer = Identity::generate().peer_id().to_string();
     let path = dir.path().join("node.json");
@@ -149,6 +149,7 @@ fn mcp_configuration_resolves_local_secret_paths_and_validates_target() -> Resul
         &path,
         &json!({"node":{"key":"node.key"},"services":{"mcp":{
             "bind":"127.0.0.1:9090",
+            "relay_key":"relay.key",
             "operations":[{
                 "name":"ops",
                 "address":format!("/ip4/127.0.0.1/udp/40000/quic-v1/p2p/{peer}"),
@@ -157,23 +158,21 @@ fn mcp_configuration_resolves_local_secret_paths_and_validates_target() -> Resul
             }],
             "principals":[{
                 "name":"alice",
-                "key":"mcp.key",
-                "token":"mcp.token",
+                "peer":Identity::generate().peer_id().to_string(),
                 "operations":["ops"]
             }]
         }}}),
     )?;
-    std::fs::write(dir.path().join("mcp.token"), "secret")?;
-    std::fs::write(dir.path().join("mcp.key"), "key")?;
+    Identity::generate().save_new(dir.path().join("relay.key"))?;
     let config = Config::load(&path, None)?;
     let mcp = config
         .services
         .mcp
         .as_ref()
         .ok_or("MCP configuration missing")?;
-    let principal = mcp.principals.first().ok_or("MCP principal missing")?;
-    assert_eq!(principal.key, dir.path().join("mcp.key"));
-    assert_eq!(principal.token, dir.path().join("mcp.token"));
+    assert_eq!(mcp.relay_key, dir.path().join("relay.key"));
+    assert_eq!(mcp.principals.len(), 1);
+    config.validate()?;
     Ok(())
 }
 

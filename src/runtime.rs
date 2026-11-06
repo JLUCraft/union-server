@@ -304,13 +304,7 @@ impl Config {
             }
         }
         if let Some(mcp) = &mut config.services.mcp {
-            for principal in &mut mcp.principals {
-                relative(base, &mut principal.key);
-                relative(base, &mut principal.token);
-                if let Some(path) = &mut principal.trust {
-                    relative(base, path);
-                }
-            }
+            relative(base, &mut mcp.relay_key);
         }
         if let Some(o) = &mut config.services.operations {
             relative(base, &mut o.state);
