@@ -53,10 +53,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
-      # Siblings are checked out at their default branches, so the committed lock
-      # file may legitimately need refreshing here; the local check keeps --locked.
+      # Siblings use their main branches, and the lockfile matches this combination.
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Test
-        run: cargo test
+        run: cargo test --locked
