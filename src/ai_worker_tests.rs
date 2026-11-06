@@ -1,6 +1,6 @@
 use super::*;
 use crate::runtime::Application;
-type F = flows::FlowAction<events::EventsDomain>;
+type F = flows::FlowAction<league::events::EventsDomain>;
 use authority::journal::Journal;
 use client::protocol::Privacy;
 use node::{Node, NodeConfig};
@@ -126,29 +126,29 @@ async fn automatic_flow(replicated: bool, decision: Option<&'static str>) -> Res
             let log=Mutex::new(client::trust::TrustLog::open(&dir.path().join("client.jsonl"),&identity_genesis,&identity_pin)?);
             authority::trust::synchronize(&client_node,host_key.peer_id(),&log).await?;log.into_inner()
         };
-        while client::files::snapshot(&client_node,host_key.peer_id(),&hash).await.is_err() {tokio::time::sleep(std::time::Duration::from_millis(50)).await;}
+        while league::files::snapshot(&client_node,host_key.peer_id(),&hash).await.is_err() {tokio::time::sleep(std::time::Duration::from_millis(50)).await;}
         let install=state::governance::Action::Domain(F::InstallTemplate{id:"summary".into(),template});
         assert!(genesis.clone().apply(&worker.peer_id().to_string(),0,now,install.clone(),cache.state()).is_err());
         let installed=client::trust::execute::<Application>(&client_node,host_key.peer_id(),&hash,&human,&cache,install,client::journal::PROTOCOL).await?;
         assert!(installed.error.is_none(),"{:?}",installed.error);
         let roles=client::trust::execute::<Application>(&client_node,host_key.peer_id(),&hash,&human,&cache,state::governance::Action::SetMemberRoles{member:"human".into(),roles:["president".into()].into()},client::journal::PROTOCOL).await?;
         assert!(roles.error.is_none());
-        let input=client::files::upload(&client_node,host_key.peer_id(),&hash,&human,client::files::Upload{branch:"main",path:"notes.txt",message:"meeting input",bytes:b"meeting notes"},&cache).await?;
-        let snapshot=client::files::snapshot(&client_node,host_key.peer_id(),&hash).await?;
+        let input=league::files::upload(&client_node,host_key.peer_id(),&hash,&human,league::files::Upload{branch:"main",path:"notes.txt",message:"meeting input",bytes:b"meeting notes"},&cache).await?;
+        let snapshot=league::files::snapshot(&client_node,host_key.peer_id(),&hash).await?;
         let mut updates=authority::events::subscribe(&client_node,host_key.peer_id(),snapshot.revision,authority::events::PROTOCOL).await?;
-        let create=events::EventAction::Create{id:"event".into(),title:"meeting".into(),brief_hash:input.to_string(),window:events::Window{opens_ms:now+60000,closes_ms:now+120000,starts_ms:now+180000}};
+        let create=league::events::EventAction::Create{id:"event".into(),title:"meeting".into(),brief_hash:input.to_string(),window:events::Window{opens_ms:now+60000,closes_ms:now+120000,starts_ms:now+180000}};
         let payload=if decision.is_some() {
-            for action in [create,events::EventAction::Submit{id:"event".into()}] {
+            for action in [create,league::events::EventAction::Submit{id:"event".into()}] {
                 let reply=client::trust::execute::<Application>(&client_node,host_key.peer_id(),&hash,&human,&cache,state::governance::Action::Domain(F::Inner(action)),client::journal::PROTOCOL).await?;
                 assert!(reply.error.is_none());
             }
-            events::EventAction::Approve{id:"event".into(),epoch:1,co_organizers:Default::default()}
+            league::events::EventAction::Approve{id:"event".into(),epoch:1,co_organizers:Default::default()}
         } else {create};
         let action=state::governance::Action::Domain(F::Start{ max_points: 1_000_000,id:"flow".into(),template:"summary".into(),input:Some(input.clone()),payload});
         let reply=client::trust::execute::<Application>(&client_node,host_key.peer_id(),&hash,&human,&cache,action,client::journal::PROTOCOL).await?;
         assert!(reply.error.is_none(),"{:?}",reply.error);
         let mut state=loop {
-            let snapshot=client::files::snapshot(&client_node,host_key.peer_id(),&hash).await?;
+            let snapshot=league::files::snapshot(&client_node,host_key.peer_id(),&hash).await?;
             let flow=&snapshot.domain.flows["flow"];
             let expected=match decision {Some("reject" | "timeout")=>flows::Status::Rejected,Some("changes_requested")=>flows::Status::ChangesRequested,Some("invalid" | "approve")=>flows::Status::Active,_=>flows::Status::Approved};
             if flow.status==expected && flow.records[0].ai_runs.last().is_some_and(|r|r.output.is_some() || r.error.is_some()) {break snapshot;}
@@ -164,7 +164,7 @@ async fn automatic_flow(replicated: bool, decision: Option<&'static str>) -> Res
         if decision==Some("approve") {
             let flow=&state.domain.flows["flow"];
             assert_eq!(flow.current,1);
-            assert_eq!(state.domain.inner.events["event"].phase,events::Phase::Review);
+            assert_eq!(state.domain.inner.events["event"].phase,league::events::Phase::Review);
             assert!(flow.deadline_ms.is_none());
             assert!(matches!(flows::template_for(&state.domain.flow_templates,flow)?.stages[1].approver,flows::Approver::ClubPresidents{..}));
             let worker_node=Node::start(worker.clone(),NodeConfig::default()).await?;
@@ -176,8 +176,8 @@ async fn automatic_flow(replicated: bool, decision: Option<&'static str>) -> Res
                 let reply=client::trust::execute::<Application>(&client_node,host_key.peer_id(),&hash,&human,&cache,state::governance::Action::Domain(action),client::journal::PROTOCOL).await?;
                 assert!(reply.error.is_none(),"{:?}",reply.error);
             }
-            state=client::files::snapshot(&client_node,host_key.peer_id(),&hash).await?;
-            assert_eq!(state.domain.inner.events["event"].phase,events::Phase::Approved);
+            state=league::files::snapshot(&client_node,host_key.peer_id(),&hash).await?;
+            assert_eq!(state.domain.inner.events["event"].phase,league::events::Phase::Approved);
         }
         assert_eq!(calls.load(Ordering::SeqCst),1);
         provider.await?;

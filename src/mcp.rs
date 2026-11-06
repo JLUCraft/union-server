@@ -1128,7 +1128,7 @@ async fn application_invoke(
         }
     };
     let text = wire(trust, action)?;
-    match client::application::execute_with_upload(caller.identity.clone(), &text, inline).await {
+    match league::application::execute_with_upload(caller.identity.clone(), &text, inline).await {
         Ok(response) => Ok(value_result(Ok::<_, String>(response))),
         Err(error) => Ok(value_result(Err::<serde_json::Value, String>(
             error.to_string(),

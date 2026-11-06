@@ -3,8 +3,8 @@
 use crate::protocol::{self, Fields, Packet};
 use anyhow::{Result, bail, ensure};
 use authority::journal::now_ms;
-use client::application::{Action, Authority};
 use identity::Identity;
+use league::application::{Action, Authority};
 use league::governance::{ConnectionHealth, Phase, Route};
 use node::{IncomingSession, Node};
 use serde::Deserialize;
@@ -74,7 +74,7 @@ struct Active {
 }
 struct Runtime {
     journal: Authority,
-    cache: RwLock<client::application::Snapshot>,
+    cache: RwLock<league::application::Snapshot>,
     identity: Identity,
     config: Config,
     witnesses: Option<crate::activity::Witnesses>,
@@ -193,7 +193,7 @@ async fn presence(
     }
     action(
         runtime,
-        client::application::competition(league::LeagueAction::Presence {
+        league::application::competition(league::LeagueAction::Presence {
             league: runtime.config.league.clone(),
             member: member.into(),
             online,
@@ -265,7 +265,7 @@ async fn monitor(shared: Shared, node: Arc<Node>, changed: watch::Sender<()>) ->
             if paused == healthy {
                 action(
                     &runtime,
-                    client::application::competition(league::LeagueAction::Infrastructure {
+                    league::application::competition(league::LeagueAction::Infrastructure {
                         league: runtime.config.league.clone(),
                         healthy,
                     }),
@@ -276,7 +276,7 @@ async fn monitor(shared: Shared, node: Arc<Node>, changed: watch::Sender<()>) ->
             if healthy && expired {
                 action(
                     &runtime,
-                    client::application::competition(league::LeagueAction::Tick {
+                    league::application::competition(league::LeagueAction::Tick {
                         league: runtime.config.league.clone(),
                     }),
                 )
@@ -655,7 +655,7 @@ pub async fn serve(
     };
     action(
         &runtime,
-        client::application::competition(league::LeagueAction::Infrastructure {
+        league::application::competition(league::LeagueAction::Infrastructure {
             league: runtime.config.league.clone(),
             healthy: false,
         }),

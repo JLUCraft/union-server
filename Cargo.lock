@@ -717,9 +717,7 @@ version = "0.2.0"
 dependencies = [
  "authority",
  "events",
- "flows",
  "identity",
- "league",
  "node",
  "protocol",
  "serde",
@@ -1382,7 +1380,6 @@ dependencies = [
 name = "events"
 version = "0.1.0"
 dependencies = [
- "league",
  "node",
  "protocol",
  "serde",
@@ -2520,12 +2517,20 @@ dependencies = [
 name = "league"
 version = "0.2.0"
 dependencies = [
+ "authority",
+ "client",
+ "events",
+ "flows",
+ "futures",
  "identity",
+ "node",
  "protocol",
  "serde",
  "serde_json",
  "sha2 0.11.1",
  "state",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

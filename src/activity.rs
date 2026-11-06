@@ -7,8 +7,8 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
-use events::points::{ACTIVITY_SLICE_MS, ActivityTotals, Attestation, DAY_MS};
 use identity::Identity;
+use league::events::points::{ACTIVITY_SLICE_MS, ActivityTotals, Attestation, DAY_MS};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -22,7 +22,7 @@ use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     sync::oneshot,
 };
-type Application = client::application::Application;
+type Application = league::application::Application;
 const MAX_SESSIONS: usize = 65_536;
 // ActivityOutbox.MAX_REPORT_PLAYERS in the Paper producer uses the same limit.
 const MAX_REPORT_PLAYERS: usize = 256;
@@ -565,9 +565,9 @@ impl OracleContext {
         self.authority
             .apply(
                 &self.identity,
-                client::application::Action::Domain(flows::FlowAction::Inner(
-                    events::EventAction::Organization(
-                        events::workflows::OrganizationAction::ActivityAttest {
+                league::application::Action::Domain(flows::FlowAction::Inner(
+                    league::events::EventAction::Organization(
+                        league::events::workflows::OrganizationAction::ActivityAttest {
                             source: source.into(),
                             window_start_ms: pending.start,
                             window_end_ms: pending.end,

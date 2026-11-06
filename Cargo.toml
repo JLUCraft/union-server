@@ -28,7 +28,7 @@ serde_json = "1"
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }
 subtle = "2"
-league = { path = "../union-core/crates/league" }
+league = { path = "game/league" }
 authority = { path = "../union-core/crates/authority" }
 node = { path = "../union-core/crates/node" }
 identity = { path = "../union-core/crates/identity" }
@@ -49,8 +49,8 @@ unsafe_code = "forbid"
 
 [workspace]
 resolver = "2"
-members = []
-default-members = ["."]
+members = ["game/league"]
+default-members = [".", "game/league"]
 
 [dev-dependencies]
 tempfile = "3"

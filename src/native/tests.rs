@@ -243,7 +243,7 @@ async fn native_cross_node_transfer_substitution_and_returner_fencing() -> Resul
         for (signer, action) in [
             (
                 &admin,
-                client::application::competition(league::LeagueAction::CreateLeague {
+                league::application::competition(league::LeagueAction::CreateLeague {
                     league: "cup".into(),
                     rules: Rules {
                         seats: 1,
@@ -257,14 +257,14 @@ async fn native_cross_node_transfer_substitution_and_returner_fencing() -> Resul
             ),
             (
                 &users[0],
-                client::application::competition(league::LeagueAction::CreateTeam {
+                league::application::competition(league::LeagueAction::CreateTeam {
                     league: "cup".into(),
                     team: "a".into(),
                 }),
             ),
             (
                 &users[0],
-                client::application::competition(league::LeagueAction::Invite {
+                league::application::competition(league::LeagueAction::Invite {
                     league: "cup".into(),
                     team: "a".into(),
                     member: "bob".into(),
@@ -272,14 +272,14 @@ async fn native_cross_node_transfer_substitution_and_returner_fencing() -> Resul
             ),
             (
                 &users[1],
-                client::application::competition(league::LeagueAction::Accept {
+                league::application::competition(league::LeagueAction::Accept {
                     league: "cup".into(),
                     team: "a".into(),
                 }),
             ),
             (
                 &users[0],
-                client::application::competition(league::LeagueAction::Register {
+                league::application::competition(league::LeagueAction::Register {
                     league: "cup".into(),
                     team: "a".into(),
                 }),
@@ -378,7 +378,7 @@ async fn native_cross_node_transfer_substitution_and_returner_fencing() -> Resul
         authority
             .apply(
                 &admin,
-                client::application::competition(league::LeagueAction::Start {
+                league::application::competition(league::LeagueAction::Start {
                     league: "cup".into(),
                     seed: [0; 32],
                 }),
@@ -428,7 +428,7 @@ async fn native_cross_node_transfer_substitution_and_returner_fencing() -> Resul
         authority
             .apply(
                 &admin,
-                client::application::competition(league::LeagueAction::Finish {
+                league::application::competition(league::LeagueAction::Finish {
                     league: "cup".into(),
                 }),
             )

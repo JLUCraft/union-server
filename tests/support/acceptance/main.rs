@@ -70,7 +70,7 @@ async fn main() -> Result<()> {
     terminal_runtime::init_logging();
     match Args::parse().command {
         Command::Application { key, input } => {
-            let response = client::application::execute(
+            let response = league::application::execute(
                 node::Identity::load(key)?,
                 serde_json::from_slice(&std::fs::read(input)?)?,
             )
@@ -83,7 +83,7 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string(&response)?);
         }
         Command::BusinessGenesis { binding, out } => {
-            let state = client::application::Snapshot::new(serde_json::from_slice(
+            let state = league::application::Snapshot::new(serde_json::from_slice(
                 &std::fs::read(binding)?,
             )?)?;
             let pin = node::protocol::digest(&serde_json::to_vec(&state)?);

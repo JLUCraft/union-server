@@ -5,8 +5,8 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
-use client::application::Action;
 use identity::Identity;
+use league::application::Action;
 use league::governance::Phase;
 use serde::Deserialize;
 use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
@@ -15,7 +15,7 @@ use tokio::sync::Mutex;
 
 #[derive(Clone)]
 struct Context {
-    journal: client::application::Authority,
+    journal: league::application::Authority,
     identity: Identity,
     token: Arc<Vec<u8>>,
 }
@@ -46,7 +46,7 @@ async fn apply(
         .state(context.identity.peer_id())
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    if let Action::Domain(flows::FlowAction::Inner(events::EventAction::Competition(
+    if let Action::Domain(flows::FlowAction::Inner(league::events::EventAction::Competition(
         league::LeagueAction::Finish { league },
     ))) = &action
     {
@@ -108,7 +108,7 @@ async fn session(
 }
 pub async fn serve(
     address: SocketAddr,
-    journal: client::application::Authority,
+    journal: league::application::Authority,
     identity: Identity,
     token: String,
 ) -> anyhow::Result<()> {
@@ -134,7 +134,7 @@ pub async fn serve(
                     apply(
                         c,
                         h,
-                        client::application::competition(league::LeagueAction::Score {
+                        league::application::competition(league::LeagueAction::Score {
                             league: s.league,
                             event: s.event,
                             players: s.players,
@@ -152,7 +152,7 @@ pub async fn serve(
                     apply(
                         c,
                         h,
-                        client::application::competition(league::LeagueAction::Finish {
+                        league::application::competition(league::LeagueAction::Finish {
                             league: s.league,
                         }),
                     )
@@ -183,13 +183,13 @@ mod tests {
         let mut journal = Journal::open(directory.path().join("journal"), ids.genesis())?;
         let now = now_ms()?;
         for action in [
-            client::application::competition(league::LeagueAction::CreateLeague {
+            league::application::competition(league::LeagueAction::CreateLeague {
                 league: "cup".into(),
                 rules: Default::default(),
                 host: admin.peer_id().to_string(),
                 scorer: scorer.peer_id().to_string(),
             }),
-            client::application::competition(league::LeagueAction::Start {
+            league::application::competition(league::LeagueAction::Start {
                 league: "cup".into(),
                 seed: [0; 32],
             }),
@@ -198,7 +198,7 @@ mod tests {
         }
         let journal = Arc::new(Mutex::new(journal));
         let context = Context {
-            journal: client::application::Authority::Local {
+            journal: league::application::Authority::Local {
                 journal: journal.clone(),
                 log: Arc::new(Mutex::new(ids.log)),
                 view,
@@ -211,7 +211,7 @@ mod tests {
             apply(
                 context.clone(),
                 headers.clone(),
-                client::application::competition(league::LeagueAction::Finish {
+                league::application::competition(league::LeagueAction::Finish {
                     league: "cup".into()
                 })
             )
@@ -239,7 +239,7 @@ mod tests {
             apply(
                 context.clone(),
                 headers.clone(),
-                client::application::competition(league::LeagueAction::Finish {
+                league::application::competition(league::LeagueAction::Finish {
                     league: "cup".into()
                 })
             )
@@ -250,7 +250,7 @@ mod tests {
             apply(
                 context,
                 headers,
-                client::application::competition(league::LeagueAction::Finish {
+                league::application::competition(league::LeagueAction::Finish {
                     league: "cup".into()
                 })
             )

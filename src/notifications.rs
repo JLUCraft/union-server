@@ -37,7 +37,7 @@ pub(crate) trait NotificationDomain: state::Domain {
     fn checkpoint_action(group: &str, expected: u64, ciphertext: String) -> Result<Self::Action>;
 }
 
-impl NotificationDomain for events::EventsDomain {
+impl NotificationDomain for league::events::EventsDomain {
     fn notices(state: &Self::State) -> &BTreeMap<String, Notice> {
         &state.organization.notices
     }
@@ -59,11 +59,11 @@ impl NotificationDomain for events::EventsDomain {
 
     fn checkpoint_action(group: &str, expected: u64, ciphertext: String) -> Result<Self::Action> {
         ensure!(
-            ciphertext.len() <= events::workflows::MAX_PUSH_CHECKPOINT_BYTES,
+            ciphertext.len() <= league::events::workflows::MAX_PUSH_CHECKPOINT_BYTES,
             "push checkpoint capacity reached"
         );
-        Ok(events::EventAction::Organization(
-            events::workflows::OrganizationAction::PushCheckpoint {
+        Ok(league::events::EventAction::Organization(
+            league::events::workflows::OrganizationAction::PushCheckpoint {
                 group: group.into(),
                 expected,
                 ciphertext,
@@ -693,12 +693,12 @@ mod tests {
 
     #[test]
     fn game_adapter_preserves_checkpoint_action_and_size_limit() -> Result<()> {
-        type Game = flows::Flows<events::EventsDomain>;
+        type Game = flows::Flows<league::events::EventsDomain>;
         let action = Game::checkpoint_action("push", 3, "encrypted".into())?;
         assert_eq!(
             action,
-            flows::FlowAction::Inner(events::EventAction::Organization(
-                events::workflows::OrganizationAction::PushCheckpoint {
+            flows::FlowAction::Inner(league::events::EventAction::Organization(
+                league::events::workflows::OrganizationAction::PushCheckpoint {
                     group: "push".into(),
                     expected: 3,
                     ciphertext: "encrypted".into()
@@ -709,7 +709,7 @@ mod tests {
             Game::checkpoint_action(
                 "push",
                 3,
-                "x".repeat(events::workflows::MAX_PUSH_CHECKPOINT_BYTES + 1)
+                "x".repeat(league::events::workflows::MAX_PUSH_CHECKPOINT_BYTES + 1)
             )
             .is_err()
         );

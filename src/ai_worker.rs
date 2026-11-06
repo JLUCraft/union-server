@@ -14,13 +14,13 @@ pub(crate) trait AiDomain: state::Domain {
     fn put_block(block: node::protocol::IpldBlock) -> Self::Action;
 }
 
-impl AiDomain for events::EventsDomain {
+impl AiDomain for league::events::EventsDomain {
     fn files(state: &Self::State) -> &events::office::files::FileStore {
         &state.files
     }
 
     fn put_block(block: node::protocol::IpldBlock) -> Self::Action {
-        events::EventAction::PutBlock { block }
+        league::events::EventAction::PutBlock { block }
     }
 }
 #[derive(Deserialize)]

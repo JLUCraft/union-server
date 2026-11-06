@@ -245,22 +245,22 @@ async fn application_commands_share_one_journal_and_revocation() -> Result {
         let services = node.list_services(host_key.peer_id()).await?;
         assert_eq!(services.len(),1);
         assert!(services.iter().any(|s| s.protocol == node::protocol::OPS_PROTOCOL));
-        let cid = client::files::upload(&node,host_key.peer_id(),&pin,&member,client::files::Upload {
+        let cid = league::files::upload(&node,host_key.peer_id(),&pin,&member,league::files::Upload {
             branch:"main",path:"notes.txt",message:"initial",bytes:b"shared application"
         },&cache).await?;
-        let snapshot = client::files::snapshot(&node,host_key.peer_id(),&pin).await?;
+        let snapshot = league::files::snapshot(&node,host_key.peer_id(),&pin).await?;
         assert_eq!(snapshot.domain.inner.files.read(&cid)?,b"shared application");
         let admin_node=Node::start(admin.clone(),NodeConfig::default()).await?;
         admin_node.dial(status.addresses[0].parse()?).await?;
         let initial_revision = snapshot.revision;
         let now = authority::journal::now_ms()?;
-        let activity = state::governance::Action::<Application>::Domain(flows::FlowAction::Inner(events::EventAction::Create {
+        let activity = state::governance::Action::<Application>::Domain(flows::FlowAction::Inner(league::events::EventAction::Create {
             id: "activity".into(), title: "Shared organization activity".into(), brief_hash: cid.to_string(),
-            window: events::Window { opens_ms: now, closes_ms: now + 60_000, starts_ms: now + 120_000 },
+            window: league::events::Window { opens_ms: now, closes_ms: now + 60_000, starts_ms: now + 120_000 },
         }));
         let created = client::trust::execute::<Application>(&admin_node,host_key.peer_id(),&pin,&admin,&cache,activity,client::journal::PROTOCOL).await?.state.ok_or("missing activity state")?;
         assert_eq!(created.revision, initial_revision + 1);
-        let competition = client::application::competition(league::LeagueAction::CreateLeague {
+        let competition = league::application::competition(league::LeagueAction::CreateLeague {
             league: "competition".into(), rules: Default::default(), host: host_key.peer_id().to_string(), scorer: member.peer_id().to_string(),
         });
         let combined = client::trust::execute::<Application>(&node,host_key.peer_id(),&pin,&member,&cache,competition,client::journal::PROTOCOL).await?.state.ok_or("missing combined state")?;
@@ -275,7 +275,7 @@ async fn application_commands_share_one_journal_and_revocation() -> Result {
         let response=client::trust::request(&admin_node,host_key.peer_id(),node::protocol::TrustRequest::Append{record}).await?;
         assert!(response.error.is_none(),"{:?}",response.error);
         assert!(node.open_service(host_key.peer_id(),operations).await.is_err());
-        assert!(client::files::snapshot(&node,host_key.peer_id(),&pin).await.is_err());
+        assert!(league::files::snapshot(&node,host_key.peer_id(),&pin).await.is_err());
         assert!(tokio::time::timeout(Duration::from_secs(3),node::protocol::read_frame::<node::protocol::JsonFrame>(&mut stream)).await?.is_err());
         admin_node.shutdown().await?;
         node.shutdown().await?;

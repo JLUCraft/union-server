@@ -2,12 +2,12 @@
 use crate::runtime::Application;
 use anyhow::{Context, Result, ensure};
 use authority::authority::Authority;
-use events::{
+use flows::FlowAction as F;
+use identity::Identity;
+use league::events::{
     EventAction as E, Phase,
     workflows::{GameResource, Kind, OrganizationAction as O, ReportStatus},
 };
-use flows::FlowAction as F;
-use identity::Identity;
 use node::protocol::{OpsInstanceState, OpsOp, OpsRequest};
 use serde::Deserialize;
 use std::{path::PathBuf, time::Duration};
@@ -19,7 +19,7 @@ pub struct Config {
 async fn apply(
     a: &Authority<Application>,
     key: &Identity,
-    action: F<events::EventsDomain>,
+    action: F<league::events::EventsDomain>,
 ) -> Result<()> {
     ensure!(a.effect_epoch().is_some(), "application leader unavailable");
     a.apply(key, state::governance::Action::Domain(action))
@@ -45,7 +45,7 @@ pub async fn serve(a: Authority<Application>, config: Config) -> Result<()> {
 async fn generated_flow(
     a: &Authority<Application>,
     key: &Identity,
-    config: &events::workflows::Automation,
+    config: &league::events::workflows::Automation,
     action: O,
 ) -> Result<()> {
     let snapshot = a.state(key.peer_id()).await?;
@@ -59,7 +59,7 @@ async fn generated_flow(
         }
         return Ok(());
     }
-    let bytes = events::workflows::evidence(&snapshot.domain.inner, &action)?;
+    let bytes = league::events::workflows::evidence(&snapshot.domain.inner, &action)?;
     let (input, blocks) = snapshot.domain.inner.files.version(None, &bytes)?;
     for block in blocks {
         self::action(a, key, E::PutBlock { block }).await?;
@@ -249,9 +249,9 @@ async fn competition(
     a: &Authority<Application>,
     key: &Identity,
     command: Option<league::LeagueAction>,
-) -> Result<client::application::Snapshot> {
+) -> Result<league::application::Snapshot> {
     if let Some(command) = command {
-        a.apply(key, client::application::competition(command))
+        a.apply(key, league::application::competition(command))
             .await?;
     }
     Ok(a.state(key.peer_id()).await?)
@@ -280,15 +280,15 @@ async fn game_step(
     a: &Authority<Application>,
     key: &Identity,
     id: &str,
-    event: &events::Event,
-    p: &events::workflows::Plan,
+    event: &league::events::Event,
+    p: &league::events::workflows::Plan,
     game: &str,
     r: &GameResource,
     checked: std::collections::BTreeSet<String>,
 ) -> Result<()> {
     let epoch = a.effect_epoch().context("application leader unavailable")?;
     let now = authority::journal::now_ms()?;
-    let league_id = events::workflows::league_id(id, game);
+    let league_id = league::events::workflows::league_id(id, game);
     if event.phase == Phase::Cancelled {
         if !p.games.get(game).is_some_and(|g| g.reserved || g.started) {
             return Ok(());
@@ -483,7 +483,7 @@ async fn stop_league_if_running(
     a: &Authority<Application>,
     key: &Identity,
     id: &str,
-    event: &events::Event,
+    event: &league::events::Event,
     r: &GameResource,
     epoch: u64,
     league: &str,
@@ -518,7 +518,7 @@ async fn ensure_current(
     a: &Authority<Application>,
     key: &Identity,
     id: &str,
-    event: &events::Event,
+    event: &league::events::Event,
     epoch: u64,
 ) -> Result<()> {
     ensure!(a.effect_epoch() == Some(epoch), "leader changed");
@@ -535,7 +535,7 @@ async fn ensure_current(
     Ok(())
 }
 
-fn automatic_stage(config: &events::workflows::Automation, purpose: &str) -> flows::Stage {
+fn automatic_stage(config: &league::events::workflows::Automation, purpose: &str) -> flows::Stage {
     flows::Stage {
         name: purpose.into(),
         approver: flows::Approver::Ai {
@@ -557,7 +557,7 @@ fn automatic_stage(config: &events::workflows::Automation, purpose: &str) -> flo
 
 /// Reuse a submitted review, including a rejection that needs a new draft revision.
 fn review_instance(
-    state: &flows::FlowsState<events::EventsDomain>,
+    state: &flows::FlowsState<league::events::EventsDomain>,
     id: &str,
     epoch: u64,
 ) -> String {

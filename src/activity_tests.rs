@@ -2,9 +2,9 @@ use super::*;
 use authority::{journal::Journal, trust::TrustLog};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-type A = client::application::Action;
-type F = flows::FlowAction<events::EventsDomain>;
-type O = events::workflows::OrganizationAction;
+type A = league::application::Action;
+type F = flows::FlowAction<league::events::EventsDomain>;
+type O = league::events::workflows::OrganizationAction;
 const TOKEN: &str = "activity-test-token-abcdefghijklmnopqrstuvwxyz";
 const OTHER_TOKEN: &str = "other-test-token-abcdefghijklmnopqrstuvwxyz";
 struct Fixture {
@@ -67,19 +67,21 @@ impl Fixture {
         fixture
             .apply(
                 0,
-                F::Inner(events::EventAction::Organization(O::ActivityPolicy {
-                    policy: events::points::ActivityPolicy {
-                        daily_member_cap: 100,
+                F::Inner(league::events::EventAction::Organization(
+                    O::ActivityPolicy {
+                        policy: league::events::points::ActivityPolicy {
+                            daily_member_cap: 100,
+                        },
                     },
-                })),
+                )),
             )
             .await?;
         fixture
             .apply(
                 0,
-                F::Inner(events::EventAction::Organization(O::OracleSource {
+                F::Inner(league::events::EventAction::Organization(O::OracleSource {
                     id: "survival".into(),
-                    source: events::points::OracleSourcePolicy {
+                    source: league::events::points::OracleSourcePolicy {
                         title: "Verified survival".into(),
                         club: "a".into(),
                         oracle_device: fixture.keys[1].peer_id().to_string(),
@@ -140,7 +142,7 @@ impl Fixture {
         let state = self.authority.state(self.keys[0].peer_id()).await?;
         let (cid, blocks) = state.domain.inner.files.version(None, bytes)?;
         for block in blocks {
-            self.apply(3, F::Inner(events::EventAction::PutBlock { block }))
+            self.apply(3, F::Inner(league::events::EventAction::PutBlock { block }))
                 .await?;
         }
         Ok(cid)
@@ -636,12 +638,12 @@ async fn witnessed_play_mints_then_a_normal_member_funds_local_inference_settles
         assert_eq!(flow.records[0].ai_runs[0].charged_points, 2);
         assert_eq!(flow.records[0].ai_runs[0].refunded_points, 2);
         assert_eq!(
-            client::points::output(&snapshot, "paid-member-job", 0)?,
+            league::points::output(&snapshot, "paid-member-job", 0)?,
             "A verified activity report."
         );
         let trust = fixture.authority.identity_view().state()?;
         let view = snapshot.identity_presentation(&trust)?;
-        let presentation = client::points::present(
+        let presentation = league::points::present(
             &snapshot,
             &view,
             &fixture.keys[3],
@@ -866,7 +868,7 @@ async fn an_assigned_provider_executes_from_a_follower_replica() -> Result<()> {
         assert_eq!(result.domain.inner.organization.points["a"]["player"], 8);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(
-            client::points::output(&result, "follower-job", 0)?,
+            league::points::output(&result, "follower-job", 0)?,
             "A verified activity report."
         );
         worker.abort();

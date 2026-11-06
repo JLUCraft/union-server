@@ -4,7 +4,7 @@ The JLUCraft service host for authority nodes, Minecraft connections, scoring, a
 
 ## Setup and structure
 
-Keep sibling `union-core` and `minecraftd` checkouts available. The production entry is `federated-server`; initialization and signed host registration use its subcommands. Configuration is defined by the Rust types and command parser in `src/`. Production keys and founder authorization stay outside the repository.
+Keep sibling `union-core` and `minecraftd` checkouts available. The production entry is `federated-server`; initialization and signed host registration use its subcommands. Configuration is defined by the Rust types and command parser in `src/`. The workspace includes `game/league`, retaining the `league` crate name and its league API. Its `events` module combines office records with game state; `application`, `points`, `discovery`, `files`, and `trust` provide game clients. Game integration tests reuse the generic fixture in `../union-core/tests/support/mod.rs`. Production keys and founder authorization stay outside the repository.
 
 ## Network operations
 
@@ -71,7 +71,7 @@ Select one validation channel for a batch and reuse successful results for uncha
 ```sh
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
-cargo test --locked
+FOUNDER_MANIFEST="$PWD/tests/fixtures/founders.json" cargo test --locked -- --test-threads=1
 ```
 
 Read [AGENTS.md](AGENTS.md) before making changes.

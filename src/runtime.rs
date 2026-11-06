@@ -17,7 +17,7 @@ use tokio::{
 };
 
 pub use crate::ai_worker::Config as AiWorkerConfig;
-pub use client::application::Application;
+pub use league::application::Application;
 const SERVICE_QUEUE: usize = 32;
 const MAX_ROOMS: usize = 8;
 const CONFIG_BYTES: u64 = 1024 * 1024;
