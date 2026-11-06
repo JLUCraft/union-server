@@ -635,6 +635,11 @@ fn application_specs() -> Vec<Spec> {
             schema: snapshot,
         },
         Spec {
+            name: "application_execute",
+            description: "Submit a governance action; use application_upload_file for inline file uploads",
+            schema: schema(&[("action", "object")], &["action"]),
+        },
+        Spec {
             name: "application_create_league",
             description: "Create a competition league",
             schema: league,
@@ -1011,6 +1016,28 @@ fn wire(trust: &client::trust::Config, action: serde_json::Value) -> Result<Stri
     serde_json::to_string(&value).map_err(|error| McpError::internal_error(error.to_string(), None))
 }
 
+fn application_execute_action(arguments: JsonObject) -> Result<serde_json::Value, McpError> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ExecuteArgs {
+        action: JsonObject,
+    }
+    let args: ExecuteArgs = parse(arguments)?;
+    let kind = args
+        .action
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .filter(|kind| !kind.trim().is_empty())
+        .ok_or_else(|| McpError::invalid_params("action.type must be a non-empty string", None))?;
+    if kind == "local.files.upload" {
+        return Err(McpError::invalid_params(
+            "local.files.upload requires inline bytes; use application_upload_file with content_base64",
+            None,
+        ));
+    }
+    Ok(serde_json::Value::Object(args.action))
+}
+
 async fn application_invoke(
     caller: &Principal,
     trust: &client::trust::Config,
@@ -1072,6 +1099,7 @@ async fn application_invoke(
             let _: EmptyArgs = parse(arguments)?;
             (serde_json::Value::Null, None)
         }
+        "application_execute" => (application_execute_action(arguments)?, None),
         "application_create_league" => {
             let args: LeagueArgs = parse(arguments)?;
             let action = serde_json::json!({
@@ -1162,7 +1190,12 @@ async fn application_invoke(
         }
     };
     let text = wire(trust, action)?;
-    match league::application::execute_with_upload(caller.identity.clone(), &text, inline).await {
+    let response = if name == "application_execute" {
+        league::application::execute_text(caller.identity.clone(), &text).await
+    } else {
+        league::application::execute_with_upload(caller.identity.clone(), &text, inline).await
+    };
+    match response {
         Ok(response) => Ok(value_result(Ok::<_, String>(response))),
         Err(error) => Ok(value_result(Err::<serde_json::Value, String>(
             error.to_string(),
@@ -1265,7 +1298,7 @@ mod tests {
     #[test]
     fn catalog_is_strict_and_covers_three_services() {
         let specs = specs();
-        assert_eq!(specs.len(), 31);
+        assert_eq!(specs.len(), 32);
         assert!(
             specs
                 .iter()
@@ -1283,7 +1316,7 @@ mod tests {
                 .iter()
                 .filter(|spec| spec.name.starts_with("application_"))
                 .count(),
-            8
+            9
         );
         assert_eq!(
             specs
@@ -1292,6 +1325,112 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    #[test]
+    fn application_execute_has_strict_schema() {
+        let specs = application_specs();
+        let spec = specs
+            .iter()
+            .find(|spec| spec.name == "application_execute")
+            .unwrap();
+        assert_eq!(
+            serde_json::Value::Object(spec.schema.clone()),
+            serde_json::json!({
+                "type": "object",
+                "properties": {"action": {"type": "object"}},
+                "required": ["action"],
+                "additionalProperties": false
+            })
+        );
+    }
+
+    #[test]
+    fn application_execute_preserves_governance_actions() {
+        for action in [
+            serde_json::json!({
+                "type": "organization.resource", "id": "game",
+                "resource": {
+                    "title": "Game", "address": "localhost", "peer": "peer",
+                    "host": "host", "scorer": "scorer", "seats": 16,
+                    "cross_school": true, "automatic_teams": false,
+                    "operations_service": "ops", "instance": "instance"
+                }
+            }),
+            serde_json::json!({"type": "create_season", "id": "season", "title": "Season"}),
+            serde_json::json!({"type": "flows.retry_ai", "instance": "flow-1"}),
+            serde_json::json!({"type": "flows.poke", "instance": "flow-1"}),
+        ] {
+            // These are real dispatcher actions, including a nested organization resource.
+            let _: league::application::Action = serde_json::from_value(action.clone()).unwrap();
+            let arguments = serde_json::json!({"action": action});
+            assert_eq!(
+                application_execute_action(arguments.as_object().unwrap().clone()).unwrap(),
+                action
+            );
+        }
+        // The adapter leaves new action types and their fields to the shared dispatcher.
+        let action = serde_json::json!({"type": "future.action", "payload": [1, {"flag": true}]});
+        let arguments = serde_json::json!({"action": action});
+        assert_eq!(
+            application_execute_action(arguments.as_object().unwrap().clone()).unwrap(),
+            action
+        );
+    }
+
+    #[test]
+    fn application_execute_requires_action_object() {
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"action": null}),
+            serde_json::json!({"action": "flows.poke"}),
+            serde_json::json!({"action": []}),
+            serde_json::json!({"action": {"type": "flows.poke"}, "extra": true}),
+        ] {
+            let error =
+                application_execute_action(invalid.as_object().unwrap().clone()).unwrap_err();
+            assert_eq!(
+                error.code,
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn application_execute_requires_nonempty_action_type() {
+        for action in [
+            serde_json::json!({}),
+            serde_json::json!({"type": null}),
+            serde_json::json!({"type": 42}),
+            serde_json::json!({"type": true}),
+            serde_json::json!({"type": []}),
+            serde_json::json!({"type": {}}),
+            serde_json::json!({"type": ""}),
+            serde_json::json!({"type": " \t\n"}),
+        ] {
+            let arguments = serde_json::json!({"action": action});
+            let error =
+                application_execute_action(arguments.as_object().unwrap().clone()).unwrap_err();
+            assert_eq!(
+                error.code,
+                rmcp::model::ErrorCode::INVALID_PARAMS,
+                "{action}"
+            );
+            assert!(error.message.contains("action.type"));
+        }
+    }
+
+    #[test]
+    fn application_execute_rejects_file_upload() {
+        let arguments = serde_json::json!({
+            "action": {"type": "local.files.upload", "local_path": "/tmp/document"}
+        });
+        let error = application_execute_action(arguments.as_object().unwrap().clone()).unwrap_err();
+        assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(error.message.contains("inline bytes"));
+        assert!(error.message.contains("application_upload_file"));
+        assert!(error.message.contains("content_base64"));
     }
 
     #[test]
@@ -1534,7 +1673,7 @@ mod tests {
                 }),
             )
             .await?;
-            assert_eq!(listed["result"]["tools"].as_array().map(Vec::len), Some(31));
+            assert_eq!(listed["result"]["tools"].as_array().map(Vec::len), Some(32));
             let called = post(
                 &client,
                 &url,
