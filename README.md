@@ -163,3 +163,14 @@ authorization or freshness. Request envelopes are signed separately.
 
 Successful operations write one JSON object to stdout. Failures exit nonzero
 with diagnostics on stderr and no JSON output.
+
+## Reusing the MCP gateway
+
+The MCP adapter uses `federation-mcp` from `union-core/crates/mcp` for envelope
+verification, canonical request commitments, audience resolution, replay limits,
+and delegated operations and journal forwarding. Other hosts can construct
+`mcp::Gateway` with their relay node, principal configuration, and `Audience`
+implementations without copying this server's HTTP middleware. This server keeps
+its rmcp catalog, host endpoint configuration, identity history synchronization,
+and application response presentation. The existing 20 operations, 2 application,
+and 4 identity tools, envelope audiences, and HTTP error statuses are preserved.

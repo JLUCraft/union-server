@@ -10,10 +10,14 @@ use axum::{
 use base64::Engine;
 use client::Identity;
 use futures::FutureExt;
+#[cfg(test)]
 use identity::mcp_envelope::{self as envelope, Expected, ReplayCache};
 #[cfg(test)]
+use mcp::request_commitment;
+use mcp::{Audience, AudienceTarget, DefaultAudience, Gateway, OperationsTarget, Verified};
+#[cfg(test)]
 use node::protocol::OpsOp;
-use node::protocol::{McpEnvelope, OpsDelegation, OpsRequest, OpsResponse};
+use node::protocol::{McpEnvelope, OpsRequest, OpsResponse};
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     handler::server::{router::Router as ToolRouter, tool::ToolCallContext, tool::ToolRoute},
@@ -37,6 +41,7 @@ use std::{
 #[cfg(test)]
 const ENVELOPE_HEADER: &str = node::protocol::MCP_ENVELOPE_HEADER;
 const MAX_REQUEST_BODY_BYTES: usize = 8 * 1024 * 1024;
+#[cfg(test)]
 const ALLOWED_DRIFT_MS: u64 = envelope::REPLAY_RETENTION_MS;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -163,13 +168,6 @@ impl Config {
 }
 
 #[derive(Clone)]
-struct OperationsTarget {
-    peer: node::PeerId,
-    address: node::Multiaddr,
-    service: node::ServiceId,
-}
-
-#[derive(Clone)]
 struct IdentityTarget {
     address: String,
     peer: String,
@@ -185,24 +183,93 @@ struct Principal {
 
 #[derive(Clone)]
 struct Authorization {
-    namespace: node::protocol::Namespace,
     principals: Arc<Vec<Principal>>,
-    operations: Arc<BTreeMap<String, OperationsTarget>>,
-    relay_peer: String,
-    replay: Arc<ReplayCache>,
+    verifier: Arc<mcp::Verifier>,
 }
 
 #[derive(Clone)]
 struct Context {
     auth: Arc<Authorization>,
+    gateway: Arc<Gateway>,
     node: Arc<node::Node>,
 }
 
-#[derive(Clone, Debug)]
-struct Verified {
-    principal: usize,
-    envelope: McpEnvelope,
-    digest: String,
+/// The host catalog selects permitted tools; the library resolves local and journal audiences.
+struct HostAudience {
+    default: DefaultAudience,
+    operations: Option<mcp::OperationsTarget>,
+}
+
+impl Audience for HostAudience {
+    fn expected(&self, tool: &str) -> AudienceTarget {
+        if operations_specs().iter().any(|spec| spec.name == tool) {
+            self.operations
+                .clone()
+                .map_or(AudienceTarget::Denied, AudienceTarget::Operations)
+        } else {
+            self.default.expected(tool)
+        }
+    }
+}
+
+fn gateway_config(
+    namespace: node::protocol::Namespace,
+    relay_peer: String,
+    principals: &[Principal],
+    capacity: usize,
+) -> mcp::Config {
+    mcp::Config {
+        namespace,
+        relay_peer,
+        principals: principals
+            .iter()
+            .map(|principal| mcp::Principal {
+                peer: principal.peer.clone(),
+                operations: principal.operations.iter().cloned().collect(),
+            })
+            .collect(),
+        max_envelope_bytes: identity::mcp_envelope::MAX_HEADER_BYTES,
+        max_body_bytes: MAX_REQUEST_BODY_BYTES,
+        replay_capacity: capacity,
+    }
+}
+
+fn audiences(
+    principals: &[Principal],
+    operations: &BTreeMap<String, OperationsTarget>,
+) -> Vec<Arc<dyn Audience>> {
+    principals
+        .iter()
+        .map(|principal| {
+            let operations = principal
+                .operations
+                .iter()
+                .next()
+                .and_then(|name| operations.get(name))
+                .cloned();
+            Arc::new(HostAudience {
+                operations,
+                default: DefaultAudience {
+                    local_tools: identity_specs()
+                        .into_iter()
+                        .map(|spec| spec.name.to_owned())
+                        .collect(),
+                    governance_tools: application_specs()
+                        .into_iter()
+                        .map(|spec| spec.name.to_owned())
+                        .collect(),
+                    journal: principal
+                        .application
+                        .as_ref()
+                        .map(|target| mcp::JournalTarget {
+                            peer: target.peer.clone(),
+                            address: target.address.clone(),
+                            genesis_hash: target.genesis_hash.clone(),
+                        }),
+                },
+            }) as Arc<dyn Audience>
+        })
+        .collect()
 }
 
 impl ServerHandler for Context {
@@ -251,9 +318,10 @@ async fn serve_with_listener_and_namespace(
         operations.insert(
             endpoint.name.clone(),
             OperationsTarget {
-                peer,
-                address,
-                service: endpoint.service.parse::<node::ServiceId>()?,
+                name: endpoint.name.clone(),
+                peer: peer.to_string(),
+                address: address.to_string(),
+                service: endpoint.service.clone(),
             },
         );
     }
@@ -284,15 +352,23 @@ async fn serve_with_listener_and_namespace(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let gateway = Arc::new(Gateway::new(
+        gateway_config(
+            namespace,
+            relay_peer,
+            &principals,
+            identity::mcp_envelope::REPLAY_CAPACITY,
+        ),
+        node.clone(),
+        audiences(&principals, &operations),
+    )?);
     let auth = Arc::new(Authorization {
-        namespace,
         principals: Arc::new(principals),
-        operations: Arc::new(operations),
-        relay_peer,
-        replay: Arc::new(ReplayCache::default()),
+        verifier: gateway.verifier().clone(),
     });
     let context = Context {
         auth: auth.clone(),
+        gateway: gateway.clone(),
         node: node.clone(),
     };
 
@@ -323,6 +399,7 @@ async fn serve_with_listener_and_namespace(
         .await
         .map_err(anyhow::Error::from);
     drop(context);
+    drop(gateway);
     match Arc::try_unwrap(node) {
         Ok(node) => node.shutdown().await?,
         Err(still) => {
@@ -331,119 +408,6 @@ async fn serve_with_listener_and_namespace(
         }
     }
     result
-}
-
-fn auth_error(error: envelope::Error) -> StatusCode {
-    match error {
-        envelope::Error::Audience(_) => StatusCode::FORBIDDEN,
-        envelope::Error::CacheFull | envelope::Error::CacheUnavailable => {
-            StatusCode::SERVICE_UNAVAILABLE
-        }
-        _ => StatusCode::UNAUTHORIZED,
-    }
-}
-
-fn request_commitment(request: &serde_json::Value) -> envelope::Result<serde_json::Value> {
-    let method = request
-        .get("method")
-        .and_then(serde_json::Value::as_str)
-        .filter(|method| !method.is_empty())
-        .ok_or(envelope::Error::Format("request method"))?;
-    let mut params = request.get("params").cloned();
-    if let Some(serde_json::Value::Object(params)) = &mut params {
-        params.remove("_meta");
-    }
-    if method == "tools/call" {
-        let params = params
-            .as_ref()
-            .and_then(serde_json::Value::as_object)
-            .ok_or(envelope::Error::Format("tool params"))?;
-        let tool = params
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .ok_or(envelope::Error::Format("tool name"))?;
-        Ok(envelope::canonical_request(tool, params.get("arguments")))
-    } else {
-        Ok(envelope::canonical_request(method, params.as_ref()))
-    }
-}
-
-fn verify_request(
-    context: &Authorization,
-    signed: McpEnvelope,
-    request: &serde_json::Value,
-    now: u64,
-) -> Result<Verified, StatusCode> {
-    let principal = context
-        .principals
-        .iter()
-        .position(|p| p.peer == signed.claims.signer)
-        .ok_or(StatusCode::FORBIDDEN)?;
-    let caller = &context.principals[principal];
-    let method = request
-        .get("method")
-        .and_then(serde_json::Value::as_str)
-        .ok_or(StatusCode::BAD_REQUEST)?;
-    let tool = if method == "tools/call" {
-        request
-            .pointer("/params/name")
-            .and_then(serde_json::Value::as_str)
-            .ok_or(StatusCode::BAD_REQUEST)?
-    } else {
-        method
-    };
-    let (peer, service) = if method == "tools/call" && tool.starts_with("ops_") {
-        if !operations_specs().iter().any(|spec| spec.name == tool) {
-            return Err(StatusCode::FORBIDDEN);
-        }
-        let target = caller
-            .operations
-            .iter()
-            .next()
-            .and_then(|name| context.operations.get(name))
-            .ok_or(StatusCode::FORBIDDEN)?;
-        (target.peer.to_string(), target.service.to_string())
-    } else if method == "tools/call" && tool.starts_with("application_") {
-        if !application_specs().iter().any(|spec| spec.name == tool) {
-            return Err(StatusCode::FORBIDDEN);
-        }
-        let target = caller.application.as_ref().ok_or(StatusCode::FORBIDDEN)?;
-        (target.peer.clone(), context.namespace.governance_protocol())
-    } else {
-        let allowed = if method == "tools/call" {
-            identity_specs().into_iter().any(|spec| spec.name == tool)
-        } else {
-            matches!(
-                method,
-                "initialize" | "tools/list" | "ping" | "notifications/initialized"
-            )
-        };
-        if !allowed {
-            return Err(StatusCode::FORBIDDEN);
-        }
-        (context.relay_peer.clone(), "gateway".into())
-    };
-    let commitment = request_commitment(request).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let verified = envelope::verify_with_namespace(
-        &signed,
-        now,
-        &Expected {
-            gateway: &context.relay_peer,
-            peer: &peer,
-            service: &service,
-            tool,
-            allowed_drift_ms: ALLOWED_DRIFT_MS,
-            request: &commitment,
-            replay_cache: &context.replay,
-        },
-        &context.namespace,
-    )
-    .map_err(auth_error)?;
-    Ok(Verified {
-        principal,
-        digest: verified.claims().digest.clone(),
-        envelope: signed,
-    })
 }
 
 async fn authenticate(
@@ -461,24 +425,28 @@ async fn authenticate_request(
     context: &Authorization,
     request: Request<Body>,
 ) -> Result<Request<Body>, StatusCode> {
-    let header = request
-        .headers()
-        .get(context.namespace.mcp_envelope_header())
-        .ok_or(StatusCode::BAD_REQUEST)?;
-    if header.as_bytes().len() > envelope::MAX_HEADER_BYTES {
-        return Err(StatusCode::PAYLOAD_TOO_LARGE);
-    }
-    let signed = envelope::decode_header(header.to_str().map_err(|_| StatusCode::BAD_REQUEST)?)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let status = |error: mcp::Error| {
+        StatusCode::from_u16(error.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+    };
+    let signed = context
+        .verifier
+        .envelope(
+            request
+                .headers()
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_bytes())),
+        )
+        .map_err(status)?;
     let (mut parts, body) = request.into_parts();
-    let bytes = to_bytes(body, MAX_REQUEST_BODY_BYTES)
+    let bytes = to_bytes(body, context.verifier.config().max_body_bytes)
         .await
         .map_err(|_| StatusCode::PAYLOAD_TOO_LARGE)?;
-    let body = serde_json::from_slice(&bytes).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let now = authority::journal::now_ms().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    parts
-        .extensions
-        .insert(verify_request(context, signed, &body, now)?);
+    parts.extensions.insert(
+        context
+            .verifier
+            .verify_envelope(signed, &bytes)
+            .map_err(status)?,
+    );
     Ok(Request::from_parts(parts, Body::from(bytes)))
 }
 
@@ -822,51 +790,35 @@ async fn invoke(
         .get(verified.principal)
         .ok_or_else(|| McpError::internal_error("unknown caller identity", None))?;
     if name.starts_with("ops_") {
-        let endpoint = caller
-            .operations
-            .iter()
-            .next()
-            .ok_or_else(|| denied("caller is not allowed any operations endpoint"))?;
-        let target = service
-            .auth
-            .operations
-            .get(endpoint)
-            .ok_or_else(|| McpError::internal_error("operations endpoint missing", None))?;
-        let delegation = ops_delegation(verified, name, arguments)?;
-        let op = client::ops::tool_request(
-            name,
-            delegation
-                .arguments
-                .clone()
-                .unwrap_or_else(|| serde_json::json!({})),
-        )
-        .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        service
-            .node
-            .dial(target.address.clone())
-            .await
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        let request = OpsRequest {
-            op,
-            delegation: Some(delegation),
-        };
-        return Ok(ops_result(
-            client::ops::execute(&service.node, target.peer, target.service, &request).await,
-        ));
+        let arguments = verified
+            .signed_arguments(name, arguments.map(serde_json::Value::Object))
+            .map_err(|error| denied(&error.to_string()))?;
+        let op =
+            client::ops::tool_request(name, arguments.unwrap_or_else(|| serde_json::json!({})))
+                .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        let response = service
+            .gateway
+            .forward_ops(
+                verified,
+                OpsRequest {
+                    op,
+                    delegation: None,
+                },
+            )
+            .await;
+        if let Err(mcp::Error::Dial(error)) = response {
+            return Err(McpError::internal_error(error.to_string(), None));
+        }
+        return Ok(ops_result(response));
     }
     if name.starts_with("application_") {
-        // Preserve argument presence: journal delegation commits snapshot to explicit {}.
-        let arguments = signed_arguments(verified, name, arguments)?.ok_or_else(|| {
-            McpError::invalid_params("application tools require explicit arguments", None)
-        })?;
-        return application_invoke(
-            caller,
-            &service.node,
-            verified.envelope.clone(),
-            name,
-            arguments,
-        )
-        .await;
+        let arguments = verified
+            .signed_arguments(name, arguments.map(serde_json::Value::Object))
+            .map_err(|error| denied(&error.to_string()))?
+            .ok_or_else(|| {
+                McpError::invalid_params("application tools require explicit arguments", None)
+            })?;
+        return application_invoke(caller, &service.gateway, verified, name, arguments).await;
     }
     if name.starts_with("identity_") {
         return identity_invoke(
@@ -883,38 +835,10 @@ async fn invoke(
     >())
 }
 
-fn signed_arguments(
-    verified: &Verified,
-    name: &str,
-    arguments: Option<JsonObject>,
-) -> Result<Option<serde_json::Value>, McpError> {
-    let arguments = arguments.map(serde_json::Value::Object);
-    let canonical = envelope::canonical_request(name, arguments.as_ref());
-    if envelope::request_digest(&canonical)
-        .map_err(|error| McpError::invalid_params(error.to_string(), None))?
-        != verified.digest
-    {
-        return Err(denied("dispatched request differs from signed request"));
-    }
-    Ok(arguments)
-}
-
-fn ops_delegation(
-    verified: &Verified,
-    name: &str,
-    arguments: Option<JsonObject>,
-) -> Result<OpsDelegation, McpError> {
-    Ok(OpsDelegation {
-        envelope: verified.envelope.clone(),
-        tool: name.into(),
-        arguments: signed_arguments(verified, name, arguments)?,
-    })
-}
-
 async fn application_invoke(
     caller: &Principal,
-    node: &node::Node,
-    envelope: McpEnvelope,
+    gateway: &Gateway,
+    verified: &Verified,
     name: &str,
     arguments: serde_json::Value,
 ) -> Result<CallToolResult, McpError> {
@@ -928,26 +852,19 @@ async fn application_invoke(
         .identity_endpoint
         .as_ref()
         .ok_or_else(|| denied("caller has no identity endpoint"))?;
+    let node = gateway.node();
     let result = async {
-        let (address, peer) = client::endpoint(&target.address, &target.peer)?;
+        let (_, peer) = client::endpoint(&target.address, &target.peer)?;
         let (identity_address, identity_peer) =
             client::endpoint(&identity.address, &identity.peer)?;
-        node.dial(address).await?;
-        // Submission needs the authority's anchored identity position, independently
-        // of the caller's command. The relay needs read as well as mcp_relay.
-        let snapshot = journal::request_delegated::<Application>(
-            node,
-            peer,
-            &target.genesis_hash,
-            Request::Snapshot,
-            if name == "application_snapshot" {
-                Some(envelope.clone())
-            } else {
-                None
-            },
-            &node.namespace().governance_protocol(),
-        )
-        .await?;
+        // Submission first obtains the authority's anchored identity position.
+        let snapshot = if name == "application_snapshot" {
+            gateway
+                .forward_journal::<Application>(verified, Request::Snapshot)
+                .await?
+        } else {
+            gateway.journal_snapshot::<Application>(verified).await?
+        };
         if snapshot.error.is_some() {
             return Ok(application_result(snapshot));
         }
@@ -970,19 +887,13 @@ async fn application_invoke(
                 node.namespace(),
             ));
         }
-        let response = journal::request_delegated::<Application>(
-            node,
-            peer,
-            &target.genesis_hash,
-            request,
-            Some(envelope),
-            &node.namespace().governance_protocol(),
-        )
-        .await?;
+        let response = gateway
+            .forward_journal::<Application>(verified, request)
+            .await?;
         Ok(application_result(response))
     }
     .await;
-    Ok(result.unwrap_or_else(|error: node::Error| value_result(Err::<(), _>(error))))
+    Ok(result.unwrap_or_else(|error: mcp::Error| value_result(Err::<(), _>(error))))
 }
 
 fn application_snapshot_result(
@@ -1096,7 +1007,7 @@ async fn identity_invoke(
     }
 }
 
-fn ops_result(result: node::Result<OpsResponse>) -> CallToolResult {
+fn ops_result<E: std::fmt::Display>(result: Result<OpsResponse, E>) -> CallToolResult {
     match result {
         Ok(response) => {
             let failed = !response.ok;
@@ -1199,6 +1110,8 @@ mod tests {
     struct AuthFixture {
         auth: Authorization,
         signer: Identity,
+        config: mcp::Config,
+        operations: Arc<BTreeMap<String, OperationsTarget>>,
     }
 
     impl AuthFixture {
@@ -1206,29 +1119,59 @@ mod tests {
             let signer = Identity::generate();
             let relay = Identity::generate();
             let target = OperationsTarget {
-                peer: Identity::generate().peer_id(),
-                address: "/ip4/127.0.0.1/udp/40000/quic-v1".parse().unwrap(),
-                service: node::ServiceId::new(),
+                name: "ops".into(),
+                peer: Identity::generate().peer_id().to_string(),
+                address: "/ip4/127.0.0.1/udp/40000/quic-v1".into(),
+                service: node::ServiceId::new().to_string(),
             };
+            let principals = Arc::new(vec![Principal {
+                peer: signer.peer_id().to_string(),
+                operations: BTreeSet::from(["ops".into()]),
+                identity_endpoint: None,
+                application: Some(ApplicationEndpoint {
+                    peer: Identity::generate().peer_id().to_string(),
+                    address: "/ip4/127.0.0.1/udp/40000/quic-v1".into(),
+                    genesis_hash: "a".repeat(64),
+                }),
+            }]);
+            let operations = Arc::new(BTreeMap::from([("ops".into(), target)]));
+            let config = gateway_config(
+                Default::default(),
+                relay.peer_id().to_string(),
+                &principals,
+                capacity,
+            );
+            let verifier = Arc::new(
+                mcp::Verifier::new(config.clone(), audiences(&principals, &operations)).unwrap(),
+            );
             Self {
                 auth: Authorization {
-                    namespace: Default::default(),
-                    principals: Arc::new(vec![Principal {
-                        peer: signer.peer_id().to_string(),
-                        operations: BTreeSet::from(["ops".into()]),
-                        identity_endpoint: None,
-                        application: Some(ApplicationEndpoint {
-                            peer: Identity::generate().peer_id().to_string(),
-                            address: "/ip4/127.0.0.1/udp/40000/quic-v1".into(),
-                            genesis_hash: "a".repeat(64),
-                        }),
-                    }]),
-                    operations: Arc::new(BTreeMap::from([("ops".into(), target)])),
-                    relay_peer: relay.peer_id().to_string(),
-                    replay: Arc::new(ReplayCache::new(capacity)),
+                    principals,
+                    verifier,
                 },
                 signer,
+                config,
+                operations,
             }
+        }
+
+        fn refresh(&mut self) {
+            self.config.principals = self
+                .auth
+                .principals
+                .iter()
+                .map(|principal| mcp::Principal {
+                    peer: principal.peer.clone(),
+                    operations: principal.operations.iter().cloned().collect(),
+                })
+                .collect();
+            self.auth.verifier = Arc::new(
+                mcp::Verifier::new(
+                    self.config.clone(),
+                    audiences(&self.auth.principals, &self.operations),
+                )
+                .unwrap(),
+            );
         }
 
         fn sign(&self, request: &serde_json::Value) -> McpEnvelope {
@@ -1239,18 +1182,18 @@ mod tests {
                 method
             };
             let (peer, service) = if tool.starts_with("ops_") {
-                let target = &self.auth.operations["ops"];
+                let target = &self.operations["ops"];
                 (target.peer.to_string(), target.service.to_string())
             } else if tool.starts_with("application_") {
                 let target = self.auth.principals[0].application.as_ref().unwrap();
                 (target.peer.clone(), client::journal::PROTOCOL.into())
             } else {
-                (self.auth.relay_peer.clone(), "gateway".into())
+                (self.config.relay_peer.clone(), "gateway".into())
             };
             signed(
                 &self.signer,
                 McpAudience {
-                    gateway: self.auth.relay_peer.clone(),
+                    gateway: self.config.relay_peer.clone(),
                     peer,
                     service,
                     tool: tool.into(),
@@ -1276,21 +1219,31 @@ mod tests {
     #[tokio::test]
     async fn custom_namespace_gateway_requires_its_header_domain_and_audience() {
         let mut fixture = AuthFixture::new(4);
-        fixture.auth.namespace = node::protocol::Namespace::new("acme", 2).unwrap();
+        fixture.config.namespace = node::protocol::Namespace::new("acme", 2).unwrap();
+        fixture.refresh();
         let body = serde_json::json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{"name":"application_snapshot", "arguments":{}}});
         let mut claims = fixture.sign(&body).claims;
-        claims.aud.service = fixture.auth.namespace.governance_protocol();
-        let signed =
-            envelope::sign_with_namespace(claims.clone(), &fixture.signer, &fixture.auth.namespace)
-                .unwrap();
+        claims.aud.service = fixture.config.namespace.governance_protocol();
+        let signed = envelope::sign_with_namespace(
+            claims.clone(),
+            &fixture.signer,
+            &fixture.config.namespace,
+        )
+        .unwrap();
         assert_eq!(
-            verify_request(
-                &fixture.auth,
-                envelope::sign(claims, &fixture.signer).unwrap(),
-                &body,
-                authority::journal::now_ms().unwrap()
+            StatusCode::from_u16(
+                fixture
+                    .auth
+                    .verifier
+                    .verify_at(
+                        envelope::sign(claims, &fixture.signer).unwrap(),
+                        &serde_json::to_vec(&body).unwrap(),
+                        authority::journal::now_ms().unwrap()
+                    )
+                    .unwrap_err()
+                    .status_code()
             )
-            .unwrap_err(),
+            .unwrap(),
             StatusCode::UNAUTHORIZED
         );
         assert_eq!(
@@ -1303,7 +1256,7 @@ mod tests {
         request.headers_mut().remove(ENVELOPE_HEADER);
         request.headers_mut().insert(
             axum::http::HeaderName::from_bytes(
-                fixture.auth.namespace.mcp_envelope_header().as_bytes(),
+                fixture.config.namespace.mcp_envelope_header().as_bytes(),
             )
             .unwrap(),
             envelope::encode_header(&signed).unwrap().parse().unwrap(),
@@ -1479,6 +1432,7 @@ mod tests {
         Arc::make_mut(&mut fixture.auth.principals)[0]
             .operations
             .clear();
+        fixture.refresh();
         let body = tool_call("ops_capabilities");
         assert_eq!(
             authenticate_request(&fixture.auth, http_request(&fixture.sign(&body), &body))
@@ -1523,7 +1477,7 @@ mod tests {
             let body = tool_call(tool);
             let mut claims = fixture.sign(&body).claims;
             if tool.starts_with("application_") {
-                claims.aud.peer = fixture.auth.relay_peer.clone();
+                claims.aud.peer = fixture.config.relay_peer.clone();
                 claims.aud.service = "gateway".into();
             } else {
                 claims.aud.peer = fixture.auth.principals[0]
@@ -1553,6 +1507,7 @@ mod tests {
         let body = tool_call("application_snapshot");
         let signed = fixture.sign(&body);
         Arc::make_mut(&mut fixture.auth.principals)[0].application = None;
+        fixture.refresh();
         assert_eq!(
             authenticate_request(&fixture.auth, http_request(&signed, &body))
                 .await
@@ -1593,18 +1548,23 @@ mod tests {
             .await
             .unwrap();
         let verified = accepted.extensions().get::<Verified>().unwrap();
-        let delegation =
-            ops_delegation(verified, "ops_capabilities", Some(JsonObject::new())).unwrap();
+        let delegation = verified
+            .ops_delegation("ops_capabilities", Some(serde_json::json!({})))
+            .unwrap();
         assert_eq!(delegation.envelope, signed);
         assert_eq!(delegation.arguments, Some(serde_json::json!({})));
-        assert!(ops_delegation(verified, "ops_status", Some(JsonObject::new())).is_err());
+        assert!(
+            verified
+                .ops_delegation("ops_status", Some(serde_json::json!({})))
+                .is_err()
+        );
         // The service verifies the forwarded envelope with its independent cache.
-        let target = &fixture.auth.operations["ops"];
+        let target = &fixture.operations["ops"];
         envelope::verify(
             &delegation.envelope,
             authority::journal::now_ms().unwrap(),
             &Expected {
-                gateway: &fixture.auth.relay_peer,
+                gateway: &fixture.config.relay_peer,
                 peer: &target.peer.to_string(),
                 service: &target.service.to_string(),
                 tool: "ops_capabilities",
@@ -1671,30 +1631,34 @@ mod tests {
             let verified = accepted.extensions().get::<Verified>().unwrap();
             digests.push(verified.digest.clone());
             assert!(
-                ops_delegation(
-                    verified,
-                    "ops_capabilities",
-                    if arguments.is_none() {
-                        Some(JsonObject::new())
-                    } else {
-                        None
-                    }
-                )
-                .is_err()
+                verified
+                    .ops_delegation(
+                        "ops_capabilities",
+                        if arguments.is_none() {
+                            Some(serde_json::json!({}))
+                        } else {
+                            None
+                        }
+                    )
+                    .is_err()
             );
-            let delegation =
-                ops_delegation(verified, "ops_capabilities", arguments.clone()).unwrap();
+            let delegation = verified
+                .ops_delegation(
+                    "ops_capabilities",
+                    arguments.clone().map(serde_json::Value::Object),
+                )
+                .unwrap();
             assert_eq!(delegation.envelope, signed);
             assert_eq!(
                 delegation.arguments,
                 arguments.map(serde_json::Value::Object)
             );
-            let target = &fixture.auth.operations["ops"];
+            let target = &fixture.operations["ops"];
             envelope::verify(
                 &delegation.envelope,
                 authority::journal::now_ms().unwrap(),
                 &Expected {
-                    gateway: &fixture.auth.relay_peer,
+                    gateway: &fixture.config.relay_peer,
                     peer: &target.peer.to_string(),
                     service: &target.service.to_string(),
                     tool: &delegation.tool,
@@ -2092,7 +2056,7 @@ mod tests {
         let mut auth = AuthFixture::new(envelope::REPLAY_CAPACITY);
         let host = Identity::generate();
         let relay = Identity::generate();
-        auth.auth.relay_peer = relay.peer_id().to_string();
+        auth.config.relay_peer = relay.peer_id().to_string();
         let mut ids = crate::test_identity::Identities::new(
             &[
                 (&host, "host", "club"),
@@ -2126,6 +2090,7 @@ mod tests {
             .unwrap();
         target.peer = host.peer_id().to_string();
         target.genesis_hash = journal.genesis_hash().into();
+        auth.refresh();
         let view = ids.log.view(std::time::Duration::from_secs(60))?;
         let replay = ReplayCache::default();
         let acceptance = Acceptance {
@@ -2200,12 +2165,9 @@ mod tests {
             .await
             .map_err(|status| anyhow::anyhow!("{status}"))?;
         let verified = request.extensions().get::<Verified>().unwrap();
-        let arguments = signed_arguments(
-            verified,
-            "application_submit",
-            arguments.as_object().cloned(),
-        )?
-        .unwrap();
+        let arguments = verified
+            .signed_arguments("application_submit", Some(arguments.clone()))?
+            .unwrap();
         let request =
             client::journal::mcp::tool_request("application_submit", arguments, Some(history))?;
         let genesis_hash = journal.genesis_hash().into();
@@ -2599,7 +2561,7 @@ mod tests {
 
     #[test]
     fn business_failures_are_tool_results_not_transport_errors() {
-        let result = ops_result(Ok(OpsResponse {
+        let result = ops_result(Ok::<_, mcp::Error>(OpsResponse {
             ok: false,
             error: Some(node::protocol::OpsError {
                 code: node::protocol::OpsErrorCode::PermissionDenied,
