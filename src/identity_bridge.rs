@@ -19,6 +19,8 @@ use tokio::sync::Mutex;
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default)]
+    pub namespace: node::protocol::Namespace,
     pub bind: SocketAddr,
     pub key: PathBuf,
     pub token: PathBuf,
@@ -48,6 +50,7 @@ impl Config {
         Ok(config)
     }
     fn validate(&self) -> anyhow::Result<()> {
+        self.namespace.validate()?;
         anyhow::ensure!(
             self.bind.ip().is_loopback(),
             "identity bridge must bind to loopback"
@@ -170,6 +173,7 @@ fn router_inner(config: Config, genesis: TrustGenesis) -> anyhow::Result<Router>
         token: read_token(&config.token)?,
         identity: node::Identity::load(&config.key)?,
         trust: TrustConfig {
+            namespace: config.namespace.clone(),
             genesis,
             genesis_hash,
             log: config.log.clone(),
@@ -227,6 +231,7 @@ mod tests {
     fn setup(dir: &Path) -> (Config, TrustGenesis) {
         let founder = node::Identity::generate();
         let config = Config {
+            namespace: Default::default(),
             bind: "127.0.0.1:0".parse().unwrap(),
             key: dir.join("issuer.key"),
             token: dir.join("token.json"),

@@ -34,7 +34,8 @@ use std::{
     sync::Arc,
 };
 
-const ENVELOPE_HEADER: &str = "x-jlucraft-envelope";
+#[cfg(test)]
+const ENVELOPE_HEADER: &str = node::protocol::MCP_ENVELOPE_HEADER;
 const MAX_REQUEST_BODY_BYTES: usize = 8 * 1024 * 1024;
 const ALLOWED_DRIFT_MS: u64 = envelope::REPLAY_RETENTION_MS;
 
@@ -184,6 +185,7 @@ struct Principal {
 
 #[derive(Clone)]
 struct Authorization {
+    namespace: node::protocol::Namespace,
     principals: Arc<Vec<Principal>>,
     operations: Arc<BTreeMap<String, OperationsTarget>>,
     relay_peer: String,
@@ -207,7 +209,7 @@ impl ServerHandler for Context {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(
-                Implementation::new("jlucraft-control", env!("CARGO_PKG_VERSION"))
+                Implementation::new(self.node.namespace().mcp_service_name(), env!("CARGO_PKG_VERSION"))
                     .with_title("JLUCraft Control Plane")
                     .with_description(
                         "Per-caller operations, application and identity control plane",
@@ -222,12 +224,24 @@ impl ServerHandler for Context {
     }
 }
 
-pub async fn serve(config: Config) -> Result<()> {
+pub async fn serve_with_namespace(
+    config: Config,
+    namespace: node::protocol::Namespace,
+) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
-    serve_with_listener(config, listener).await
+    serve_with_listener_and_namespace(config, listener, namespace).await
 }
 
+#[cfg(test)]
 async fn serve_with_listener(config: Config, listener: tokio::net::TcpListener) -> Result<()> {
+    serve_with_listener_and_namespace(config, listener, Default::default()).await
+}
+
+async fn serve_with_listener_and_namespace(
+    config: Config,
+    listener: tokio::net::TcpListener,
+    namespace: node::protocol::Namespace,
+) -> Result<()> {
     let relay = Identity::load(&config.relay_key)?;
     config.validate_with_relay(relay.peer_id())?;
 
@@ -245,7 +259,16 @@ async fn serve_with_listener(config: Config, listener: tokio::net::TcpListener) 
     }
 
     let relay_peer = relay.peer_id().to_string();
-    let node = Arc::new(node::Node::start(relay, Default::default()).await?);
+    let node = Arc::new(
+        node::Node::start(
+            relay,
+            node::NodeConfig {
+                namespace: namespace.clone(),
+                ..Default::default()
+            },
+        )
+        .await?,
+    );
     let principals = config
         .principals
         .iter()
@@ -262,6 +285,7 @@ async fn serve_with_listener(config: Config, listener: tokio::net::TcpListener) 
         })
         .collect::<Result<Vec<_>>>()?;
     let auth = Arc::new(Authorization {
+        namespace,
         principals: Arc::new(principals),
         operations: Arc::new(operations),
         relay_peer,
@@ -384,7 +408,7 @@ fn verify_request(
             return Err(StatusCode::FORBIDDEN);
         }
         let target = caller.application.as_ref().ok_or(StatusCode::FORBIDDEN)?;
-        (target.peer.clone(), client::journal::PROTOCOL.into())
+        (target.peer.clone(), context.namespace.governance_protocol())
     } else {
         let allowed = if method == "tools/call" {
             identity_specs().into_iter().any(|spec| spec.name == tool)
@@ -400,7 +424,7 @@ fn verify_request(
         (context.relay_peer.clone(), "gateway".into())
     };
     let commitment = request_commitment(request).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let verified = envelope::verify(
+    let verified = envelope::verify_with_namespace(
         &signed,
         now,
         &Expected {
@@ -412,6 +436,7 @@ fn verify_request(
             request: &commitment,
             replay_cache: &context.replay,
         },
+        &context.namespace,
     )
     .map_err(auth_error)?;
     Ok(Verified {
@@ -438,7 +463,7 @@ async fn authenticate_request(
 ) -> Result<Request<Body>, StatusCode> {
     let header = request
         .headers()
-        .get(ENVELOPE_HEADER)
+        .get(context.namespace.mcp_envelope_header())
         .ok_or(StatusCode::BAD_REQUEST)?;
     if header.as_bytes().len() > envelope::MAX_HEADER_BYTES {
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
@@ -920,7 +945,7 @@ async fn application_invoke(
             } else {
                 None
             },
-            journal::PROTOCOL,
+            &node.namespace().governance_protocol(),
         )
         .await?;
         if snapshot.error.is_some() {
@@ -938,7 +963,12 @@ async fn application_invoke(
         .await?;
         let request = journal::mcp::tool_request(name, arguments, Some(history))?;
         if matches!(request, Request::Snapshot) {
-            return Ok(application_snapshot_result(snapshot, checkpoint, peer));
+            return Ok(application_snapshot_result(
+                snapshot,
+                checkpoint,
+                peer,
+                node.namespace(),
+            ));
         }
         let response = journal::request_delegated::<Application>(
             node,
@@ -946,7 +976,7 @@ async fn application_invoke(
             &target.genesis_hash,
             request,
             Some(envelope),
-            journal::PROTOCOL,
+            &node.namespace().governance_protocol(),
         )
         .await?;
         Ok(application_result(response))
@@ -959,12 +989,13 @@ fn application_snapshot_result(
     snapshot: client::journal::Response<league::application::Application>,
     checkpoint: client::protocol::TrustCheckpoint,
     peer: node::PeerId,
+    namespace: &node::protocol::Namespace,
 ) -> CallToolResult {
     value_result(Ok::<_, String>(serde_json::json!({
         "snapshot": snapshot,
         "identity_checkpoint": checkpoint,
         "peer": peer.to_string(),
-        "protocol": client::journal::PROTOCOL,
+        "protocol": namespace.governance_protocol(),
     })))
 }
 
@@ -1047,7 +1078,12 @@ async fn identity_invoke(
         }
         "identity_review" => {
             let args: ReviewArgs = parse(arguments)?;
-            match client::trust::review(args.genesis, &args.genesis_hash, &args.records) {
+            match client::trust::review_with_namespace(
+                args.genesis,
+                &args.genesis_hash,
+                &args.records,
+                node.namespace(),
+            ) {
                 Ok(state) => Ok(value_result(Ok::<_, String>(state))),
                 Err(error) => Ok(value_result(Err::<serde_json::Value, String>(
                     error.to_string(),
@@ -1176,6 +1212,7 @@ mod tests {
             };
             Self {
                 auth: Authorization {
+                    namespace: Default::default(),
                     principals: Arc::new(vec![Principal {
                         peer: signer.peer_id().to_string(),
                         operations: BTreeSet::from(["ops".into()]),
@@ -1234,6 +1271,55 @@ mod tests {
 
     fn tool_call(name: &str) -> serde_json::Value {
         serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name, "arguments": {}}})
+    }
+
+    #[tokio::test]
+    async fn custom_namespace_gateway_requires_its_header_domain_and_audience() {
+        let mut fixture = AuthFixture::new(4);
+        fixture.auth.namespace = node::protocol::Namespace::new("acme", 2).unwrap();
+        let body = serde_json::json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{"name":"application_snapshot", "arguments":{}}});
+        let mut claims = fixture.sign(&body).claims;
+        claims.aud.service = fixture.auth.namespace.governance_protocol();
+        let signed =
+            envelope::sign_with_namespace(claims.clone(), &fixture.signer, &fixture.auth.namespace)
+                .unwrap();
+        assert_eq!(
+            verify_request(
+                &fixture.auth,
+                envelope::sign(claims, &fixture.signer).unwrap(),
+                &body,
+                authority::journal::now_ms().unwrap()
+            )
+            .unwrap_err(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            authenticate_request(&fixture.auth, http_request(&signed, &body))
+                .await
+                .unwrap_err(),
+            StatusCode::BAD_REQUEST
+        );
+        let mut request = http_request(&signed, &body);
+        request.headers_mut().remove(ENVELOPE_HEADER);
+        request.headers_mut().insert(
+            axum::http::HeaderName::from_bytes(
+                fixture.auth.namespace.mcp_envelope_header().as_bytes(),
+            )
+            .unwrap(),
+            envelope::encode_header(&signed).unwrap().parse().unwrap(),
+        );
+        let verified = authenticate_request(&fixture.auth, request).await.unwrap();
+        assert_eq!(
+            verified
+                .extensions()
+                .get::<Verified>()
+                .unwrap()
+                .envelope
+                .claims
+                .aud
+                .service,
+            "/acme/union/application/2"
+        );
     }
 
     #[tokio::test]
@@ -2070,6 +2156,7 @@ mod tests {
             snapshot,
             ids.log.state().checkpoint().clone(),
             host.peer_id(),
+            &Default::default(),
         );
         let context = result.structured_content.unwrap();
         assert_eq!(context["peer"], host.peer_id().to_string());

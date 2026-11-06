@@ -20,7 +20,12 @@ pub async fn execute(
     identity: crate::Identity,
     input: Input,
 ) -> crate::Result<crate::journal::Response<Application>> {
-    crate::generic::execute(identity, input, crate::journal::PROTOCOL).await
+    crate::generic::execute(
+        identity,
+        input,
+        &crate::protocol::Namespace::default().governance_protocol(),
+    )
+    .await
 }
 
 #[derive(serde::Deserialize)]
@@ -94,7 +99,7 @@ pub async fn execute_with_upload(
         return crate::generic::execute(
             identity,
             serde_json::from_value(value).map_err(protocol)?,
-            crate::journal::PROTOCOL,
+            &crate::protocol::Namespace::default().governance_protocol(),
         )
         .await;
     }
@@ -149,7 +154,14 @@ pub async fn execute_with_upload(
         bytes
     };
     let (address, peer) = crate::endpoint(&input.address, &input.peer)?;
-    let node = Node::start(identity.clone(), NodeConfig::default()).await?;
+    let node = Node::start(
+        identity.clone(),
+        NodeConfig {
+            namespace: input.identity.namespace.clone(),
+            ..Default::default()
+        },
+    )
+    .await?;
     let result = async {
         node.dial(address).await?;
         let log = tokio::sync::Mutex::new(input.identity.open()?);
@@ -194,7 +206,7 @@ pub async fn execute_with_upload(
                 &identity,
                 &trust,
                 action,
-                crate::journal::PROTOCOL,
+                &node.namespace().governance_protocol(),
             )
             .await;
         }
@@ -212,7 +224,7 @@ pub async fn execute_with_upload(
                 &identity,
                 &trust,
                 action,
-                crate::journal::PROTOCOL,
+                &node.namespace().governance_protocol(),
             )
             .await;
         }
@@ -221,7 +233,7 @@ pub async fn execute_with_upload(
             peer,
             &input.genesis_hash,
             crate::journal::Request::Snapshot,
-            crate::journal::PROTOCOL,
+            &node.namespace().governance_protocol(),
         )
         .await?;
         if let Some(state) = &response.state {

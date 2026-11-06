@@ -46,14 +46,25 @@ impl Discovered {
 
 /// mDNS announcements hand out every local interface, including unreachable virtual
 /// ones. Probe each candidate with a throwaway node and keep the first that answers.
-async fn probe_address(peer: PeerId, candidates: Vec<crate::Multiaddr>) -> Option<String> {
+async fn probe_address(
+    peer: PeerId,
+    candidates: Vec<crate::Multiaddr>,
+    namespace: protocol::Namespace,
+) -> Option<String> {
     let mut tasks = JoinSet::new();
     for (index, candidate) in candidates.into_iter().enumerate() {
+        let namespace = namespace.clone();
         tasks.spawn(async move {
             let (address, _) = crate::endpoint(&candidate.to_string(), &peer.to_string()).ok()?;
-            let probe = Node::start(Identity::generate(), NodeConfig::default())
-                .await
-                .ok()?;
+            let probe = Node::start(
+                Identity::generate(),
+                NodeConfig {
+                    namespace,
+                    ..Default::default()
+                },
+            )
+            .await
+            .ok()?;
             let result = tokio::time::timeout(ADDRESS_PROBE_TIMEOUT, probe.dial(address)).await;
             probe.shutdown().await.ok()?;
             match result {
@@ -75,10 +86,18 @@ async fn probe_address(peer: PeerId, candidates: Vec<crate::Multiaddr>) -> Optio
 /// Listen for mDNS announcements, then read each host's public identity genesis and
 /// application genesis. Hosts that never answer or have no reachable address are skipped.
 pub async fn discover(identity: Identity, wait: Option<Duration>) -> Result<Vec<Discovered>> {
+    discover_with_namespace(identity, wait, Default::default()).await
+}
+pub async fn discover_with_namespace(
+    identity: Identity,
+    wait: Option<Duration>,
+    namespace: protocol::Namespace,
+) -> Result<Vec<Discovered>> {
     let wait = wait.unwrap_or(DEFAULT_WAIT).min(MAX_WAIT);
     let node = Node::start(
         identity,
         NodeConfig {
+            namespace,
             lan_discovery: true,
             ..Default::default()
         },
@@ -104,7 +123,7 @@ pub async fn discover(identity: Identity, wait: Option<Duration>) -> Result<Vec<
             let application = match crate::journal::discover::<crate::application::Application>(
                 &node,
                 peer,
-                crate::journal::PROTOCOL,
+                &node.namespace().governance_protocol(),
             )
             .await
             {
@@ -117,7 +136,8 @@ pub async fn discover(identity: Identity, wait: Option<Duration>) -> Result<Vec<
                 Err(_) => None,
             };
             let candidates = node.peer_addresses(peer).await?;
-            let Some(address) = probe_address(peer, candidates).await else {
+            let Some(address) = probe_address(peer, candidates, node.namespace().clone()).await
+            else {
                 continue;
             };
             servers.push(Discovered {
@@ -216,7 +236,12 @@ mod tests {
         let address = server.addresses().remove(0);
         let mut unreachable = address.clone();
         unreachable.push(crate::AddressProtocol::P2p(Identity::generate().peer_id()));
-        let found = probe_address(server.peer_id(), vec![unreachable, address.clone()]).await;
+        let found = probe_address(
+            server.peer_id(),
+            vec![unreachable, address.clone()],
+            Default::default(),
+        )
+        .await;
         server.shutdown().await?;
         assert_eq!(found.as_deref(), Some(address.to_string().as_str()));
         Ok(())

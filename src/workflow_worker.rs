@@ -256,8 +256,20 @@ async fn competition(
     }
     Ok(a.state(key.peer_id()).await?)
 }
-async fn ops(key: &Identity, r: &GameResource, op: OpsOp) -> Result<node::protocol::OpsResponse> {
-    let node = node::Node::start(key.clone(), node::NodeConfig::default()).await?;
+async fn ops(
+    a: &Authority<Application>,
+    key: &Identity,
+    r: &GameResource,
+    op: OpsOp,
+) -> Result<node::protocol::OpsResponse> {
+    let node = node::Node::start(
+        key.clone(),
+        node::NodeConfig {
+            namespace: a.identity_view().state()?.namespace().clone(),
+            ..Default::default()
+        },
+    )
+    .await?;
     let result = async {
         node.dial(r.address.parse()?).await?;
         client::ops::execute(
@@ -373,6 +385,7 @@ async fn game_step(
         .await?;
         ensure_current(a, key, id, event, epoch).await?;
         let status = ops(
+            a,
             key,
             r,
             OpsOp::StartLeague {
@@ -492,6 +505,7 @@ async fn stop_league_if_running(
     league: &str,
 ) -> Result<()> {
     let status = ops(
+        a,
         key,
         r,
         OpsOp::Status {
@@ -506,6 +520,7 @@ async fn stop_league_if_running(
     {
         ensure_current(a, key, id, event, epoch).await?;
         ops(
+            a,
             key,
             r,
             OpsOp::StopLeague {

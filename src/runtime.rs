@@ -2,8 +2,7 @@
 use crate::{ai_worker, ops, rooms};
 use anyhow::{Context, Result, ensure};
 use authority::authority::Authority;
-use authority::events::PROTOCOL as EVENTS_PROTOCOL;
-use authority::journal::{Journal, PROTOCOL as GOVERNANCE_PROTOCOL};
+use authority::journal::Journal;
 use node::{AccessPolicy, Identity, Node, NodeConfig, PeerId, Service, ServiceId};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -32,6 +31,8 @@ pub struct Config {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Network {
+    #[serde(default)]
+    pub namespace: node::protocol::Namespace,
     pub key: PathBuf,
     #[serde(default)]
     pub listen: Vec<String>,
@@ -336,7 +337,9 @@ impl Config {
             );
             values.iter().map(|v| Ok(v.parse()?)).collect()
         }
+        self.node.namespace.validate()?;
         let mut network = NodeConfig {
+            namespace: self.node.namespace.clone(),
             external_addresses: addresses(&self.node.external)?,
             bootstrap: addresses(&self.node.bootstrap)?,
             relay: self.services.relay.config(),
@@ -596,10 +599,11 @@ impl Host {
                     genesis
                 }
             };
-            let log = Arc::new(Mutex::new(authority::trust::TrustLog::open(
+            let log = Arc::new(Mutex::new(authority::trust::TrustLog::open_with_namespace(
                 &config.log,
                 &genesis,
                 &config.genesis_hash,
+                self.node()?.namespace().clone(),
             )?));
             let view = log
                 .lock()
@@ -771,7 +775,11 @@ impl Host {
                 anyhow::bail!("Raft hosting requires the server feature");
             }
         } else {
-            let journal = Arc::new(Mutex::new(Journal::<D>::open(&config.journal, genesis)?));
+            let journal = Arc::new(Mutex::new(Journal::<D>::open_with_namespace(
+                &config.journal,
+                genesis,
+                self.node()?.namespace().clone(),
+            )?));
             let (log, view) = self
                 .identity
                 .as_ref()
@@ -805,16 +813,20 @@ impl Host {
         let serving = authority.clone();
         self.tasks.spawn(async move {
             serving
-                .serve(node, GOVERNANCE_PROTOCOL)
+                .serve(node.clone(), &node.namespace().governance_protocol())
                 .await
                 .map_err(Into::into)
         });
         let node = self.node()?;
         let events = authority.clone();
         self.tasks.spawn(async move {
-            authority::events::serve_authority(node, events, EVENTS_PROTOCOL)
-                .await
-                .map_err(Into::into)
+            authority::events::serve_authority(
+                node.clone(),
+                events,
+                &node.namespace().events_protocol(),
+            )
+            .await
+            .map_err(Into::into)
         });
         self.services.push("application".into());
         Ok(())
@@ -840,7 +852,7 @@ impl Host {
                 .publish(Service {
                     id: service,
                     name: "Application notifications".into(),
-                    protocol: node::protocol::APPLICATION_PUSH_PROTOCOL.into(),
+                    protocol: self.node()?.namespace().notifications_protocol(),
                     metadata: vec![],
                     access: self.access("use")?,
                 })
@@ -886,7 +898,7 @@ impl Host {
                 .publish(Service {
                     id: service,
                     name: "Operations".into(),
-                    protocol: node::protocol::OPS_PROTOCOL.into(),
+                    protocol: self.node()?.namespace().ops_protocol(),
                     metadata: vec![],
                     access: ops::access(view.clone()),
                 })
@@ -898,7 +910,10 @@ impl Host {
             self.services.push(format!("operations:{service}"));
         }
         if let Some(config) = services.mcp.take() {
-            self.tasks.spawn(crate::mcp::serve(config));
+            self.tasks.spawn(crate::mcp::serve_with_namespace(
+                config,
+                self.node()?.namespace().clone(),
+            ));
             self.services.push("mcp".into());
         }
         if let Some(d) = services.documents.take() {
@@ -907,7 +922,7 @@ impl Host {
                 .publish(Service {
                     id: service,
                     name: "Documents".into(),
-                    protocol: node::protocol::DOCUMENT_PROTOCOL.into(),
+                    protocol: self.node()?.namespace().documents_protocol(),
                     metadata: vec![],
                     access: self.access("read")?,
                 })

@@ -6,6 +6,27 @@ The JLUCraft service host for authority nodes, Minecraft connections, scoring, a
 
 Keep sibling `union-core` and `minecraftd` checkouts available. The production entry is `federated-server`; initialization and signed host registration use its subcommands. Configuration is defined by the Rust types and command parser in `src/`. The workspace includes `game/league`, retaining the `league` crate name and its league API. Its `events` module combines office records with game state; `application`, `points`, `discovery`, `files`, and `trust` provide game clients. Game integration tests reuse the generic fixture in `../union-core/tests/support/mod.rs`. Production keys and founder authorization stay outside the repository.
 
+## Protocol namespace
+
+The optional `node.namespace` object configures the shared transport, discovery,
+service protocols, MCP service name and header, and signature verification:
+
+```json
+{"node":{"key":"node.key","namespace":{"organization":"acme","version":1}}}
+```
+
+Omit the object to preserve the existing JLUCraft wire bytes. The organization
+uses ASCII letters, digits, underscores, or hyphens; the version is positive.
+Identity and governance logs must retain the namespace used when they were
+signed. Namespace configuration does not rewrite or migrate historical records.
+The MCP relay and workflow operation clients inherit the host namespace. For a
+custom organization, the envelope header becomes `X-<organization>-Envelope`
+and the MCP service name becomes `<organization>-control`.
+The standalone identity bridge accepts the same optional `namespace` object.
+Exported identity client settings include it only when it differs from default.
+`jlucraft-agent` accepts `--organization` and `--protocol-version` for local
+command and identity-record signing; both flags default to the original domain.
+
 ## Network operations
 
 League discovery exposes `Discovered::to_json()` for terminal adapters. Its `services` array contains objects with `id`, `name`, and `protocol`; service metadata is omitted.

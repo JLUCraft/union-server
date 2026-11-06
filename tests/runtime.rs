@@ -455,6 +455,7 @@ async fn document_terminal_download_checks_hash_and_live_read_permission() -> Re
     let host = Host::start(Config::load(&path, Some(&root))?).await?;
     let status = host.status()?;
     let input = || client::documents::Input {
+        namespace: Default::default(),
         address: status.addresses[0].clone(),
         peer: status.peer.clone(),
         service: documents.to_string(),
@@ -513,5 +514,30 @@ async fn document_terminal_download_checks_hash_and_live_read_permission() -> Re
     assert!(client::documents::fetch(reader, input()).await.is_err());
     node.shutdown().await?;
     host.close().await?;
+    Ok(())
+}
+
+#[test]
+fn namespace_configuration_defaults_and_rejects_invalid_components() -> Result {
+    let baseline = json!({"node":{"key":"node.key"}, "services":{"directory":true}});
+    let default: Config = serde_json::from_value(baseline.clone())?;
+    assert_eq!(default.node.namespace, node::protocol::Namespace::default());
+    default.validate()?;
+    let mut custom = baseline;
+    custom["node"]["namespace"] = json!({"organization":"acme", "version":2});
+    let config: Config = serde_json::from_value(custom.clone())?;
+    config.validate()?;
+    assert_eq!(config.node.namespace.node_protocol(), "/acme/union/2");
+    for invalid in [
+        json!({"organization":"a/b", "version":2}),
+        json!({"organization":"acme", "version":0}),
+    ] {
+        custom["node"]["namespace"] = invalid;
+        assert!(
+            serde_json::from_value::<Config>(custom.clone())?
+                .validate()
+                .is_err()
+        );
+    }
     Ok(())
 }

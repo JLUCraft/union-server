@@ -15,6 +15,10 @@ use std::{
 #[derive(Parser)]
 #[command(name = "jlucraft-agent", about = "Sign locally with an agent identity")]
 struct Cli {
+    #[arg(long, global = true, default_value_t = protocol::Namespace::default().organization)]
+    organization: String,
+    #[arg(long, global = true, default_value_t = protocol::Namespace::default().version)]
+    protocol_version: u32,
     #[command(subcommand)]
     command: Operation,
 }
@@ -94,7 +98,12 @@ fn read_json<T: DeserializeOwned>(input: &str, kind: &str) -> Result<T> {
     })
 }
 
+#[cfg(test)]
 fn run(command: Operation) -> Result<Value> {
+    run_with_namespace(command, &protocol::Namespace::default())
+}
+
+fn run_with_namespace(command: Operation, namespace: &protocol::Namespace) -> Result<Value> {
     match command {
         Operation::Keygen { out } => {
             let identity = Identity::generate();
@@ -113,7 +122,7 @@ fn run(command: Operation) -> Result<Value> {
                 &input,
                 "TrustedCommand",
             )?;
-            let signed = SignedCommand::sign(&identity, command)?;
+            let signed = SignedCommand::sign_with_namespace(&identity, command, namespace)?;
             Ok(serde_json::to_value(CommandOutput {
                 payload: signed.payload,
                 public_key: signed.public_key,
@@ -123,18 +132,23 @@ fn run(command: Operation) -> Result<Value> {
         Operation::SignRecord { key, input } => {
             let identity = Identity::load(key).context("cannot load identity key")?;
             let mut record = read_json::<trust::TrustRecord>(&input, "TrustRecord")?;
-            trust::sign(&mut record, &identity).context("cannot sign TrustRecord")?;
+            trust::sign_with_namespace(&mut record, &identity, namespace)
+                .context("cannot sign TrustRecord")?;
             Ok(serde_json::to_value(record)?)
         }
     }
 }
 
 fn main() -> ExitCode {
-    let result = run(Cli::parse().command).and_then(|value| {
-        let mut stdout = io::stdout().lock();
-        serde_json::to_writer(&mut stdout, &value).context("cannot write JSON output")?;
-        writeln!(stdout).context("cannot write JSON output")
-    });
+    let cli = Cli::parse();
+    let result = protocol::Namespace::new(cli.organization, cli.protocol_version)
+        .map_err(anyhow::Error::from)
+        .and_then(|namespace| run_with_namespace(cli.command, &namespace))
+        .and_then(|value| {
+            let mut stdout = io::stdout().lock();
+            serde_json::to_writer(&mut stdout, &value).context("cannot write JSON output")?;
+            writeln!(stdout).context("cannot write JSON output")
+        });
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {

@@ -159,14 +159,24 @@ enum PossessionProof {
     Service,
     Device,
 }
+#[cfg(test)]
 fn sign_possession(
+    key: &Identity,
+    genesis: &TrustGenesis,
+    record: client::trust::TrustRecord,
+    proof: PossessionProof,
+) -> anyhow::Result<client::trust::TrustRecord> {
+    sign_possession_with_namespace(key, genesis, record, proof, &Default::default())
+}
+fn sign_possession_with_namespace(
     key: &Identity,
     genesis: &TrustGenesis,
     mut record: client::trust::TrustRecord,
     proof: PossessionProof,
+    namespace: &node::protocol::Namespace,
 ) -> anyhow::Result<client::trust::TrustRecord> {
     let pin = TrustState::genesis_digest(genesis)?;
-    client::management::review_record(genesis, &pin, &record)?;
+    client::management::review_record_with_namespace(genesis, &pin, &record, namespace)?;
     let own = key.peer_id().to_string();
     let allowed = match (&record.action, proof) {
         (
@@ -187,8 +197,8 @@ fn sign_possession(
         allowed,
         "only this key's own device or service possession can be co-signed"
     );
-    identity::trust::verify_signatures(&record)?;
-    client::trust::sign(&mut record, key)?;
+    identity::trust::verify_signatures_with_namespace(&record, namespace)?;
+    identity::trust::sign_with_namespace(&mut record, key, namespace)?;
     Ok(record)
 }
 fn sign_file(
@@ -197,17 +207,19 @@ fn sign_file(
     record: &Path,
     out: &Path,
     proof: PossessionProof,
+    namespace: &node::protocol::Namespace,
 ) -> anyhow::Result<()> {
     validate_genesis(genesis)?;
     anyhow::ensure!(
         record.metadata()?.len() <= node::protocol::MAX_TRUST_RECORD as u64,
         "record too large"
     );
-    let signed = sign_possession(
+    let signed = sign_possession_with_namespace(
         &Identity::load(key)?,
         genesis,
         serde_json::from_slice(&std::fs::read(record)?)?,
         proof,
+        namespace,
     )?;
     write_new_inner(out, &signed)
 }
@@ -225,12 +237,30 @@ pub fn sign_service(
         record,
         out,
         PossessionProof::Service,
+        &config.node.namespace,
     )
     .map_err(crate::operation_error)
 }
 /// Executors prove possession when being bound; they cannot impersonate a chair or another device.
 pub fn sign_device(key: &Path, genesis: &TrustGenesis, record: &Path, out: &Path) -> Result<()> {
-    sign_file(key, genesis, record, out, PossessionProof::Device).map_err(crate::operation_error)
+    sign_device_with_namespace(key, genesis, record, out, &Default::default())
+}
+pub fn sign_device_with_namespace(
+    key: &Path,
+    genesis: &TrustGenesis,
+    record: &Path,
+    out: &Path,
+    namespace: &node::protocol::Namespace,
+) -> Result<()> {
+    sign_file(
+        key,
+        genesis,
+        record,
+        out,
+        PossessionProof::Device,
+        namespace,
+    )
+    .map_err(crate::operation_error)
 }
 
 /// Public, directly importable client settings. The operator chooses a reachable address;
@@ -271,6 +301,7 @@ fn identity_config_inner(
         (peer, parsed.to_string())
     };
     Ok(client::management::review_config(&client::trust::Config {
+        namespace: config.node.namespace.clone(),
         genesis: genesis.clone(),
         genesis_hash: service.genesis_hash.clone(),
         log: Default::default(),

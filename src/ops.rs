@@ -471,7 +471,7 @@ fn authorize_request(
         // verify also inserts a nonce. Use a disposable cache until the tool/op
         // binding passes, then claim it atomically in this service's shared cache.
         let verification_cache = ReplayCache::new(1);
-        let verified = mcp::verify(
+        let verified = mcp::verify_with_namespace(
             &delegation.envelope,
             now,
             &Expected {
@@ -483,6 +483,7 @@ fn authorize_request(
                 request: &signed_request,
                 replay_cache: &verification_cache,
             },
+            view.state()?.namespace(),
         )
         .map_err(delegation_error)?;
         let op = client::ops::tool_request(

@@ -116,6 +116,7 @@ async fn main() -> Result<()> {
             let bytes = client::documents::fetch(
                 identity::Identity::load(&config.node.key)?,
                 client::documents::Input {
+                    namespace: config.node.namespace.clone(),
                     address,
                     peer,
                     service,

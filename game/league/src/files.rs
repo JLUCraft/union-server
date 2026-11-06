@@ -12,7 +12,7 @@ pub async fn snapshot(node: &Node, peer: PeerId, genesis: &str) -> Result<Snapsh
         peer,
         genesis,
         journal::Request::Snapshot,
-        crate::journal::PROTOCOL,
+        &node.namespace().governance_protocol(),
     )
     .await?
     .state
@@ -116,7 +116,7 @@ async fn apply_with_identity(
         identity,
         trust,
         state::governance::Action::Domain(flows::FlowAction::Inner(action)),
-        crate::journal::PROTOCOL,
+        &node.namespace().governance_protocol(),
     )
     .await?
     .state

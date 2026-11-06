@@ -17,7 +17,7 @@ pub async fn fetch_genesis_chains(
         address,
         peer,
         &pin,
-        crate::journal::PROTOCOL,
+        &node.namespace().governance_protocol(),
     )
     .await
     .map(|(_, pin)| serde_json::json!({"genesis_hash": pin}))

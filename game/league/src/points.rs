@@ -301,7 +301,14 @@ pub async fn request_text(
     let input: crate::application::Input =
         serde_json::from_value(value).map_err(crate::Error::protocol)?;
     let (address, peer) = crate::endpoint(&input.address, &input.peer)?;
-    let node = crate::Node::start(identity.clone(), crate::NodeConfig::default()).await?;
+    let node = crate::Node::start(
+        identity.clone(),
+        crate::NodeConfig {
+            namespace: input.identity.namespace.clone(),
+            ..Default::default()
+        },
+    )
+    .await?;
     let result = async {
         node.dial(address).await?;
         let log = tokio::sync::Mutex::new(input.identity.open()?);
@@ -338,7 +345,7 @@ pub async fn request_text(
             &identity,
             &trust,
             action,
-            crate::journal::PROTOCOL,
+            &node.namespace().governance_protocol(),
         )
         .await?;
         if let Some(state) = &response.state {
