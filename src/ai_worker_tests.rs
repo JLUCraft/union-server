@@ -70,11 +70,11 @@ async fn automatic_flow(replicated: bool, decision: Option<&'static str>) -> Res
             socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
         });
         let host_key=Identity::generate();
-        let identity_genesis=node::protocol::TrustGenesis {federation:"worker-test".into(),quorum:1,founders:vec![node::protocol::TrustFounder {member:"chair".into(),club:"school".into(),public_key:admin.public_key().encode_protobuf()}]};
+        let identity_genesis=node::protocol::TrustGenesis {namespace: node::protocol::Namespace::jlucraft(),quorum:1,founders:vec![node::protocol::TrustFounder {member:"chair".into(),club:"school".into(),public_key:admin.public_key().encode_protobuf()}]};
         let identity_pin=client::trust::TrustState::genesis_digest(&identity_genesis)?;
         {
             use node::protocol::TrustAction as T;
-            let mut log=client::trust::TrustLog::open(&dir.path().join("identity.jsonl"),&identity_genesis,&identity_pin)?;
+            let mut log=client::trust::TrustLog::open_with_namespace(&dir.path().join("identity.jsonl"),&identity_genesis,&identity_pin, node::protocol::Namespace::jlucraft())?;
             for action in [
                 T::ConfirmMember {member:"worker".into(),club:"school".into(),device:Some(worker.peer_id().to_string()),evidence:"manual".into(),verifier:None},
                 T::ConfirmMember {member:"human".into(),club:"school".into(),device:Some(human.peer_id().to_string()),evidence:"manual".into(),verifier:None},
@@ -83,7 +83,7 @@ async fn automatic_flow(replicated: bool, decision: Option<&'static str>) -> Res
                 T::GrantPermission {id:"human-office".into(),member:"human".into(),service:"application".into(),permission:"admin".into()},
             ] {
                 let mut record=log.state().draft(action);
-                for key in [&admin,&worker,&human,&host_key] {client::trust::sign(&mut record,key)?;}
+                for key in [&admin,&worker,&human,&host_key] {client::trust::sign_with_namespace(&mut record,key, &node::protocol::Namespace::jlucraft())?;}
                 log.append(record)?;
             }
             genesis=state::State::<Application>::new(node::protocol::TrustBusinessBinding {genesis:identity_pin.clone(),namespace:"application".into(),service:"application".into(),audience:host_key.peer_id().to_string(),club:"school".into()})?;
@@ -93,7 +93,7 @@ async fn automatic_flow(replicated: bool, decision: Option<&'static str>) -> Res
         worker.save_new(dir.path().join("worker.key"))?;
         host_key.save_new(dir.path().join("node.key"))?;
         let mut config=serde_json::json!({
-            "node":{"key":"node.key"},"services":{
+            "node":{"namespace":{"organization":"jlucraft","version":1},"key":"node.key"},"services":{
                 "governance":{"genesis":"genesis.json","journal":"office"},
                 "ai_worker":{"key":"worker.key","providers":[{"id":"fixture","protocol":"chat_completions","url":url,"models":["local"],"context_tokens":4096}]}
             }
@@ -120,10 +120,10 @@ async fn automatic_flow(replicated: bool, decision: Option<&'static str>) -> Res
         let config_path=dir.path().join("node.json");
         std::fs::write(&config_path,serde_json::to_vec(&config)?)?;
         let host=crate::runtime::Host::start(crate::runtime::Config::load(&config_path,Some(&identity_genesis))?).await?;
-        let client_node=Node::start(human.clone(),NodeConfig::default()).await?;
+        let client_node=Node::start(human.clone(),NodeConfig::new(node::protocol::Namespace::jlucraft())).await?;
         client_node.dial(host.status()?.addresses[0].parse()?).await?;
         let cache={
-            let log=Mutex::new(client::trust::TrustLog::open(&dir.path().join("client.jsonl"),&identity_genesis,&identity_pin)?);
+            let log=Mutex::new(client::trust::TrustLog::open_with_namespace(&dir.path().join("client.jsonl"),&identity_genesis,&identity_pin, node::protocol::Namespace::jlucraft())?);
             authority::trust::synchronize(&client_node,host_key.peer_id(),&log).await?;log.into_inner()
         };
         while league::files::snapshot(&client_node,host_key.peer_id(),&hash).await.is_err() {tokio::time::sleep(std::time::Duration::from_millis(50)).await;}
@@ -167,7 +167,7 @@ async fn automatic_flow(replicated: bool, decision: Option<&'static str>) -> Res
             assert_eq!(state.domain.inner.events["event"].phase,league::events::Phase::Review);
             assert!(flow.deadline_ms.is_none());
             assert!(matches!(flows::template_for(&state.domain.flow_templates,flow)?.stages[1].approver,flows::Approver::ClubPresidents{..}));
-            let worker_node=Node::start(worker.clone(),NodeConfig::default()).await?;
+            let worker_node=Node::start(worker.clone(),NodeConfig::new(node::protocol::Namespace::jlucraft())).await?;
             worker_node.dial(host.status()?.addresses[0].parse()?).await?;
             let denied=client::trust::execute::<Application>(&worker_node,host_key.peer_id(),&hash,&worker,&cache,state::governance::Action::Domain(F::Approve{instance:"flow".into(),comment_hash:"a".repeat(64)}),client::journal::PROTOCOL).await?;
             assert!(denied.error.is_some());
@@ -185,12 +185,12 @@ async fn automatic_flow(replicated: bool, decision: Option<&'static str>) -> Res
         client_node.shutdown().await?;
         host.close().await?;
         if !replicated {
-            let replay=Journal::<Application>::open(dir.path().join("office"),genesis.clone())?;
+            let replay=Journal::<Application>::open_with_namespace(dir.path().join("office"),genesis.clone(), node::protocol::Namespace::jlucraft())?;
             assert_eq!(replay.state(),&state);
         }
         #[cfg(feature = "server")]
         if replicated {
-            let replay=authority::consensus::Store::open(&dir.path().join("office"),genesis)?;
+            let replay=authority::consensus::Store::open_with_namespace(&dir.path().join("office"),genesis, node::protocol::Namespace::jlucraft())?;
             assert_eq!(replay.state().await,state);
         }
         assert_eq!(calls.load(Ordering::SeqCst),1);
@@ -263,9 +263,10 @@ async fn office_domain_registers_worker_and_commits_file_versions() -> Result<()
         crate::test_identity::Identities::new(&[(&worker, "worker", "school")], "worker");
     let genesis = identities.genesis::<Office>();
     let authority = Authority::Local {
-        journal: Arc::new(Mutex::new(Journal::open(
+        journal: Arc::new(Mutex::new(Journal::open_with_namespace(
             dir.path().join("office"),
             genesis,
+            node::protocol::Namespace::jlucraft(),
         )?)),
         view: identities.log.view(std::time::Duration::from_secs(60))?,
         log: Arc::new(Mutex::new(identities.log)),

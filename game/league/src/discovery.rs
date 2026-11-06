@@ -49,7 +49,7 @@ impl Discovered {
 async fn probe_address(
     peer: PeerId,
     candidates: Vec<crate::Multiaddr>,
-    namespace: protocol::Namespace,
+    namespace: node::protocol::Namespace,
 ) -> Option<String> {
     let mut tasks = JoinSet::new();
     for (index, candidate) in candidates.into_iter().enumerate() {
@@ -59,8 +59,7 @@ async fn probe_address(
             let probe = Node::start(
                 Identity::generate(),
                 NodeConfig {
-                    namespace,
-                    ..Default::default()
+                    ..node::NodeConfig::new(namespace)
                 },
             )
             .await
@@ -85,21 +84,17 @@ async fn probe_address(
 
 /// Listen for mDNS announcements, then read each host's public identity genesis and
 /// application genesis. Hosts that never answer or have no reachable address are skipped.
-pub async fn discover(identity: Identity, wait: Option<Duration>) -> Result<Vec<Discovered>> {
-    discover_with_namespace(identity, wait, Default::default()).await
-}
 pub async fn discover_with_namespace(
     identity: Identity,
     wait: Option<Duration>,
-    namespace: protocol::Namespace,
+    namespace: node::protocol::Namespace,
 ) -> Result<Vec<Discovered>> {
     let wait = wait.unwrap_or(DEFAULT_WAIT).min(MAX_WAIT);
     let node = Node::start(
         identity,
         NodeConfig {
-            namespace,
             lan_discovery: true,
-            ..Default::default()
+            ..node::NodeConfig::new(namespace)
         },
     )
     .await?;
@@ -141,7 +136,7 @@ pub async fn discover_with_namespace(
                 continue;
             };
             servers.push(Discovered {
-                federation: genesis.federation.clone(),
+                federation: genesis.namespace.organization.clone(),
                 peer,
                 address,
                 genesis,
@@ -163,10 +158,11 @@ pub async fn connect_pinned(
     identity: Identity,
     genesis_hash: &str,
     wait: Option<Duration>,
+    namespace: node::protocol::Namespace,
 ) -> Result<Option<Discovered>> {
     crate::protocol::validate_digest(genesis_hash)
         .map_err(|_| Error::protocol("a pinned lowercase genesis SHA-256 is required"))?;
-    Ok(discover(identity, wait)
+    Ok(discover_with_namespace(identity, wait, namespace)
         .await?
         .into_iter()
         .find(|server| server.genesis_hash == genesis_hash))
@@ -183,7 +179,7 @@ mod tests {
             peer: Identity::generate().peer_id(),
             address: "/ip4/127.0.0.1/udp/40000/quic-v1".into(),
             genesis: TrustGenesis {
-                federation: "JLUCraft".into(),
+                namespace: node::protocol::Namespace::jlucraft(),
                 founders: Vec::new(),
                 quorum: 1,
             },
@@ -202,7 +198,7 @@ mod tests {
                 "peer": server.peer.to_string(),
                 "address": server.address,
                 "federation": "JLUCraft",
-                "genesis": {"federation": "JLUCraft", "founders": [], "quorum": 1},
+                "genesis": {"namespace": {"organization":"jlucraft", "wire_version":1, "signing_version":1}, "founders": [], "quorum": 1},
                 "genesis_hash": "a".repeat(64),
                 "application": "b".repeat(64),
                 "services": [{
@@ -229,7 +225,7 @@ mod tests {
                         .parse()
                         .map_err(Error::protocol)?,
                 ],
-                ..Default::default()
+                ..node::NodeConfig::new(node::protocol::Namespace::jlucraft())
             },
         )
         .await?;
@@ -239,7 +235,7 @@ mod tests {
         let found = probe_address(
             server.peer_id(),
             vec![unreachable, address.clone()],
-            Default::default(),
+            node::protocol::Namespace::jlucraft(),
         )
         .await;
         server.shutdown().await?;

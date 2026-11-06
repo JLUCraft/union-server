@@ -1,5 +1,5 @@
 {
-  "federation": "jlucraft-isolated-ci-test",
+  "namespace": {"organization": "jlucraft", "version": 1},
   "quorum": 1,
   "founders": [
     {

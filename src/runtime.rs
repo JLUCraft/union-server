@@ -31,7 +31,6 @@ pub struct Config {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Network {
-    #[serde(default)]
     pub namespace: node::protocol::Namespace,
     pub key: PathBuf,
     #[serde(default)]
@@ -247,6 +246,13 @@ impl Config {
         relative(base, &mut config.node.key);
         if let Some(identity) = &mut config.services.identity {
             let genesis = genesis.context("identity service requires an explicit trust root")?;
+            ensure!(
+                config
+                    .node
+                    .namespace
+                    .same_signing_domain(&genesis.namespace),
+                "node.namespace signing domain does not match identity genesis namespace"
+            );
             let pin = crate::bootstrap::validate_genesis(genesis)?;
             ensure!(
                 identity.genesis_hash.is_empty() || identity.genesis_hash == pin,
@@ -339,13 +345,12 @@ impl Config {
         }
         self.node.namespace.validate()?;
         let mut network = NodeConfig {
-            namespace: self.node.namespace.clone(),
             external_addresses: addresses(&self.node.external)?,
             bootstrap: addresses(&self.node.bootstrap)?,
             relay: self.services.relay.config(),
             discovery_server: self.services.directory,
             lan_discovery: self.node.lan_discovery,
-            ..Default::default()
+            ..NodeConfig::new(self.node.namespace.clone())
         };
         if !self.node.listen.is_empty() {
             network.listen = addresses(&self.node.listen)?;

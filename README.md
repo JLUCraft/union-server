@@ -8,24 +8,33 @@ Keep sibling `union-core` and `minecraftd` checkouts available. The production e
 
 ## Protocol namespace
 
-The optional `node.namespace` object configures the shared transport, discovery,
-service protocols, MCP service name and header, and signature verification:
+The required `node.namespace` object configures transport, discovery, service
+protocols, MCP service names and headers, and signature verification. Missing
+namespace configuration is rejected. JLUCraft deployments use:
 
 ```json
-{"node":{"key":"node.key","namespace":{"organization":"acme","version":1}}}
+{"node":{"key":"node.key","namespace":{"organization":"jlucraft","version":1}}}
 ```
 
-Omit the object to preserve the existing JLUCraft wire bytes. The organization
-uses ASCII letters, digits, underscores, or hyphens; the version is positive.
-Identity and governance logs must retain the namespace used when they were
-signed. Namespace configuration does not rewrite or migrate historical records.
-The MCP relay and workflow operation clients inherit the host namespace. For a
-custom organization, the envelope header becomes `X-<organization>-Envelope`
-and the MCP service name becomes `<organization>-control`.
-The standalone identity bridge accepts the same optional `namespace` object.
-Exported identity client settings include it only when it differs from default.
-`jlucraft-agent` accepts `--organization` and `--protocol-version` for local
-command and identity-record signing; both flags default to the original domain.
+`version` is an input alias for `wire_version`. The canonical namespace contains
+`organization`, `wire_version`, and `signing_version`; only `signing_version`
+defaults to 1. Organizations contain 1–64 lowercase ASCII letters, digits, or
+hyphens; both versions must be positive. Wire versions change protocols and KAD
+keys independently of signature domains. The explicit JLUCraft namespace
+preserves all original protocol, KAD, and signature-domain bytes.
+
+The identity genesis contains the namespace instead of a separate federation
+string, and its digest covers every namespace field. The host namespace must
+match the supplied genesis organization and signing version. The runtime wire
+version may change without editing genesis or replacing its pin. The schema
+change requires reviewing and distributing new genesis pins; it does not migrate existing identity or governance logs.
+The MCP relay and workflow clients inherit the host namespace. A custom
+organization selects `x-<organization>-envelope` and `<organization>-control`.
+The standalone identity bridge also requires an explicit namespace. Exported
+identity client settings always include it. `jlucraft-agent` accepts
+`--organization` and `--protocol-version`; its explicit JLUCraft defaults retain
+signing version 1 when the wire version changes. Acceptance terminal node
+arguments require both namespace flags.
 
 ## Network operations
 

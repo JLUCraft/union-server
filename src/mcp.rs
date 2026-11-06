@@ -301,7 +301,7 @@ pub async fn serve_with_namespace(
 
 #[cfg(test)]
 async fn serve_with_listener(config: Config, listener: tokio::net::TcpListener) -> Result<()> {
-    serve_with_listener_and_namespace(config, listener, Default::default()).await
+    serve_with_listener_and_namespace(config, listener, node::protocol::Namespace::jlucraft()).await
 }
 
 async fn serve_with_listener_and_namespace(
@@ -327,16 +327,7 @@ async fn serve_with_listener_and_namespace(
     }
 
     let relay_peer = relay.peer_id().to_string();
-    let node = Arc::new(
-        node::Node::start(
-            relay,
-            node::NodeConfig {
-                namespace: namespace.clone(),
-                ..Default::default()
-            },
-        )
-        .await?,
-    );
+    let node = Arc::new(node::Node::start(relay, node::NodeConfig::new(namespace.clone())).await?);
     let principals = config
         .principals
         .iter()
@@ -1052,7 +1043,7 @@ mod tests {
 
     fn signed(signer: &Identity, aud: McpAudience, request: &serde_json::Value) -> McpEnvelope {
         let now = authority::journal::now_ms().unwrap();
-        envelope::sign(
+        envelope::sign_with_namespace(
             McpClaims {
                 signer: signer.peer_id().to_string(),
                 public_key: base64::engine::general_purpose::STANDARD
@@ -1064,6 +1055,7 @@ mod tests {
                 digest: envelope::request_digest(&request_commitment(request).unwrap()).unwrap(),
             },
             signer,
+            &node::protocol::Namespace::jlucraft(),
         )
         .unwrap()
     }
@@ -1136,7 +1128,7 @@ mod tests {
             }]);
             let operations = Arc::new(BTreeMap::from([("ops".into(), target)]));
             let config = gateway_config(
-                Default::default(),
+                node::protocol::Namespace::jlucraft(),
                 relay.peer_id().to_string(),
                 &principals,
                 capacity,
@@ -1236,7 +1228,12 @@ mod tests {
                     .auth
                     .verifier
                     .verify_at(
-                        envelope::sign(claims, &fixture.signer).unwrap(),
+                        envelope::sign_with_namespace(
+                            claims,
+                            &fixture.signer,
+                            &node::protocol::Namespace::jlucraft()
+                        )
+                        .unwrap(),
                         &serde_json::to_vec(&body).unwrap(),
                         authority::journal::now_ms().unwrap()
                     )
@@ -1337,7 +1334,12 @@ mod tests {
                 claims.iat_ms += ALLOWED_DRIFT_MS + envelope::MAX_LIFETIME_MS;
                 claims.exp_ms = claims.iat_ms + envelope::MAX_LIFETIME_MS;
             }
-            let bad = envelope::sign(claims, &fixture.signer).unwrap();
+            let bad = envelope::sign_with_namespace(
+                claims,
+                &fixture.signer,
+                &node::protocol::Namespace::jlucraft(),
+            )
+            .unwrap();
             assert_eq!(
                 authenticate_request(&fixture.auth, http_request(&bad, &body))
                     .await
@@ -1404,7 +1406,12 @@ mod tests {
                     "service" => claims.aud.service = "wrong".into(),
                     _ => claims.aud.tool = "wrong".into(),
                 }
-                let bad = envelope::sign(claims, &fixture.signer).unwrap();
+                let bad = envelope::sign_with_namespace(
+                    claims,
+                    &fixture.signer,
+                    &node::protocol::Namespace::jlucraft(),
+                )
+                .unwrap();
                 assert_eq!(
                     authenticate_request(&fixture.auth, http_request(&bad, &body))
                         .await
@@ -1488,7 +1495,12 @@ mod tests {
                     .clone();
                 claims.aud.service = client::journal::PROTOCOL.into();
             }
-            let wrong = envelope::sign(claims, &fixture.signer).unwrap();
+            let wrong = envelope::sign_with_namespace(
+                claims,
+                &fixture.signer,
+                &node::protocol::Namespace::jlucraft(),
+            )
+            .unwrap();
             assert_eq!(
                 authenticate_request(&fixture.auth, http_request(&wrong, &body))
                     .await
@@ -1499,7 +1511,12 @@ mod tests {
             // A rejected audience does not consume the nonce.
             let mut correct = fixture.sign(&body).claims;
             correct.nonce = wrong.claims.nonce;
-            let correct = envelope::sign(correct, &fixture.signer).unwrap();
+            let correct = envelope::sign_with_namespace(
+                correct,
+                &fixture.signer,
+                &node::protocol::Namespace::jlucraft(),
+            )
+            .unwrap();
             authenticate_request(&fixture.auth, http_request(&correct, &body))
                 .await
                 .unwrap();
@@ -1560,7 +1577,7 @@ mod tests {
         );
         // The service verifies the forwarded envelope with its independent cache.
         let target = &fixture.operations["ops"];
-        envelope::verify(
+        envelope::verify_with_namespace(
             &delegation.envelope,
             authority::journal::now_ms().unwrap(),
             &Expected {
@@ -1575,6 +1592,7 @@ mod tests {
                 ),
                 replay_cache: &ReplayCache::default(),
             },
+            &node::protocol::Namespace::jlucraft(),
         )
         .unwrap();
     }
@@ -1654,7 +1672,7 @@ mod tests {
                 arguments.map(serde_json::Value::Object)
             );
             let target = &fixture.operations["ops"];
-            envelope::verify(
+            envelope::verify_with_namespace(
                 &delegation.envelope,
                 authority::journal::now_ms().unwrap(),
                 &Expected {
@@ -1669,6 +1687,7 @@ mod tests {
                     ),
                     replay_cache: &ReplayCache::default(),
                 },
+                &node::protocol::Namespace::jlucraft(),
             )
             .unwrap();
         }
@@ -1893,7 +1912,11 @@ mod tests {
                     ..Default::default()
                 },
             })?);
-            let mut host = node::Node::start(host_key.clone(), node::NodeConfig::default()).await?;
+            let mut host = node::Node::start(
+                host_key.clone(),
+                node::NodeConfig::new(node::protocol::Namespace::jlucraft()),
+            )
+            .await?;
             let incoming = host.take_incoming()?;
             let service = node::ServiceId::new();
             identities.service(&host_key, &service.to_string(), "agent", "manage");
@@ -2082,8 +2105,11 @@ mod tests {
             &[&root],
         );
         ids.log.mark_current()?;
-        let mut journal =
-            Journal::<Application>::open(directory.path().join("journal"), ids.genesis())?;
+        let mut journal = Journal::<Application>::open_with_namespace(
+            directory.path().join("journal"),
+            ids.genesis(),
+            node::protocol::Namespace::jlucraft(),
+        )?;
         let target = Arc::make_mut(&mut auth.auth.principals)[0]
             .application
             .as_mut()
@@ -2121,7 +2147,7 @@ mod tests {
             snapshot,
             ids.log.state().checkpoint().clone(),
             host.peer_id(),
-            &Default::default(),
+            &node::protocol::Namespace::jlucraft(),
         );
         let context = result.structured_content.unwrap();
         assert_eq!(context["peer"], host.peer_id().to_string());
@@ -2131,7 +2157,7 @@ mod tests {
             serde_json::to_value(ids.log.state().checkpoint())?
         );
         assert!(context["snapshot"]["proof"].get("identity").is_none());
-        let command = SignedCommand::sign(
+        let command = SignedCommand::sign_with_namespace(
             &auth.signer,
             TrustedCommand::<Application> {
                 genesis: context["snapshot"]["proof"]["genesis_hash"]
@@ -2152,6 +2178,7 @@ mod tests {
                     },
                 },
             },
+            &node::protocol::Namespace::jlucraft(),
         )?;
         let history = ids.log.history_since(None)?;
         let (_, arguments) = client::journal::mcp::request_tool(&Request::Execute {
@@ -2244,22 +2271,32 @@ mod tests {
                     &[&root],
                 );
             }
-            let mut log = client::trust::TrustLog::open(
+            let mut log = client::trust::TrustLog::open_with_namespace(
                 &directory.path().join("identity"),
                 ids.log.genesis(),
                 &ids.binding.genesis,
+                node::protocol::Namespace::jlucraft(),
             )?;
             for record in ids.log.history_since(None)?.records {
                 log.append(record)?;
             }
             log.mark_current()?;
             let view = log.view(std::time::Duration::from_secs(60))?;
-            let journal =
-                client::journal::Journal::open(directory.path().join("journal"), ids.genesis())?;
+            let journal = client::journal::Journal::open_with_namespace(
+                directory.path().join("journal"),
+                ids.genesis(),
+                node::protocol::Namespace::jlucraft(),
+            )?;
             let genesis_hash = journal.genesis_hash().to_owned();
             let log = Arc::new(tokio::sync::Mutex::new(log));
             let journal = Arc::new(tokio::sync::Mutex::new(journal));
-            let host = Arc::new(node::Node::start(host_key, node::NodeConfig::default()).await?);
+            let host = Arc::new(
+                node::Node::start(
+                    host_key,
+                    node::NodeConfig::new(node::protocol::Namespace::jlucraft()),
+                )
+                .await?,
+            );
             let serving = host.clone();
             let serving_log = log.clone();
             let identity_task = tokio::spawn(async move {
@@ -2349,7 +2386,7 @@ mod tests {
             use client::journal::{Command, SignedCommand, TrustedCommand};
             let context = self.snapshot().await?;
             let command =
-                SignedCommand::sign(
+                SignedCommand::sign_with_namespace(
                     &self.agent,
                     TrustedCommand {
                         genesis: context["snapshot"]["proof"]["genesis_hash"]
@@ -2375,6 +2412,7 @@ mod tests {
                                 },
                             },
                     },
+                    &node::protocol::Namespace::jlucraft(),
                 )?;
             let base64 = base64::engine::general_purpose::STANDARD;
             self.call("application_submit", serde_json::json!({"command": {
@@ -2395,7 +2433,11 @@ mod tests {
                         service: "business".into(),
                         permission: "read".into(),
                     });
-            client::trust::sign(&mut record, &self.root)?;
+            client::trust::sign_with_namespace(
+                &mut record,
+                &self.root,
+                &node::protocol::Namespace::jlucraft(),
+            )?;
             self.call("identity_submit", serde_json::to_value(record)?)
                 .await
         }
@@ -2428,12 +2470,20 @@ mod tests {
                         service: "business".into(),
                         permission: "read".into(),
                     });
-                client::trust::sign(&mut record, &f.root)?;
+                client::trust::sign_with_namespace(
+                    &mut record,
+                    &f.root,
+                    &node::protocol::Namespace::jlucraft(),
+                )?;
                 log.append(record)?;
             }
             log.mark_current()?;
         }
-        let reader = node::Node::start(Identity::generate(), Default::default()).await?;
+        let reader = node::Node::start(
+            Identity::generate(),
+            node::NodeConfig::new(node::protocol::Namespace::jlucraft()),
+        )
+        .await?;
         let (address, peer) = client::endpoint(
             &f.host.addresses()[0].to_string(),
             &f.host.peer_id().to_string(),

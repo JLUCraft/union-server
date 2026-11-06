@@ -14,12 +14,23 @@ async fn events_invalidate_snapshots_and_reject_outsiders() -> Result<(), Box<dy
     let identities = support::Identities::new(&[(&identity, "admin", "jlu")], "admin");
     let view = identities.log.view(Duration::from_secs(60))?;
     let dir = tempfile::tempdir()?;
-    let journal = Arc::new(Mutex::new(Journal::open(
+    let journal = Arc::new(Mutex::new(Journal::open_with_namespace(
         dir.path().join("journal"),
         identities.genesis(),
+        node::protocol::Namespace::jlucraft(),
     )?));
-    let host = Arc::new(Node::start(Identity::generate(), NodeConfig::default()).await?);
-    let client = Node::start(identity.clone(), NodeConfig::default()).await?;
+    let host = Arc::new(
+        Node::start(
+            Identity::generate(),
+            NodeConfig::new(node::protocol::Namespace::jlucraft()),
+        )
+        .await?,
+    );
+    let client = Node::start(
+        identity.clone(),
+        NodeConfig::new(node::protocol::Namespace::jlucraft()),
+    )
+    .await?;
     client.dial(host.addresses()[0].clone()).await?;
     let log = Arc::new(Mutex::new(identities.log));
     let task = tokio::spawn(events::serve_authority(
@@ -38,7 +49,7 @@ async fn events_invalidate_snapshots_and_reject_outsiders() -> Result<(), Box<dy
     assert!(first.resync);
     let current = log.lock().await;
     let mut j = journal.lock().await;
-    let command = authority::journal::SignedCommand::sign(
+    let command = authority::journal::SignedCommand::sign_with_namespace(
         &identity,
         authority::journal::TrustedCommand {
             genesis: j.genesis_hash().into(),
@@ -53,6 +64,7 @@ async fn events_invalidate_snapshots_and_reject_outsiders() -> Result<(), Box<dy
                 },
             },
         },
+        &node::protocol::Namespace::jlucraft(),
     )?;
     j.execute(command, current.history_since(None)?, current.state(), 10)?;
     drop(j);
@@ -66,7 +78,11 @@ async fn events_invalidate_snapshots_and_reject_outsiders() -> Result<(), Box<dy
         }
     })
     .await??;
-    let outsider = Node::start(Identity::generate(), NodeConfig::default()).await?;
+    let outsider = Node::start(
+        Identity::generate(),
+        NodeConfig::new(node::protocol::Namespace::jlucraft()),
+    )
+    .await?;
     outsider.dial(host.addresses()[0].clone()).await?;
     let mut denied = events::subscribe(&outsider, host.peer_id(), 0, events::PROTOCOL).await?;
     assert!(

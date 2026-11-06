@@ -23,6 +23,15 @@ pub fn validate_genesis(genesis: &TrustGenesis) -> Result<String> {
 }
 
 fn validate_identity_root(config: &Config, genesis: &TrustGenesis) -> Result<()> {
+    if !config
+        .node
+        .namespace
+        .same_signing_domain(&genesis.namespace)
+    {
+        return Err(Error::protocol(
+            "node.namespace signing domain does not match identity genesis namespace",
+        ));
+    }
     let pin = validate_genesis(genesis)?;
     if let Some(identity) = &config.services.identity
         && identity.genesis_hash != pin
@@ -166,7 +175,7 @@ fn sign_possession(
     record: client::trust::TrustRecord,
     proof: PossessionProof,
 ) -> anyhow::Result<client::trust::TrustRecord> {
-    sign_possession_with_namespace(key, genesis, record, proof, &Default::default())
+    sign_possession_with_namespace(key, genesis, record, proof, &genesis.namespace)
 }
 fn sign_possession_with_namespace(
     key: &Identity,
@@ -243,7 +252,7 @@ pub fn sign_service(
 }
 /// Executors prove possession when being bound; they cannot impersonate a chair or another device.
 pub fn sign_device(key: &Path, genesis: &TrustGenesis, record: &Path, out: &Path) -> Result<()> {
-    sign_device_with_namespace(key, genesis, record, out, &Default::default())
+    sign_device_with_namespace(key, genesis, record, out, &genesis.namespace)
 }
 pub fn sign_device_with_namespace(
     key: &Path,
@@ -341,14 +350,15 @@ mod tests {
         let pin = validate_genesis(&genesis).unwrap();
         let key = dir.path().join("node.key");
         let config: Config = serde_json::from_value(serde_json::json!({
-            "node":{"key":key},"services":{"identity":{
+            "node":{"namespace":{"organization":"jlucraft","version":1},"key":key},"services":{"identity":{
                 "genesis_hash":pin,"log":dir.path().join("identity.jsonl"),
                 "writer":true,"max_staleness_seconds":60
             }}
         }))
         .unwrap();
         let mut other = genesis.clone();
-        other.federation = "different-explicit-test-root".into();
+        other.namespace =
+            node::protocol::Namespace::new("different-explicit-test-root", 1).unwrap();
         assert!(initialize(&config, &other).is_err());
         assert!(!key.exists());
         assert!(identity_config(&config, &other, None).is_err());
@@ -367,7 +377,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let key = dir.path().join("node.key");
         let config: Config =
-            serde_json::from_value(serde_json::json!({"node":{"key":key}})).unwrap();
+            serde_json::from_value(serde_json::json!({"node":{"namespace":{"organization":"jlucraft","version":1},"key":key}})).unwrap();
         let genesis = parse_genesis(TEST_ROOT).unwrap();
         let first = initialize(&config, &genesis).unwrap();
         assert_eq!(first, initialize(&config, &genesis).unwrap());
@@ -376,7 +386,7 @@ mod tests {
         std::fs::remove_file(&key).unwrap();
         let log = dir.path().join("existing.jsonl");
         std::fs::write(&log, b"existing state").unwrap();
-        let config: Config = serde_json::from_value(serde_json::json!({"node":{"key":key},"services":{"identity":{
+        let config: Config = serde_json::from_value(serde_json::json!({"node":{"namespace":{"organization":"jlucraft","version":1},"key":key},"services":{"identity":{
             "genesis":"unused","genesis_hash":validate_genesis(&genesis).unwrap(),"log":log,"writer":true,"max_staleness_seconds":60
         }}})).unwrap();
         assert!(initialize(&config, &genesis).is_err());
@@ -389,7 +399,7 @@ mod tests {
         let executor = Identity::generate();
         let other = Identity::generate();
         let genesis = TrustGenesis {
-            federation: "proof-test".into(),
+            namespace: node::protocol::Namespace::jlucraft(),
             quorum: 1,
             founders: vec![TrustFounder {
                 member: "chair".into(),
@@ -406,7 +416,12 @@ mod tests {
             evidence: "manual".into(),
             verifier: None,
         });
-        client::trust::sign(&mut record, &chair).unwrap();
+        client::trust::sign_with_namespace(
+            &mut record,
+            &chair,
+            &node::protocol::Namespace::jlucraft(),
+        )
+        .unwrap();
         assert!(
             sign_possession(&other, &genesis, record.clone(), PossessionProof::Device).is_err()
         );
@@ -430,7 +445,12 @@ mod tests {
             audience: executor.peer_id().to_string(),
             club: "school".into(),
         });
-        client::trust::sign(&mut registration, &chair).unwrap();
+        client::trust::sign_with_namespace(
+            &mut registration,
+            &chair,
+            &node::protocol::Namespace::jlucraft(),
+        )
+        .unwrap();
         assert!(
             sign_possession(
                 &other,
@@ -449,7 +469,12 @@ mod tests {
             service: "application".into(),
             permission: "admin".into(),
         });
-        client::trust::sign(&mut grant, &chair).unwrap();
+        client::trust::sign_with_namespace(
+            &mut grant,
+            &chair,
+            &node::protocol::Namespace::jlucraft(),
+        )
+        .unwrap();
         assert!(sign_possession(&executor, &genesis, grant, PossessionProof::Device).is_err());
     }
     #[test]
@@ -466,7 +491,12 @@ mod tests {
         let pin = write_business::<Application>(&path, binding.clone()).unwrap();
         let state: state::State<Application> =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        let journal = authority::journal::Journal::open(dir.path().join("journal"), state).unwrap();
+        let journal = authority::journal::Journal::open_with_namespace(
+            dir.path().join("journal"),
+            state,
+            node::protocol::Namespace::jlucraft(),
+        )
+        .unwrap();
         assert_eq!(pin, journal.genesis_hash());
         assert!(write_business::<Application>(&path, binding).is_err());
     }

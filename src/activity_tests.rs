@@ -39,17 +39,22 @@ impl Fixture {
             &[&identities.root("a"), &keys[3]],
         );
         let genesis = identities.genesis::<Application>();
-        let mut log = TrustLog::open(
+        let mut log = TrustLog::open_with_namespace(
             &directory.path().join("identity"),
             identities.log.genesis(),
             &identities.binding.genesis,
+            node::protocol::Namespace::jlucraft(),
         )?;
         for record in identities.log.history_since(None)?.records {
             log.append(record)?;
         }
         log.mark_current()?;
         let view = log.view(std::time::Duration::from_secs(60))?;
-        let journal = Journal::open(directory.path().join("application"), genesis.clone())?;
+        let journal = Journal::open_with_namespace(
+            directory.path().join("application"),
+            genesis.clone(),
+            node::protocol::Namespace::jlucraft(),
+        )?;
         let authority = Authority::Local {
             journal: Arc::new(tokio::sync::Mutex::new(journal)),
             log: Arc::new(tokio::sync::Mutex::new(log)),
@@ -673,7 +678,11 @@ async fn witnessed_play_mints_then_a_normal_member_funds_local_inference_settles
             ..
         } = fixture;
         drop(authority);
-        let replay = Journal::<Application>::open(path, genesis)?;
+        let replay = Journal::<Application>::open_with_namespace(
+            path,
+            genesis,
+            node::protocol::Namespace::jlucraft(),
+        )?;
         assert_eq!(replay.state(), &stored);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         drop(replay);
@@ -760,7 +769,11 @@ async fn an_assigned_provider_executes_from_a_follower_replica() -> Result<()> {
         let mut nodes = Vec::new();
         for _ in 0..3 {
             nodes.push(Arc::new(
-                node::Node::start(Identity::generate(), node::NodeConfig::default()).await?,
+                node::Node::start(
+                    Identity::generate(),
+                    node::NodeConfig::new(node::protocol::Namespace::jlucraft()),
+                )
+                .await?,
             ));
         }
         let peers: BTreeMap<_, _> = nodes

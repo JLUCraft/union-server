@@ -305,7 +305,7 @@ pub async fn request_text(
         identity.clone(),
         crate::NodeConfig {
             namespace: input.identity.namespace.clone(),
-            ..Default::default()
+            ..crate::NodeConfig::new(input.identity.namespace.clone())
         },
     )
     .await?;

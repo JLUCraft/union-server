@@ -18,12 +18,19 @@ async fn governance_binds_signed_actor_to_authenticated_stream_and_rejects_repla
         let directory = tempfile::tempdir()?;
         let identities = support::Identities::new(&[(&admin, "admin", "jlu")], "admin");
         let view = identities.log.view(Duration::from_secs(60))?;
-        let journal = Arc::new(Mutex::new(Journal::open(
+        let journal = Arc::new(Mutex::new(Journal::open_with_namespace(
             directory.path().join("journal"),
             identities.genesis(),
+            node::protocol::Namespace::jlucraft(),
         )?));
         let genesis_hash = journal.lock().await.genesis_hash().to_owned();
-        let server = Arc::new(Node::start(Identity::generate(), NodeConfig::default()).await?);
+        let server = Arc::new(
+            Node::start(
+                Identity::generate(),
+                NodeConfig::new(node::protocol::Namespace::jlucraft()),
+            )
+            .await?,
+        );
         let task = {
             let node = server.clone();
             let journal = journal.clone();
@@ -33,8 +40,16 @@ async fn governance_binds_signed_actor_to_authenticated_stream_and_rejects_repla
         };
         // Protocol registration runs on the spawned server task before dialing.
         tokio::task::yield_now().await;
-        let client = Node::start(admin.clone(), NodeConfig::default()).await?;
-        let stranger = Node::start(outsider, NodeConfig::default()).await?;
+        let client = Node::start(
+            admin.clone(),
+            NodeConfig::new(node::protocol::Namespace::jlucraft()),
+        )
+        .await?;
+        let stranger = Node::start(
+            outsider,
+            NodeConfig::new(node::protocol::Namespace::jlucraft()),
+        )
+        .await?;
         client.dial(server.addresses()[0].clone()).await?;
         stranger.dial(server.addresses()[0].clone()).await?;
         assert!(
@@ -49,7 +64,7 @@ async fn governance_binds_signed_actor_to_authenticated_stream_and_rejects_repla
             .state
             .is_none()
         );
-        let command = SignedCommand::sign(
+        let command = SignedCommand::sign_with_namespace(
             &admin,
             TrustedCommand {
                 genesis: genesis_hash.clone(),
@@ -64,6 +79,7 @@ async fn governance_binds_signed_actor_to_authenticated_stream_and_rejects_repla
                     },
                 },
             },
+            &node::protocol::Namespace::jlucraft(),
         )?;
         let history = identities.log.history_since(None)?;
         let wrong = journal::request::<league::application::Application>(

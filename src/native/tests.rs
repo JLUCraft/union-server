@@ -112,7 +112,11 @@ async fn room_host(
 ) -> Result<(Node, Backend, tokio::task::JoinHandle<()>)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
-    let mut node = Node::start(Identity::generate(), NodeConfig::default()).await?;
+    let mut node = Node::start(
+        Identity::generate(),
+        NodeConfig::new(node::protocol::Namespace::jlucraft()),
+    )
+    .await?;
     let id = ServiceId::new();
     node.publish(Service {
         metadata: Vec::new(),
@@ -238,7 +242,11 @@ async fn native_cross_node_transfer_substitution_and_returner_fencing() -> Resul
                 &[&root, &users[i]],
             );
         }
-        let mut journal = Journal::open(dir.path().join("journal"), identities.genesis())?;
+        let mut journal = Journal::open_with_namespace(
+            dir.path().join("journal"),
+            identities.genesis(),
+            node::protocol::Namespace::jlucraft(),
+        )?;
         let now = now_ms()?;
         for (signer, action) in [
             (
@@ -288,7 +296,11 @@ async fn native_cross_node_transfer_substitution_and_returner_fencing() -> Resul
             identities.run(&mut journal, signer, now, action)?;
         }
         let journal = Arc::new(Mutex::new(journal));
-        let mut gateway = Node::start(admin.clone(), NodeConfig::default()).await?;
+        let mut gateway = Node::start(
+            admin.clone(),
+            NodeConfig::new(node::protocol::Namespace::jlucraft()),
+        )
+        .await?;
         let service = ServiceId::new();
         identities.service(&admin, &service.to_string(), "alice", "play");
         let view = identities.log.view(Duration::from_secs(60))?;
@@ -337,8 +349,16 @@ async fn native_cross_node_transfer_substitution_and_returner_fencing() -> Resul
             Some(witnesses.clone()),
         ));
         let clients = [
-            Node::start(users[0].clone(), NodeConfig::default()).await?,
-            Node::start(users[1].clone(), NodeConfig::default()).await?,
+            Node::start(
+                users[0].clone(),
+                NodeConfig::new(node::protocol::Namespace::jlucraft()),
+            )
+            .await?,
+            Node::start(
+                users[1].clone(),
+                NodeConfig::new(node::protocol::Namespace::jlucraft()),
+            )
+            .await?,
         ];
         for client in &clients {
             client.dial(gateway.addresses()[0].clone()).await?;

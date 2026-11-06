@@ -14,10 +14,11 @@ pub struct Cache {
 }
 impl Cache {
     pub fn open(&self) -> Result<TrustLog> {
-        Ok(TrustLog::open(
+        Ok(TrustLog::open_with_namespace(
             &self.log,
             &read(&self.genesis)?,
             &self.genesis_hash,
+            node::protocol::Namespace::jlucraft(),
         )?)
     }
 }
@@ -40,7 +41,7 @@ impl Target {
         );
         let node = node::Node::start(
             node::Identity::load(&self.key)?,
-            node::NodeConfig::default(),
+            node::NodeConfig::new(node::protocol::Namespace::jlucraft()),
         )
         .await?;
         if let Err(error) = node.dial(address).await {
@@ -143,7 +144,11 @@ pub async fn execute(command: Command) -> Result<()> {
         }
         Command::Sign { key, record, out } => {
             let mut record: TrustRecord = read(&record)?;
-            client::trust::sign(&mut record, &node::Identity::load(key)?)?;
+            client::trust::sign_with_namespace(
+                &mut record,
+                &node::Identity::load(key)?,
+                &node::protocol::Namespace::jlucraft(),
+            )?;
             crate::write_json(&out, &record)?;
         }
         Command::Sync { cache, target } => remote(cache, target, None).await?,

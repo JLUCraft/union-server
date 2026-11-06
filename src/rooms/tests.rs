@@ -43,12 +43,12 @@ async fn managed_room_publishes_after_readiness_and_withdraws_on_stop() -> Resul
         let host_identity = Identity::generate();
         let identities=crate::test_identity::Identities::new(&[(&host_identity,"host","a")],"host");
         let view=identities.log.view(Duration::from_secs(60))?;
-        let mut host = Node::start(host_identity, NodeConfig::default()).await?;
+        let mut host = Node::start(host_identity, NodeConfig::new(node::protocol::Namespace::jlucraft())).await?;
         let incoming=host.take_incoming()?;
         let host=Arc::new(host);
         let peer = host.peer_id();
         let address = host.addresses()[0].clone();
-        let client = Node::start(Identity::generate(), NodeConfig::default()).await?;
+        let client = Node::start(Identity::generate(), NodeConfig::new(node::protocol::Namespace::jlucraft())).await?;
         client.dial(address).await?;
         assert!(client.list_services(peer).await?.is_empty());
         let key = dir.path().join("forwarding.key");
@@ -83,7 +83,7 @@ async fn unified_members_from_two_clubs_join_over_relay_without_qualification_ex
         let roots = [Identity::generate(), Identity::generate()];
         let users = [Identity::generate(), Identity::generate()];
         let genesis = TrustGenesis {
-            federation: "relay-identity-test".into(),
+            namespace: node::protocol::Namespace::jlucraft(),
             quorum: 2,
             founders: roots
                 .iter()
@@ -97,10 +97,11 @@ async fn unified_members_from_two_clubs_join_over_relay_without_qualification_ex
         };
         let directory = tempfile::tempdir()?;
         let pin = identity::trust::TrustState::genesis_digest(&genesis)?;
-        let mut log = authority::trust::TrustLog::open(
+        let mut log = authority::trust::TrustLog::open_with_namespace(
             &directory.path().join("identity.jsonl"),
             &genesis,
             &pin,
+            node::protocol::Namespace::jlucraft(),
         )?;
         for (i, user) in users.iter().enumerate() {
             for action in [
@@ -118,8 +119,16 @@ async fn unified_members_from_two_clubs_join_over_relay_without_qualification_ex
                 },
             ] {
                 let mut record = log.state().draft(action);
-                identity::trust::sign(&mut record, &roots[i])?;
-                identity::trust::sign(&mut record, user)?;
+                identity::trust::sign_with_namespace(
+                    &mut record,
+                    &roots[i],
+                    &node::protocol::Namespace::jlucraft(),
+                )?;
+                identity::trust::sign_with_namespace(
+                    &mut record,
+                    user,
+                    &node::protocol::Namespace::jlucraft(),
+                )?;
                 log.append(record)?;
             }
         }
@@ -130,7 +139,7 @@ async fn unified_members_from_two_clubs_join_over_relay_without_qualification_ex
             NodeConfig {
                 listen: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse()?],
                 relay: Some(RelayConfig::default()),
-                ..Default::default()
+                ..NodeConfig::new(node::protocol::Namespace::jlucraft())
             },
         )
         .await?;
@@ -144,7 +153,7 @@ async fn unified_members_from_two_clubs_join_over_relay_without_qualification_ex
                     user,
                     NodeConfig {
                         hole_punching: false,
-                        ..Default::default()
+                        ..NodeConfig::new(node::protocol::Namespace::jlucraft())
                     },
                 )
                 .await?,
@@ -294,7 +303,11 @@ async fn unified_members_from_two_clubs_join_over_relay_without_qualification_ex
             member: "person-0".into(),
             club: "club-0".into(),
         });
-        identity::trust::sign(&mut revoke, &roots[0])?;
+        identity::trust::sign_with_namespace(
+            &mut revoke,
+            &roots[0],
+            &node::protocol::Namespace::jlucraft(),
+        )?;
         log.append(revoke)?;
         assert!(
             timeout(Duration::from_secs(2), stream.read_u8())

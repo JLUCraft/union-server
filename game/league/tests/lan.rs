@@ -18,9 +18,10 @@ async fn lan_discovery_pins_and_probes_announced_servers()
         );
         let identity_pin = identities.binding.genesis.clone();
         let directory = tempfile::tempdir()?;
-        let journal = Arc::new(Mutex::new(Journal::open(
+        let journal = Arc::new(Mutex::new(Journal::open_with_namespace(
             directory.path().join("journal"),
             identities.genesis(),
+            node::protocol::Namespace::jlucraft(),
         )?));
         let application_pin = journal.lock().await.genesis_hash().to_owned();
         assert_ne!(identity_pin, application_pin);
@@ -32,7 +33,7 @@ async fn lan_discovery_pins_and_probes_announced_servers()
                 NodeConfig {
                     listen: vec!["/ip4/0.0.0.0/udp/0/quic-v1".parse()?],
                     lan_discovery: true,
-                    ..Default::default()
+                    ..NodeConfig::new(node::protocol::Namespace::jlucraft())
                 },
             )
             .await?,
@@ -51,20 +52,28 @@ async fn lan_discovery_pins_and_probes_announced_servers()
         });
         tokio::task::yield_now().await;
 
-        let found =
-            league::discovery::discover(Identity::generate(), Some(Duration::from_secs(3))).await?;
+        let found = league::discovery::discover_with_namespace(
+            Identity::generate(),
+            Some(Duration::from_secs(3)),
+            node::protocol::Namespace::jlucraft(),
+        )
+        .await?;
         let discovered = found
             .iter()
             .find(|entry| entry.peer == server.peer_id())
             .ok_or("announced server not discovered")?;
-        assert_eq!(discovered.federation, "test-federation");
+        assert_eq!(discovered.federation, "jlucraft");
         assert_eq!(discovered.genesis_hash, identity_pin);
         assert_eq!(
             discovered.application.as_deref(),
             Some(application_pin.as_str())
         );
         // The returned address answered a real dial, so governance works over it directly.
-        let probe = Node::start(terminal, NodeConfig::default()).await?;
+        let probe = Node::start(
+            terminal,
+            NodeConfig::new(node::protocol::Namespace::jlucraft()),
+        )
+        .await?;
         probe.dial(discovered.address.parse()?).await?;
         let response = authority::journal::discover::<league::application::Application>(
             &probe,
@@ -108,6 +117,7 @@ async fn lan_discovery_pins_and_probes_announced_servers()
             Identity::generate(),
             &identity_pin,
             Some(Duration::from_secs(3)),
+            node::protocol::Namespace::jlucraft(),
         )
         .await?;
         assert_eq!(pinned.map(|server| server.peer), Some(server.peer_id()));
@@ -115,6 +125,7 @@ async fn lan_discovery_pins_and_probes_announced_servers()
             Identity::generate(),
             &"0".repeat(64),
             Some(Duration::from_secs(3)),
+            node::protocol::Namespace::jlucraft(),
         )
         .await?;
         assert!(wrong.is_none());

@@ -19,7 +19,6 @@ use tokio::sync::Mutex;
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    #[serde(default)]
     pub namespace: node::protocol::Namespace,
     pub bind: SocketAddr,
     pub key: PathBuf,
@@ -231,7 +230,7 @@ mod tests {
     fn setup(dir: &Path) -> (Config, TrustGenesis) {
         let founder = node::Identity::generate();
         let config = Config {
-            namespace: Default::default(),
+            namespace: node::protocol::Namespace::jlucraft(),
             bind: "127.0.0.1:0".parse().unwrap(),
             key: dir.join("issuer.key"),
             token: dir.join("token.json"),
@@ -242,7 +241,7 @@ mod tests {
             verifier: "skin".into(),
         };
         let genesis = TrustGenesis {
-            federation: "bridge-test".into(),
+            namespace: node::protocol::Namespace::jlucraft(),
             quorum: 1,
             founders: vec![node::protocol::TrustFounder {
                 member: "chair".into(),

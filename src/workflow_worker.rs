@@ -264,10 +264,7 @@ async fn ops(
 ) -> Result<node::protocol::OpsResponse> {
     let node = node::Node::start(
         key.clone(),
-        node::NodeConfig {
-            namespace: a.identity_view().state()?.namespace().clone(),
-            ..Default::default()
-        },
+        node::NodeConfig::new(a.identity_view().state()?.namespace().clone()),
     )
     .await?;
     let result = async {
@@ -600,7 +597,11 @@ mod tests {
             crate::test_identity::Identities::new(&[(&worker, "worker", "club")], "worker");
         let genesis = identities.genesis::<Application>();
         let view = identities.log.view(Duration::from_secs(60))?;
-        let journal = Journal::open(directory.path().join("application"), genesis)?;
+        let journal = Journal::open_with_namespace(
+            directory.path().join("application"),
+            genesis,
+            node::protocol::Namespace::jlucraft(),
+        )?;
         let pin = journal.genesis_hash().to_owned();
         let authority = Authority::Local {
             journal: Arc::new(Mutex::new(journal)),

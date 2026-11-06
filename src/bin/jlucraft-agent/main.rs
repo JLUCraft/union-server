@@ -15,9 +15,9 @@ use std::{
 #[derive(Parser)]
 #[command(name = "jlucraft-agent", about = "Sign locally with an agent identity")]
 struct Cli {
-    #[arg(long, global = true, default_value_t = protocol::Namespace::default().organization)]
+    #[arg(long, global = true, default_value_t = node::protocol::Namespace::jlucraft().organization)]
     organization: String,
-    #[arg(long, global = true, default_value_t = protocol::Namespace::default().version)]
+    #[arg(long, global = true, default_value_t = node::protocol::Namespace::jlucraft().wire_version)]
     protocol_version: u32,
     #[command(subcommand)]
     command: Operation,
@@ -100,10 +100,10 @@ fn read_json<T: DeserializeOwned>(input: &str, kind: &str) -> Result<T> {
 
 #[cfg(test)]
 fn run(command: Operation) -> Result<Value> {
-    run_with_namespace(command, &protocol::Namespace::default())
+    run_with_namespace(command, &node::protocol::Namespace::jlucraft())
 }
 
-fn run_with_namespace(command: Operation, namespace: &protocol::Namespace) -> Result<Value> {
+fn run_with_namespace(command: Operation, namespace: &node::protocol::Namespace) -> Result<Value> {
     match command {
         Operation::Keygen { out } => {
             let identity = Identity::generate();
@@ -141,7 +141,7 @@ fn run_with_namespace(command: Operation, namespace: &protocol::Namespace) -> Re
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let result = protocol::Namespace::new(cli.organization, cli.protocol_version)
+    let result = node::protocol::Namespace::new(cli.organization, cli.protocol_version)
         .map_err(anyhow::Error::from)
         .and_then(|namespace| run_with_namespace(cli.command, &namespace))
         .and_then(|value| {

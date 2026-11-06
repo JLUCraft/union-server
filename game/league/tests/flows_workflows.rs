@@ -231,7 +231,12 @@ fn ai_receipts_pin_inputs_reject_duplicates_and_replay_without_inference() {
     .unwrap();
     let state = h.journal.state().clone();
     drop(h.journal);
-    let replay = Journal::<Office>::open(&h.path, h.genesis).unwrap();
+    let replay = Journal::<Office>::open_with_namespace(
+        &h.path,
+        h.genesis,
+        node::protocol::Namespace::jlucraft(),
+    )
+    .unwrap();
     assert_eq!(replay.state(), &state);
     assert_eq!(
         replay.state().domain.inner.files.read(&input).unwrap(),
@@ -300,7 +305,12 @@ impl Harness {
             .insert("b".into(), [("carol".into(), 100_000)].into());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("organization.json");
-        let journal = Journal::open(&path, genesis.clone()).unwrap();
+        let journal = Journal::open_with_namespace(
+            &path,
+            genesis.clone(),
+            node::protocol::Namespace::jlucraft(),
+        )
+        .unwrap();
         let mut h = Self {
             identities,
             keys,
@@ -488,7 +498,12 @@ fn multistage_authorization_execution_and_signed_replay() {
     );
     let expected = serde_json::to_vec(h.journal.state()).unwrap();
     drop(h.journal);
-    let restored = Journal::<Office>::open(&h.path, h.genesis).unwrap();
+    let restored = Journal::<Office>::open_with_namespace(
+        &h.path,
+        h.genesis,
+        node::protocol::Namespace::jlucraft(),
+    )
+    .unwrap();
     assert_eq!(expected, serde_json::to_vec(restored.state()).unwrap());
 }
 
@@ -888,7 +903,13 @@ fn review_decisions_control_execution_and_survive_replay() {
         let state = h.journal.state().clone();
         drop(h.journal);
         assert_eq!(
-            Journal::<Office>::open(&h.path, h.genesis).unwrap().state(),
+            Journal::<Office>::open_with_namespace(
+                &h.path,
+                h.genesis,
+                node::protocol::Namespace::jlucraft()
+            )
+            .unwrap()
+            .state(),
             &state
         );
     }
@@ -1115,7 +1136,13 @@ fn default_president_approval_revises_and_restarts_without_templates() {
     let state = h.journal.state().clone();
     drop(h.journal);
     assert_eq!(
-        Journal::<Office>::open(&h.path, h.genesis).unwrap().state(),
+        Journal::<Office>::open_with_namespace(
+            &h.path,
+            h.genesis,
+            node::protocol::Namespace::jlucraft()
+        )
+        .unwrap()
+        .state(),
         &state
     );
 }

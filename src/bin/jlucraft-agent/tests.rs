@@ -30,7 +30,7 @@ fn keygen_is_private_and_never_overwrites() -> Result<()> {
 
 fn fixture(identity: &Identity) -> Result<TrustState> {
     let genesis = TrustGenesis {
-        federation: "agent-test".into(),
+        namespace: node::protocol::Namespace::jlucraft(),
         founders: vec![TrustFounder {
             member: "founder".into(),
             club: "club".into(),
@@ -80,7 +80,8 @@ fn command_output_verifies_and_binds_all_fields() -> Result<()> {
         public_key: decode("public_key")?,
         signature: decode("signature")?,
     };
-    let (peer, verified) = signed.verify::<Application>()?;
+    let (peer, verified) =
+        signed.verify_with_namespace::<Application>(&node::protocol::Namespace::jlucraft())?;
     assert_eq!(peer, identity.peer_id().to_string());
     assert_eq!(
         serde_json::to_value(verified)?,
@@ -96,7 +97,11 @@ fn command_output_verifies_and_binds_all_fields() -> Result<()> {
         output
     );
     signed.payload[0] ^= 1;
-    assert!(signed.verify::<Application>().is_err());
+    assert!(
+        signed
+            .verify_with_namespace::<Application>(&node::protocol::Namespace::jlucraft())
+            .is_err()
+    );
     Ok(())
 }
 
@@ -118,7 +123,7 @@ fn record_output_verifies_and_can_be_appended() -> Result<()> {
     assert!(output["signatures"][0]["public_key"].is_array());
     let mut signed: TrustRecord = serde_json::from_value(output.clone())?;
     assert_eq!(
-        trust::verify_signatures(&signed)?,
+        trust::verify_signatures_with_namespace(&signed, &node::protocol::Namespace::jlucraft())?,
         [identity.peer_id().to_string()].into()
     );
     state.apply(&signed)?;
@@ -136,10 +141,20 @@ fn record_output_verifies_and_can_be_appended() -> Result<()> {
         key: key.with_file_name("second.key"),
         input: serde_json::to_string(&signed)?,
     })?)?;
-    assert_eq!(trust::verify_signatures(&countersigned)?.len(), 2);
+    assert_eq!(
+        trust::verify_signatures_with_namespace(
+            &countersigned,
+            &node::protocol::Namespace::jlucraft()
+        )?
+        .len(),
+        2
+    );
     assert!(countersigned.signatures.contains(&signed.signatures[0]));
     signed.previous = "d".repeat(64);
-    assert!(trust::verify_signatures(&signed).is_err());
+    assert!(
+        trust::verify_signatures_with_namespace(&signed, &node::protocol::Namespace::jlucraft())
+            .is_err()
+    );
     Ok(())
 }
 

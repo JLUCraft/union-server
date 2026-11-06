@@ -659,7 +659,7 @@ mod tests {
                 )
                 .unwrap(),
                 delegation: Some(node::protocol::OpsDelegation {
-                    envelope: mcp::sign(
+                    envelope: mcp::sign_with_namespace(
                         node::protocol::McpClaims {
                             signer: self.signer.peer_id().to_string(),
                             public_key: base64::engine::general_purpose::STANDARD
@@ -676,6 +676,7 @@ mod tests {
                             digest: mcp::request_digest(&request).unwrap(),
                         },
                         &self.signer,
+                        &node::protocol::Namespace::jlucraft(),
                     )
                     .unwrap(),
                     tool: tool.into(),
@@ -855,7 +856,7 @@ mod tests {
         let delegation = request.delegation.as_ref().unwrap();
         let claims = &delegation.envelope.claims;
         let gateway_cache = ReplayCache::default();
-        mcp::verify(
+        mcp::verify_with_namespace(
             &delegation.envelope,
             authority::journal::now_ms()?,
             &Expected {
@@ -867,6 +868,7 @@ mod tests {
                 request: &mcp::canonical_request(&delegation.tool, delegation.arguments.as_ref()),
                 replay_cache: &gateway_cache,
             },
+            &node::protocol::Namespace::jlucraft(),
         )?;
         assert_eq!(
             fixture.authorize(&request, &ReplayCache::default())?,
@@ -1010,7 +1012,11 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
-            *envelope = mcp::sign(claims.clone(), &fixture.signer)?;
+            *envelope = mcp::sign_with_namespace(
+                claims.clone(),
+                &fixture.signer,
+                &node::protocol::Namespace::jlucraft(),
+            )?;
             assert_code(
                 fixture.authorize(&changed, &cache),
                 OpsErrorCode::PermissionDenied,
@@ -1195,8 +1201,11 @@ mod tests {
                     league: "league".into(),
                 })?,
             )?;
-            let mut host =
-                Node::start(fixture_identity.host.clone(), NodeConfig::default()).await?;
+            let mut host = Node::start(
+                fixture_identity.host.clone(),
+                NodeConfig::new(node::protocol::Namespace::jlucraft()),
+            )
+            .await?;
             let incoming = host.take_incoming()?;
             let service = fixture_identity.service;
             let view = fixture_identity
@@ -1211,9 +1220,16 @@ mod tests {
                 access: access(view.clone()),
             })
             .await?;
-            let relay = Node::start(fixture_identity.relay.clone(), NodeConfig::default()).await?;
-            let signer =
-                Node::start(fixture_identity.signer.clone(), NodeConfig::default()).await?;
+            let relay = Node::start(
+                fixture_identity.relay.clone(),
+                NodeConfig::new(node::protocol::Namespace::jlucraft()),
+            )
+            .await?;
+            let signer = Node::start(
+                fixture_identity.signer.clone(),
+                NodeConfig::new(node::protocol::Namespace::jlucraft()),
+            )
+            .await?;
             relay.dial(host.addresses()[0].clone()).await?;
             signer.dial(host.addresses()[0].clone()).await?;
             let host = Arc::new(host);
@@ -1256,8 +1272,11 @@ mod tests {
             let mut denied = fixture_identity.request("ops_capabilities", serde_json::json!({}));
             let envelope = &mut denied.delegation.as_mut().unwrap().envelope;
             envelope.claims.aud.gateway = signer.peer_id().to_string();
-            *envelope =
-                identity::mcp_envelope::sign(envelope.claims.clone(), &fixture_identity.signer)?;
+            *envelope = identity::mcp_envelope::sign_with_namespace(
+                envelope.claims.clone(),
+                &fixture_identity.signer,
+                &node::protocol::Namespace::jlucraft(),
+            )?;
             assert_eq!(
                 client::ops::execute(&signer, host.peer_id(), service, &denied)
                     .await?
@@ -1461,7 +1480,11 @@ mod tests {
                     ..Default::default()
                 },
             })?);
-            let mut host = Node::start(host_key.clone(), NodeConfig::default()).await?;
+            let mut host = Node::start(
+                host_key.clone(),
+                NodeConfig::new(node::protocol::Namespace::jlucraft()),
+            )
+            .await?;
             let incoming = host.take_incoming()?;
             let service = ServiceId::new();
             identities.service(&host_key, &service.to_string(), "user", "manage");
@@ -1485,7 +1508,8 @@ mod tests {
                 access: access(view.clone()),
             })
             .await?;
-            let client = Node::start(user, NodeConfig::default()).await?;
+            let client =
+                Node::start(user, NodeConfig::new(node::protocol::Namespace::jlucraft())).await?;
             client.dial(host.addresses()[0].clone()).await?;
             let mut tasks = JoinSet::new();
             let host = Arc::new(host);
@@ -1552,7 +1576,11 @@ mod tests {
                 missing.error.map(|error| error.code),
                 Some(node::protocol::OpsErrorCode::NotFound)
             );
-            let read_only = Node::start(reader, NodeConfig::default()).await?;
+            let read_only = Node::start(
+                reader,
+                NodeConfig::new(node::protocol::Namespace::jlucraft()),
+            )
+            .await?;
             read_only.dial(host.addresses()[0].clone()).await?;
             let listed = client::ops::execute(
                 &read_only,

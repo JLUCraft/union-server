@@ -180,7 +180,11 @@ mod tests {
             "admin",
         );
         let view = ids.log.view(std::time::Duration::from_secs(60))?;
-        let mut journal = Journal::open(directory.path().join("journal"), ids.genesis())?;
+        let mut journal = Journal::open_with_namespace(
+            directory.path().join("journal"),
+            ids.genesis(),
+            node::protocol::Namespace::jlucraft(),
+        )?;
         let now = now_ms()?;
         for action in [
             league::application::competition(league::LeagueAction::CreateLeague {

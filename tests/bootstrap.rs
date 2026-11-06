@@ -19,7 +19,7 @@ fn standalone_rejects_external_roots_and_initializes_only_explicitly() {
     );
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("node.json");
-    let config = json!({"node":{"key":"node.key"},"services":{"directory":true}});
+    let config = json!({"node":{"namespace":{"organization":"jlucraft","version":1},"key":"node.key"},"services":{"directory":true}});
     std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
     let command = |verb: &str| {
         Command::new(env!("CARGO_BIN_EXE_federated-server"))
@@ -39,14 +39,14 @@ fn standalone_rejects_external_roots_and_initializes_only_explicitly() {
         serde_json::to_vec(&exported["genesis"]).unwrap(),
     )
     .unwrap();
-    std::fs::write(&path,serde_json::to_vec(&json!({"node":{"key":"node.key"},"services":{"identity":{
+    std::fs::write(&path,serde_json::to_vec(&json!({"node":{"namespace":{"organization":"jlucraft","version":1},"key":"node.key"},"services":{"identity":{
         "genesis":"injected.json","genesis_hash":exported["genesis_hash"],"log":"log","writer":true,"max_staleness_seconds":60
     }}})).unwrap()).unwrap();
     let rejected = command("check");
     assert!(!rejected.status.success());
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("built-in founder manifest"));
     let mut substituted = root.clone();
-    substituted.federation = "runtime-substitution-test".into();
+    substituted.namespace.organization = "runtime-substitution-test".into();
     std::fs::write(
         dir.path().join("injected.json"),
         serde_json::to_vec(&substituted).unwrap(),
@@ -55,7 +55,7 @@ fn standalone_rejects_external_roots_and_initializes_only_explicitly() {
     assert!(!command("check").status.success());
     std::fs::write(
         &path,
-        serde_json::to_vec(&json!({"node":{"key":"node.key"},"services":{"identity":{
+        serde_json::to_vec(&json!({"node":{"namespace":{"organization":"jlucraft","version":1},"key":"node.key"},"services":{"identity":{
             "log":"log","writer":true,"max_staleness_seconds":60
         }}}))
         .unwrap(),

@@ -29,18 +29,29 @@ async fn snapshot_exceeds_single_frame_and_rejects_out_of_order_chunks()
             );
         }
         assert!(serde_json::to_vec(&state)?.len() > protocol::MAX_FRAME);
-        let journal = Arc::new(Mutex::new(Journal::open(
+        let journal = Arc::new(Mutex::new(Journal::open_with_namespace(
             dir.path().join("journal"),
             state.clone(),
+            node::protocol::Namespace::jlucraft(),
         )?));
         let genesis_hash = journal.lock().await.genesis_hash().to_owned();
-        let host = Arc::new(Node::start(Identity::generate(), NodeConfig::default()).await?);
+        let host = Arc::new(
+            Node::start(
+                Identity::generate(),
+                NodeConfig::new(node::protocol::Namespace::jlucraft()),
+            )
+            .await?,
+        );
         let server = host.clone();
         let serving =
             tokio::spawn(
                 async move { journal::serve(&server, journal, view, journal::PROTOCOL).await },
             );
-        let client = Node::start(admin, NodeConfig::default()).await?;
+        let client = Node::start(
+            admin,
+            NodeConfig::new(node::protocol::Namespace::jlucraft()),
+        )
+        .await?;
         client.dial(host.addresses()[0].clone()).await?;
         let response = journal::request::<league::application::Application>(
             &client,
@@ -60,7 +71,11 @@ async fn snapshot_exceeds_single_frame_and_rejects_out_of_order_chunks()
         let mut missing = response.clone();
         missing.proof = None;
         assert!(missing.verify(&genesis_hash).is_err());
-        let rogue = Node::start(Identity::generate(), NodeConfig::default()).await?;
+        let rogue = Node::start(
+            Identity::generate(),
+            NodeConfig::new(node::protocol::Namespace::jlucraft()),
+        )
+        .await?;
         let mut incoming = rogue.accept_protocol(journal::PROTOCOL)?;
         client.dial(rogue.addresses()[0].clone()).await?;
         let attack = tokio::spawn(async move {

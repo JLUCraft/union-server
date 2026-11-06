@@ -20,12 +20,8 @@ pub async fn execute(
     identity: crate::Identity,
     input: Input,
 ) -> crate::Result<crate::journal::Response<Application>> {
-    crate::generic::execute(
-        identity,
-        input,
-        &crate::protocol::Namespace::default().governance_protocol(),
-    )
-    .await
+    let protocol = input.identity.namespace.governance_protocol();
+    crate::generic::execute(identity, input, &protocol).await
 }
 
 #[derive(serde::Deserialize)]
@@ -96,12 +92,8 @@ pub async fn execute_with_upload(
         Some("local.flows.approve" | "local.flows.reject")
     );
     if !creating && !amending && !reviewing && value["action"]["type"] != "local.files.upload" {
-        return crate::generic::execute(
-            identity,
-            serde_json::from_value(value).map_err(protocol)?,
-            &crate::protocol::Namespace::default().governance_protocol(),
-        )
-        .await;
+        let input: Input = serde_json::from_value(value).map_err(protocol)?;
+        return execute(identity, input).await;
     }
     let draft: Option<Draft> = if creating || amending {
         Some(serde_json::from_value(value["action"].take()).map_err(protocol)?)
@@ -158,7 +150,7 @@ pub async fn execute_with_upload(
         identity.clone(),
         NodeConfig {
             namespace: input.identity.namespace.clone(),
-            ..Default::default()
+            ..node::NodeConfig::new(input.identity.namespace.clone())
         },
     )
     .await?;

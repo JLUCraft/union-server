@@ -11,7 +11,7 @@ fn configuration_requires_the_explicit_root_and_matching_digest() -> Result {
     let dir = tempfile::tempdir()?;
     let root = federated_server::bootstrap::parse_genesis(TEST_ROOT)?;
     let path = dir.path().join("node.json");
-    let config = json!({"node":{"key":"node.key"},"services":{"identity":{
+    let config = json!({"node":{"namespace":{"organization":"jlucraft","version":1},"key":"node.key"},"services":{"identity":{
         "log":"identity.jsonl","writer":true,"max_staleness_seconds":60
     }}});
     write(&path, &config)?;
@@ -33,7 +33,7 @@ fn configuration_requires_the_explicit_root_and_matching_digest() -> Result {
         federated_server::bootstrap::validate_genesis(&root)?
     );
     let mut other = root.clone();
-    other.federation = "another-explicit-test-root".into();
+    other.namespace.organization = "another-explicit-test-root".into();
     let mut mismatched = config;
     mismatched["services"]["identity"]["genesis_hash"] =
         federated_server::bootstrap::validate_genesis(&other)?.into();
@@ -51,12 +51,12 @@ fn embedded_genesis_file_cannot_replace_the_explicit_root() -> Result {
     let root = federated_server::bootstrap::parse_genesis(TEST_ROOT)?;
     Identity::generate().save_new(dir.path().join("node.key"))?;
     let mut other = root.clone();
-    other.federation = "different-file-test-root".into();
+    other.namespace.organization = "different-file-test-root".into();
     write(&dir.path().join("identity-genesis.json"), &other)?;
     let path = dir.path().join("node.json");
     write(
         &path,
-        &json!({"node":{"key":"node.key"},"services":{"identity":{
+        &json!({"node":{"namespace":{"organization":"jlucraft","version":1},"key":"node.key"},"services":{"identity":{
             "genesis":"identity-genesis.json","log":"identity.jsonl","writer":true,"max_staleness_seconds":60
         }}}),
     )?;
@@ -79,7 +79,7 @@ async fn lightweight_node_needs_no_game_or_governance_files() -> Result {
     let config = dir.path().join("node.json");
     write(
         &config,
-        &json!({"node":{"key":"node.key"},"services":{"directory":true,"relay":true}}),
+        &json!({"node":{"namespace":{"organization":"jlucraft","version":1},"key":"node.key"},"services":{"directory":true,"relay":true}}),
     )?;
     let host = Host::start(Config::load(&config, None)?).await?;
     let status = host.status()?;
@@ -102,7 +102,7 @@ fn report_board_key_is_resolved_from_configuration_directory() -> Result {
     ] {
         write(
             &path,
-            &json!({"node":{"key":"node.key"},"services":{
+            &json!({"node":{"namespace":{"organization":"jlucraft","version":1},"key":"node.key"},"services":{
                 "identity":{"log":"identity.jsonl","writer":true,"max_staleness_seconds":60},
                 "governance":{"genesis":"organization.json","journal":"office-journal"},
                 "report_board":{"bind":"127.0.0.1:4237","key":key}
@@ -127,16 +127,19 @@ fn configuration_rejects_unknown_fields_missing_governance_and_colliding_service
         json!({"operations":{"service":ServiceId::new().to_string(),"issuers":[Identity::generate().peer_id().to_string()],"instances":[]}}),
         json!({"ai_worker":{"key":"k","providers":[],"grant":"g"}}),
     ] {
-        let result =
-            serde_json::from_value::<Config>(json!({"node":{"key":"unused"},"services":services}));
+        let result = serde_json::from_value::<Config>(
+            json!({"node":{"namespace":{"organization":"jlucraft","version":1},"key":"unused"},"services":services}),
+        );
         assert!(result.is_err() || result?.validate().is_err());
     }
     let id = ServiceId::new().to_string();
-    let config: Config = serde_json::from_value(json!({"node":{"key":"unused"},"services":{
-        "governance":{"genesis":"unused","journal":"unused"},
-        "documents":{"service":id,"directory":"unused"},
-        "operations":{"service":id,"instances":[]}
-    }}))?;
+    let config: Config = serde_json::from_value(
+        json!({"node":{"namespace":{"organization":"jlucraft","version":1},"key":"unused"},"services":{
+            "governance":{"genesis":"unused","journal":"unused"},
+            "documents":{"service":id,"directory":"unused"},
+            "operations":{"service":id,"instances":[]}
+        }}),
+    )?;
     assert!(config.validate().is_err());
     Ok(())
 }
@@ -147,7 +150,7 @@ fn mcp_configuration_resolves_only_relay_key_and_validates_target() -> Result {
     let path = dir.path().join("node.json");
     write(
         &path,
-        &json!({"node":{"key":"node.key"},"services":{"mcp":{
+        &json!({"node":{"namespace":{"organization":"jlucraft","version":1},"key":"node.key"},"services":{"mcp":{
             "bind":"127.0.0.1:9090",
             "relay_key":"relay.key",
             "operations":[{
@@ -178,10 +181,12 @@ fn mcp_configuration_resolves_only_relay_key_and_validates_target() -> Result {
 
 #[test]
 fn application_configuration_has_one_genesis_and_journal() -> Result {
-    let config: Config = serde_json::from_value(json!({"node":{"key":"node.key"},"services":{
-        "identity":{"log":"identity.jsonl","writer":true,"max_staleness_seconds":60,"genesis_hash":"0".repeat(64)},
-        "governance":{"genesis":"application.json","journal":"application-journal"}
-    }}))?;
+    let config: Config = serde_json::from_value(
+        json!({"node":{"namespace":{"organization":"jlucraft","version":1},"key":"node.key"},"services":{
+            "identity":{"log":"identity.jsonl","writer":true,"max_staleness_seconds":60,"genesis_hash":"0".repeat(64)},
+            "governance":{"genesis":"application.json","journal":"application-journal"}
+        }}),
+    )?;
     config.validate()?;
     let governance = config
         .services
@@ -200,13 +205,16 @@ fn application_configuration_has_one_genesis_and_journal() -> Result {
 #[test]
 fn relay_service_accepts_toggle_or_limit_overrides() -> Result {
     for services in [json!({}), json!({"relay":false}), json!({"relay":true})] {
-        let config: Config =
-            serde_json::from_value(json!({"node":{"key":"unused"},"services":services}))?;
+        let config: Config = serde_json::from_value(
+            json!({"node":{"namespace":{"organization":"jlucraft","version":1},"key":"unused"},"services":services}),
+        )?;
         config.validate()?;
     }
-    let config: Config = serde_json::from_value(json!({"node":{"key":"unused"},"services":{
-        "relay":{"max_circuits":64,"max_circuit_duration_seconds":7200}
-    }}))?;
+    let config: Config = serde_json::from_value(
+        json!({"node":{"namespace":{"organization":"jlucraft","version":1},"key":"unused"},"services":{
+            "relay":{"max_circuits":64,"max_circuit_duration_seconds":7200}
+        }}),
+    )?;
     config.validate()?;
     for relay in [
         json!({"max_circuit":1}),
@@ -215,7 +223,7 @@ fn relay_service_accepts_toggle_or_limit_overrides() -> Result {
         json!("yes"),
     ] {
         let result = serde_json::from_value::<Config>(
-            json!({"node":{"key":"unused"},"services":{"relay":relay}}),
+            json!({"node":{"namespace":{"organization":"jlucraft","version":1},"key":"unused"},"services":{"relay":relay}}),
         );
         assert!(result.is_err() || result?.validate().is_err());
     }
@@ -233,13 +241,13 @@ async fn application_commands_share_one_journal_and_revocation() -> Result {
         write(&dir.path().join("genesis.json"), &genesis)?;
         let pin = node::protocol::digest(&serde_json::to_vec(&genesis)?);
         let path = dir.path().join("node.json");
-        write(&path, &json!({"node":{"key":"node.key"},"services":{
+        write(&path, &json!({"node":{"namespace":{"organization":"jlucraft","version":1},"key":"node.key"},"services":{
             "identity":identity_config,"governance":{"genesis":"genesis.json","journal":"journal"},
             "operations":{"service":operations.to_string(),"instances":[]}
         }}))?;
         let host = Host::start(Config::load(&path, Some(&root))?).await?;
         let status = host.status()?;
-        let node = Node::start(member.clone(),NodeConfig::default()).await?;
+        let node = Node::start(member.clone(),NodeConfig::new(node::protocol::Namespace::jlucraft())).await?;
         node.dial(status.addresses[0].parse()?).await?;
         let services = node.list_services(host_key.peer_id()).await?;
         assert_eq!(services.len(),1);
@@ -249,7 +257,7 @@ async fn application_commands_share_one_journal_and_revocation() -> Result {
         },&cache).await?;
         let snapshot = league::files::snapshot(&node,host_key.peer_id(),&pin).await?;
         assert_eq!(snapshot.domain.inner.files.read(&cid)?,b"shared application");
-        let admin_node=Node::start(admin.clone(),NodeConfig::default()).await?;
+        let admin_node=Node::start(admin.clone(),NodeConfig::new(node::protocol::Namespace::jlucraft())).await?;
         admin_node.dial(status.addresses[0].parse()?).await?;
         let initial_revision = snapshot.revision;
         let now = authority::journal::now_ms()?;
@@ -270,7 +278,7 @@ async fn application_commands_share_one_journal_and_revocation() -> Result {
         assert!(response.ok && response.instances.is_empty());
         let mut stream=node.open_service(host_key.peer_id(),operations).await?;
         let mut record=cache.state().draft(node::protocol::TrustAction::RevokeDevice{member:"alice".into(),device:member.peer_id().to_string()});
-        client::trust::sign(&mut record,&admin)?;
+        client::trust::sign_with_namespace(&mut record,&admin, &node::protocol::Namespace::jlucraft())?;
         let response=client::trust::request(&admin_node,host_key.peer_id(),node::protocol::TrustRequest::Append{record}).await?;
         assert!(response.error.is_none(),"{:?}",response.error);
         assert!(node.open_service(host_key.peer_id(),operations).await.is_err());
@@ -279,7 +287,7 @@ async fn application_commands_share_one_journal_and_revocation() -> Result {
         admin_node.shutdown().await?;
         node.shutdown().await?;
         host.close().await?;
-        let replay = authority::journal::Journal::<Application>::open(dir.path().join("journal"),genesis)?;
+        let replay = authority::journal::Journal::<Application>::open_with_namespace(dir.path().join("journal"),genesis, node::protocol::Namespace::jlucraft())?;
         assert_eq!(replay.state().domain.inner.files.read(&cid)?,b"shared application");
         assert!(replay.state().domain.events.contains_key("activity"));
         assert!(replay.state().domain.leagues.contains_key("competition"));
@@ -297,7 +305,7 @@ async fn failed_start_and_dropped_host_release_governance_ownership() -> Result 
     let genesis = state::State::<Application>::new(binding)?;
     write(&dir.path().join("genesis.json"), &genesis)?;
     let path = dir.path().join("node.json");
-    let mut value = json!({"node":{"key":"node.key"},"services":{
+    let mut value = json!({"node":{"namespace":{"organization":"jlucraft","version":1},"key":"node.key"},"services":{
         "identity":identity_config,"governance":{"genesis":"genesis.json","journal":"journal"},
         "ai_worker":{"key":"node.key","providers":[{"id":"fixture","protocol":"chat_completions","url":"invalid-url","models":["test"],"context_tokens":128}]}
     }});
@@ -307,9 +315,10 @@ async fn failed_start_and_dropped_host_release_governance_ownership() -> Result 
             .await
             .is_err()
     );
-    drop(authority::journal::Journal::open(
+    drop(authority::journal::Journal::open_with_namespace(
         dir.path().join("journal"),
         genesis.clone(),
+        node::protocol::Namespace::jlucraft(),
     )?);
     value["services"]
         .as_object_mut()
@@ -320,8 +329,12 @@ async fn failed_start_and_dropped_host_release_governance_ownership() -> Result 
     drop(host);
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            if authority::journal::Journal::open(dir.path().join("journal"), genesis.clone())
-                .is_ok()
+            if authority::journal::Journal::open_with_namespace(
+                dir.path().join("journal"),
+                genesis.clone(),
+                node::protocol::Namespace::jlucraft(),
+            )
+            .is_ok()
             {
                 break;
             }
@@ -345,7 +358,7 @@ fn setup_identity(
 )> {
     use node::protocol::{TrustAction as A, TrustBusinessBinding, TrustFounder, TrustGenesis};
     let genesis = TrustGenesis {
-        federation: "test".into(),
+        namespace: node::protocol::Namespace::jlucraft(),
         quorum: 1,
         founders: vec![TrustFounder {
             member: "chair".into(),
@@ -355,7 +368,12 @@ fn setup_identity(
     };
     let pin = client::trust::TrustState::genesis_digest(&genesis)?;
     write(&dir.join("identity-genesis.json"), &genesis)?;
-    let mut log = client::trust::TrustLog::open(&dir.join("identity.jsonl"), &genesis, &pin)?;
+    let mut log = client::trust::TrustLog::open_with_namespace(
+        &dir.join("identity.jsonl"),
+        &genesis,
+        &pin,
+        node::protocol::Namespace::jlucraft(),
+    )?;
     let mut actions = vec![
         A::RegisterService {
             service: "application".into(),
@@ -408,12 +426,21 @@ fn setup_identity(
                 .iter()
                 .any(|s| s.public_key == key.public_key().encode_protobuf())
             {
-                client::trust::sign(&mut record, key)?;
+                client::trust::sign_with_namespace(
+                    &mut record,
+                    key,
+                    &node::protocol::Namespace::jlucraft(),
+                )?;
             }
         }
         log.append(record)?;
     }
-    let mut cache = client::trust::TrustLog::open(&dir.join("cache.jsonl"), &genesis, &pin)?;
+    let mut cache = client::trust::TrustLog::open_with_namespace(
+        &dir.join("cache.jsonl"),
+        &genesis,
+        &pin,
+        node::protocol::Namespace::jlucraft(),
+    )?;
     for record in log.history_since(None)?.records {
         cache.append(record)?;
     }
@@ -450,12 +477,12 @@ async fn document_terminal_download_checks_hash_and_live_read_permission() -> Re
     let path = dir.path().join("node.json");
     write(
         &path,
-        &json!({"node":{"key":"node.key"},"services":{"identity":identity_config,"documents":{"service":documents.to_string(),"directory":"documents"}}}),
+        &json!({"node":{"namespace":{"organization":"jlucraft","version":1},"key":"node.key"},"services":{"identity":identity_config,"documents":{"service":documents.to_string(),"directory":"documents"}}}),
     )?;
     let host = Host::start(Config::load(&path, Some(&root))?).await?;
     let status = host.status()?;
     let input = || client::documents::Input {
-        namespace: Default::default(),
+        namespace: node::protocol::Namespace::jlucraft(),
         address: status.addresses[0].clone(),
         peer: status.peer.clone(),
         service: documents.to_string(),
@@ -467,7 +494,11 @@ async fn document_terminal_download_checks_hash_and_live_read_permission() -> Re
             .await
             .is_err()
     );
-    let node = Node::start(admin.clone(), NodeConfig::default()).await?;
+    let node = Node::start(
+        admin.clone(),
+        NodeConfig::new(node::protocol::Namespace::jlucraft()),
+    )
+    .await?;
     node.dial(status.addresses[0].parse()?).await?;
     let mut grant = cache.state().draft(TrustAction::GrantPermission {
         id: "doc-read".into(),
@@ -475,7 +506,7 @@ async fn document_terminal_download_checks_hash_and_live_read_permission() -> Re
         service: documents.to_string(),
         permission: "read".into(),
     });
-    client::trust::sign(&mut grant, &admin)?;
+    client::trust::sign_with_namespace(&mut grant, &admin, &node::protocol::Namespace::jlucraft())?;
     let response = client::trust::request(
         &node,
         host_key.peer_id(),
@@ -500,7 +531,11 @@ async fn document_terminal_download_checks_hash_and_live_read_permission() -> Re
     let mut revoke = cache.state().draft(TrustAction::RevokePermission {
         id: "doc-read".into(),
     });
-    client::trust::sign(&mut revoke, &admin)?;
+    client::trust::sign_with_namespace(
+        &mut revoke,
+        &admin,
+        &node::protocol::Namespace::jlucraft(),
+    )?;
     assert!(
         client::trust::request(
             &node,
@@ -518,16 +553,51 @@ async fn document_terminal_download_checks_hash_and_live_read_permission() -> Re
 }
 
 #[test]
-fn namespace_configuration_defaults_and_rejects_invalid_components() -> Result {
-    let baseline = json!({"node":{"key":"node.key"}, "services":{"directory":true}});
+fn namespace_configuration_requires_explicit_namespace_and_rejects_invalid_components() -> Result {
+    let baseline = json!({"node":{"namespace":{"organization":"jlucraft","version":1},"key":"node.key"}, "services":{"directory":true}});
+    let mut missing = baseline.clone();
+    missing["node"].as_object_mut().unwrap().remove("namespace");
+    let error = serde_json::from_value::<Config>(missing)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("missing field `namespace`"), "{error}");
     let default: Config = serde_json::from_value(baseline.clone())?;
-    assert_eq!(default.node.namespace, node::protocol::Namespace::default());
+    assert_eq!(
+        default.node.namespace,
+        node::protocol::Namespace::jlucraft()
+    );
     default.validate()?;
     let mut custom = baseline;
     custom["node"]["namespace"] = json!({"organization":"acme", "version":2});
     let config: Config = serde_json::from_value(custom.clone())?;
     config.validate()?;
     assert_eq!(config.node.namespace.node_protocol(), "/acme/union/2");
+    let dir = tempfile::tempdir()?;
+    let root = federated_server::bootstrap::parse_genesis(TEST_ROOT)?;
+    let path = dir.path().join("node.json");
+    let mut upgrade = json!({"node":{"key":"node.key","namespace":{"organization":"jlucraft","wire_version":2}},"services":{"identity":{"log":"identity.jsonl","writer":true,"max_staleness_seconds":60}}});
+    write(&path, &upgrade)?;
+    let loaded = Config::load(&path, Some(&root))?;
+    assert_eq!(loaded.node.namespace.wire_version, 2);
+    assert_eq!(
+        loaded.services.identity.unwrap().genesis_hash,
+        federated_server::bootstrap::validate_genesis(&root)?
+    );
+    for namespace in [
+        json!({"organization":"other","wire_version":2}),
+        json!({"organization":"jlucraft","wire_version":2,"signing_version":2}),
+    ] {
+        upgrade["node"]["namespace"] = namespace;
+        write(&path, &upgrade)?;
+        assert!(
+            Config::load(&path, Some(&root))
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("signing domain does not match")
+        );
+    }
     for invalid in [
         json!({"organization":"a/b", "version":2}),
         json!({"organization":"acme", "version":0}),

@@ -617,10 +617,13 @@ mod tests {
             crate::test_identity::Identities::new(&[(&key, "secretary", "school")], "secretary");
         let genesis = identities.genesis::<Office>();
         let authority = Authority::Local {
-            journal: Arc::new(Mutex::new(authority::journal::Journal::open(
-                dir.path().join("office"),
-                genesis.clone(),
-            )?)),
+            journal: Arc::new(Mutex::new(
+                authority::journal::Journal::open_with_namespace(
+                    dir.path().join("office"),
+                    genesis.clone(),
+                    node::protocol::Namespace::jlucraft(),
+                )?,
+            )),
             view: identities.log.view(Duration::from_secs(60))?,
             log: Arc::new(Mutex::new(identities.log)),
         };
@@ -685,8 +688,11 @@ mod tests {
             store.sent
         );
         drop(authority);
-        let replay =
-            authority::journal::Journal::<Office>::open(dir.path().join("office"), genesis)?;
+        let replay = authority::journal::Journal::<Office>::open_with_namespace(
+            dir.path().join("office"),
+            genesis,
+            node::protocol::Namespace::jlucraft(),
+        )?;
         assert_eq!(replay.state(), &current);
         Ok(())
     }
