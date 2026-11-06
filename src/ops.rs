@@ -117,7 +117,7 @@ impl Fleet {
             },
             |response| response.clone(),
         );
-        crate::ops_extended::audit_legacy(self, &request, actor, &audit_response).await?;
+        crate::ops_extended::audit_legacy(self, &request, actor, &audit_response).await;
         result
     }
     async fn execute_inner(&self, request: OpsRequest) -> Result<OpsResponse> {
@@ -211,6 +211,10 @@ impl Fleet {
         let mut states = managed.instance.state_watch();
         let expected = match request.op {
             OpsOp::Start { .. } | OpsOp::StartLeague { .. } => {
+                if managed.instance.state() == InstanceState::Running {
+                    response.instances = vec![status(managed).await?];
+                    return Ok(response);
+                }
                 if !matches!(
                     managed.instance.state(),
                     InstanceState::Stopped | InstanceState::Error(_)
@@ -1645,6 +1649,141 @@ mod tests {
             .await?;
         assert!(empty.backups.is_empty());
         reopened.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audit_failure_preserves_start_success_and_retry() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let (fleet, _) = fixture(directory.path(), "sh -c 'cat'")?;
+        let audit = directory.path().join("audit.jsonl");
+        std::fs::create_dir(&audit)?;
+        let request = OpsRequest {
+            delegation: None,
+            op: OpsOp::Start {
+                instance: "test".into(),
+            },
+        };
+        for _ in 0..2 {
+            let response = fleet.execute(request.clone(), "test").await?;
+            assert!(response.ok);
+            assert_eq!(response.instances[0].state, OpsInstanceState::Running);
+            assert_eq!(
+                fleet.instances["test"].instance.state(),
+                InstanceState::Running
+            );
+        }
+        std::fs::remove_dir(&audit)?;
+        assert!(fleet.execute(request, "test").await?.ok);
+        let records: Vec<node::protocol::OpsAuditRecord> = std::fs::read_to_string(&audit)?
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<std::result::Result<_, _>>()?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].action, "start");
+        assert_eq!(records[0].target.as_deref(), Some("test"));
+        assert!(records[0].success);
+        fleet.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audit_failure_preserves_command_result_and_recovery() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let (fleet, _) = fixture(directory.path(), "sh -c 'cat'")?;
+        fleet
+            .execute(
+                OpsRequest {
+                    delegation: None,
+                    op: OpsOp::Start {
+                        instance: "test".into(),
+                    },
+                },
+                "test",
+            )
+            .await?;
+        let audit = directory.path().join("audit.jsonl");
+        std::fs::remove_file(&audit)?;
+        std::fs::create_dir(&audit)?;
+        let request = OpsRequest {
+            delegation: None,
+            op: OpsOp::Command {
+                instance: "test".into(),
+                command: "save-all".into(),
+            },
+        };
+        for _ in 0..2 {
+            let response = fleet.execute(request.clone(), "test").await?;
+            assert!(response.ok);
+            assert!(response.logs.is_some_and(|logs| logs.contains("save-all")));
+            assert_eq!(
+                fleet.instances["test"].instance.state(),
+                InstanceState::Running
+            );
+        }
+        let invalid = OpsRequest {
+            delegation: None,
+            op: OpsOp::Command {
+                instance: "test".into(),
+                command: "".into(),
+            },
+        };
+        let error = fleet.execute_tracked(invalid, "test").await.unwrap_err();
+        assert_eq!(
+            crate::ops_extended::error_response(&error).code,
+            node::protocol::OpsErrorCode::InvalidRequest
+        );
+        std::fs::remove_dir(&audit)?;
+        assert!(fleet.execute(request, "test").await?.ok);
+        let records: Vec<node::protocol::OpsAuditRecord> = std::fs::read_to_string(&audit)?
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<std::result::Result<_, _>>()?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].action, "command");
+        assert_eq!(records[0].command.as_deref(), Some("save-all"));
+        assert!(records[0].success);
+        fleet.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audit_failure_preserves_delete_backup_success() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let (fleet, _) = fixture(directory.path(), "/nonexistent/ops-audit-delete")?;
+        let submitted = fleet
+            .execute(
+                OpsRequest {
+                    delegation: None,
+                    op: OpsOp::CreateBackup {
+                        instance: "test".into(),
+                        label: "audit".into(),
+                        idempotency_key: "audit-delete".into(),
+                    },
+                },
+                "test",
+            )
+            .await?;
+        let job = wait_job(&fleet, &submitted.job.context("job missing")?.id).await?;
+        fleet.extended.shutdown().await?;
+        let backup = job.result_backup.context("backup missing")?;
+        let audit = directory.path().join("audit.jsonl");
+        std::fs::remove_file(&audit)?;
+        std::fs::create_dir(&audit)?;
+        let request = OpsRequest {
+            delegation: None,
+            op: OpsOp::DeleteBackup {
+                instance: "test".into(),
+                backup: backup.id,
+            },
+        };
+        assert!(fleet.execute(request.clone(), "test").await?.ok);
+        let error = fleet.execute_tracked(request, "test").await.unwrap_err();
+        assert_eq!(
+            crate::ops_extended::error_response(&error).code,
+            node::protocol::OpsErrorCode::NotFound
+        );
+        fleet.shutdown().await?;
         Ok(())
     }
 

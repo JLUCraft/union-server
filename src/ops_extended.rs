@@ -425,12 +425,27 @@ fn page<T>(values: Vec<T>, offset: u32, limit: Option<u32>) -> Result<(Vec<T>, O
     Ok((values, next))
 }
 
+async fn record_audit_or_log(
+    store: &AuditStore,
+    action: &str,
+    target: Option<&str>,
+    record: Result<OpsAuditRecord>,
+) {
+    let result = match record {
+        Ok(record) => store.record(record).await,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = result {
+        tracing::error!(action, target, %error, "operations audit record lost");
+    }
+}
+
 pub(crate) async fn audit_legacy(
     fleet: &Fleet,
     request: &OpsRequest,
     actor: &str,
     response: &OpsResponse,
-) -> Result<()> {
+) {
     if !matches!(
         request.op,
         OpsOp::Start { .. }
@@ -440,12 +455,17 @@ pub(crate) async fn audit_legacy(
             | OpsOp::Restart { .. }
             | OpsOp::Kill { .. }
     ) {
-        return Ok(());
+        return;
     }
-    let action = serde_json::to_value(&request.op)?["op"]
-        .as_str()
-        .context("operation name missing")?
-        .to_owned();
+    let action = match &request.op {
+        OpsOp::Start { .. } => "start",
+        OpsOp::StartLeague { .. } => "start_league",
+        OpsOp::StopLeague { .. } => "stop_league",
+        OpsOp::Stop { .. } => "stop",
+        OpsOp::Restart { .. } => "restart",
+        OpsOp::Kill { .. } => "kill",
+        _ => return,
+    };
     let target = match &request.op {
         OpsOp::Start { instance }
         | OpsOp::StartLeague { instance, .. }
@@ -456,23 +476,22 @@ pub(crate) async fn audit_legacy(
         _ => None,
     };
     let (relay, nonce) = delegation_metadata(request);
-    fleet
-        .extended
-        .audit
-        .record(OpsAuditRecord {
+    let record = (|| {
+        Ok(OpsAuditRecord {
             relay,
             nonce,
             timestamp_ms: now_ms()?,
             actor: actor.into(),
-            action,
-            target,
+            action: action.into(),
+            target: target.clone(),
             request_digest: request_digest(request)?,
             success: response.ok,
             error_code: response.error.as_ref().map(|error| error.code),
             job: None,
             command: None,
         })
-        .await
+    })();
+    record_audit_or_log(&fleet.extended.audit, action, target.as_deref(), record).await;
 }
 
 pub(crate) async fn execute(
@@ -507,10 +526,8 @@ pub(crate) async fn execute(
                 .as_ref()
                 .err()
                 .map(|error| error_response(error).code);
-            fleet
-                .extended
-                .audit
-                .record(OpsAuditRecord {
+            let record = (|| {
+                Ok(OpsAuditRecord {
                     relay,
                     nonce,
                     timestamp_ms: now_ms()?,
@@ -523,7 +540,8 @@ pub(crate) async fn execute(
                     job: None,
                     command: Some(command.clone()),
                 })
-                .await?;
+            })();
+            record_audit_or_log(&fleet.extended.audit, "command", Some(instance), record).await;
             response.logs = Some(result?);
         }
         OpsOp::ListJobs { offset, limit } => {
@@ -581,10 +599,8 @@ pub(crate) async fn execute(
                 .as_ref()
                 .err()
                 .map(|error| error_response(error).code);
-            fleet
-                .extended
-                .audit
-                .record(OpsAuditRecord {
+            let record = (|| {
+                Ok(OpsAuditRecord {
                     relay,
                     nonce,
                     timestamp_ms: now_ms()?,
@@ -597,7 +613,14 @@ pub(crate) async fn execute(
                     job: None,
                     command: None,
                 })
-                .await?;
+            })();
+            record_audit_or_log(
+                &fleet.extended.audit,
+                "delete_backup",
+                Some(instance),
+                record,
+            )
+            .await;
             result?;
         }
         _ => return Err(invalid("legacy operation dispatched through extended path")),
@@ -887,12 +910,17 @@ async fn submit(fleet: &Arc<Fleet>, request: &OpsRequest, actor: &str) -> Result
                     job: Some(job.id.clone()),
                     command: None,
                 });
-                match record {
-                    Ok(record) => if let Err(error) = running.extended.audit.record(record).await {
-                        tracing::error!(%error, job = %job.id, "operations audit write failed");
-                    },
-                    Err(error) => tracing::error!(%error, job = %job.id, "job audit timestamp failed"),
-                }
+                let action = match job.kind {
+                    OpsJobKind::CreateBackup => "create_backup",
+                    OpsJobKind::VerifyBackup => "verify_backup",
+                    OpsJobKind::RestoreBackup => "restore_backup",
+                };
+                record_audit_or_log(
+                    &running.extended.audit,
+                    action,
+                    Some(&job.instance),
+                    record,
+                ).await;
             }
             Err(error) => tracing::error!(%error, job = %running_job.id, "operations job completion persistence failed"),
         }
