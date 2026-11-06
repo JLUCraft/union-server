@@ -3,7 +3,9 @@ use crate::{ai_worker, ops, rooms};
 use anyhow::{Context, Result, ensure};
 use authority::authority::Authority;
 use authority::journal::Journal;
-use node::{AccessPolicy, Identity, Node, NodeConfig, PeerId, Service, ServiceId};
+use node::{
+    AccessPolicy, Identity, Node, NodeConfig, PeerId, Service, ServiceId, game_profile_session,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -350,6 +352,7 @@ impl Config {
             relay: self.services.relay.config(),
             discovery_server: self.services.directory,
             lan_discovery: self.node.lan_discovery,
+            session_policy: Some(Arc::new(game_profile_session)),
             ..NodeConfig::new(self.node.namespace.clone())
         };
         if !self.node.listen.is_empty() {
@@ -1067,5 +1070,22 @@ impl Drop for Host {
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_selects_game_profile_session() -> Result<()> {
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "node": {
+                "namespace": {"organization": "jlucraft", "version": 1},
+                "key": "unused.key"
+            }
+        }))?;
+        assert!(config.network()?.session_policy.is_some());
+        Ok(())
     }
 }
