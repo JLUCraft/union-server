@@ -175,11 +175,17 @@ with diagnostics on stderr and no JSON output.
 
 ## Reusing the MCP gateway
 
-The MCP adapter uses `federation-mcp` from `union-core/crates/mcp` for envelope
-verification, canonical request commitments, audience resolution, replay limits,
-and delegated operations and journal forwarding. Other hosts can construct
-`mcp::Gateway` with their relay node, principal configuration, and `Audience`
-implementations without copying this server's HTTP middleware. This server keeps
-its rmcp catalog, host endpoint configuration, identity history synchronization,
-and application response presentation. The existing 20 operations, 2 application,
-and 4 identity tools, envelope audiences, and HTTP error statuses are preserved.
+The MCP adapter enables the `forwarding` feature of `federation-mcp` from
+`union-core/crates/mcp`. The default library provides envelope verification,
+canonical commitments, header codecs, and replay protection with only `protocol`
+and `identity` as platform dependencies. Its optional `mcp::forwarding` module
+adds `node` and `client` for delegated operations and journal forwarding.
+
+Each `mcp::Principal` holds its own `Audience` policy. This server's
+`HostAudience` resolves its endpoint allowlist and local/journal service names;
+`HostToolMapping` injects the existing operations and application mappings.
+`mcp::forwarding::Gateway::new` takes the configuration, relay node, and mapping.
+The server selects the existing clock tolerance and retains its rmcp
+catalog, identity history synchronization, and application response presentation.
+The existing 20 operations, 2 application, and 4 identity tools, envelope
+audiences, and HTTP error statuses are preserved.

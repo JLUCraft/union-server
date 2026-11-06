@@ -16,7 +16,7 @@ ignored = ["openssl"]
 base64 = "0.22"
 aes-gcm = "0.11"
 state = { package = "federation-state", version = "0.2.0", path = "../union-core/crates/state" }
-mcp = { package = "federation-mcp", version = "0.2.0", path = "../union-core/crates/mcp" }
+mcp = { package = "federation-mcp", version = "0.2.0", path = "../union-core/crates/mcp", features = ["forwarding"] }
 client = { package = "federation-client", version = "0.2.0", path = "../union-core/crates/client", features = ["documents"] }
 events = { package = "federation-events", version = "0.2.0", path = "../union-core/crates/events", features = ["documents"] }
 flows = { package = "federation-flows", version = "0.2.0", path = "../union-core/crates/flows" }

@@ -12,9 +12,11 @@ use client::Identity;
 use futures::FutureExt;
 #[cfg(test)]
 use identity::mcp_envelope::{self as envelope, Expected, ReplayCache};
+use mcp::forwarding::{Gateway, JournalTarget, OperationsTarget, Route, ToolMapping};
 #[cfg(test)]
 use mcp::request_commitment;
-use mcp::{Audience, AudienceTarget, DefaultAudience, Gateway, OperationsTarget, Verified};
+use mcp::{Audience, AudienceTarget};
+type Verified = mcp::Verified<Route>;
 #[cfg(test)]
 use node::protocol::OpsOp;
 use node::protocol::{McpEnvelope, OpsRequest, OpsResponse};
@@ -184,7 +186,7 @@ struct Principal {
 #[derive(Clone)]
 struct Authorization {
     principals: Arc<Vec<Principal>>,
-    verifier: Arc<mcp::Verifier>,
+    verifier: Arc<mcp::Verifier<Route>>,
 }
 
 #[derive(Clone)]
@@ -194,21 +196,61 @@ struct Context {
     node: Arc<node::Node>,
 }
 
-/// The host catalog selects permitted tools; the library resolves local and journal audiences.
+/// The host owns the catalog, endpoint allowlists, and service audience conventions.
+#[derive(Debug)]
 struct HostAudience {
-    default: DefaultAudience,
-    operations: Option<mcp::OperationsTarget>,
+    namespace: node::protocol::Namespace,
+    relay_peer: String,
+    operations: Option<OperationsTarget>,
+    journal: Option<JournalTarget>,
 }
 
-impl Audience for HostAudience {
-    fn expected(&self, tool: &str) -> AudienceTarget {
+impl Audience<Route> for HostAudience {
+    fn expected(&self, tool: &str) -> Option<AudienceTarget<Route>> {
         if operations_specs().iter().any(|spec| spec.name == tool) {
-            self.operations
-                .clone()
-                .map_or(AudienceTarget::Denied, AudienceTarget::Operations)
+            let target = self.operations.clone()?;
+            Some(AudienceTarget {
+                peer: target.peer.clone(),
+                service: target.service.clone(),
+                route: Route::Operations(target),
+            })
+        } else if application_specs().iter().any(|spec| spec.name == tool) {
+            let target = self.journal.clone()?;
+            Some(AudienceTarget {
+                peer: target.peer.clone(),
+                service: self.namespace.governance_protocol(),
+                route: Route::Journal(target),
+            })
+        } else if mcp::LOCAL_METHODS.contains(&tool)
+            || identity_specs().iter().any(|spec| spec.name == tool)
+        {
+            Some(AudienceTarget {
+                peer: self.relay_peer.clone(),
+                service: "gateway".into(),
+                route: Route::Local,
+            })
         } else {
-            self.default.expected(tool)
+            None
         }
+    }
+}
+
+struct HostToolMapping;
+impl ToolMapping for HostToolMapping {
+    fn ops_request(
+        &self,
+        tool: &str,
+        arguments: serde_json::Value,
+    ) -> node::protocol::Result<node::protocol::OpsOp> {
+        client::ops::tool_request(tool, arguments)
+    }
+
+    fn journal_tool(
+        &self,
+        request: &client::journal::Request,
+    ) -> node::protocol::Result<(String, serde_json::Value)> {
+        let (tool, arguments) = client::journal::mcp::request_tool(request)?;
+        Ok((tool.into(), arguments))
     }
 }
 
@@ -216,60 +258,39 @@ fn gateway_config(
     namespace: node::protocol::Namespace,
     relay_peer: String,
     principals: &[Principal],
+    operations: &BTreeMap<String, OperationsTarget>,
     capacity: usize,
-) -> mcp::Config {
+) -> mcp::Config<Route> {
+    let principals = principals
+        .iter()
+        .map(|principal| mcp::Principal {
+            peer: principal.peer.clone(),
+            audience: Arc::new(HostAudience {
+                namespace: namespace.clone(),
+                relay_peer: relay_peer.clone(),
+                operations: principal
+                    .operations
+                    .iter()
+                    .next()
+                    .and_then(|name| operations.get(name))
+                    .cloned(),
+                journal: principal.application.as_ref().map(|target| JournalTarget {
+                    peer: target.peer.clone(),
+                    address: target.address.clone(),
+                    genesis_hash: target.genesis_hash.clone(),
+                }),
+            }),
+        })
+        .collect();
     mcp::Config {
         namespace,
         relay_peer,
-        principals: principals
-            .iter()
-            .map(|principal| mcp::Principal {
-                peer: principal.peer.clone(),
-                operations: principal.operations.iter().cloned().collect(),
-            })
-            .collect(),
+        principals,
         max_envelope_bytes: identity::mcp_envelope::MAX_HEADER_BYTES,
         max_body_bytes: MAX_REQUEST_BODY_BYTES,
         replay_capacity: capacity,
+        allowed_drift_ms: identity::mcp_envelope::REPLAY_RETENTION_MS,
     }
-}
-
-fn audiences(
-    principals: &[Principal],
-    operations: &BTreeMap<String, OperationsTarget>,
-) -> Vec<Arc<dyn Audience>> {
-    principals
-        .iter()
-        .map(|principal| {
-            let operations = principal
-                .operations
-                .iter()
-                .next()
-                .and_then(|name| operations.get(name))
-                .cloned();
-            Arc::new(HostAudience {
-                operations,
-                default: DefaultAudience {
-                    local_tools: identity_specs()
-                        .into_iter()
-                        .map(|spec| spec.name.to_owned())
-                        .collect(),
-                    governance_tools: application_specs()
-                        .into_iter()
-                        .map(|spec| spec.name.to_owned())
-                        .collect(),
-                    journal: principal
-                        .application
-                        .as_ref()
-                        .map(|target| mcp::JournalTarget {
-                            peer: target.peer.clone(),
-                            address: target.address.clone(),
-                            genesis_hash: target.genesis_hash.clone(),
-                        }),
-                },
-            }) as Arc<dyn Audience>
-        })
-        .collect()
 }
 
 impl ServerHandler for Context {
@@ -348,10 +369,11 @@ async fn serve_with_listener_and_namespace(
             namespace,
             relay_peer,
             &principals,
+            &operations,
             identity::mcp_envelope::REPLAY_CAPACITY,
         ),
         node.clone(),
-        audiences(&principals, &operations),
+        Arc::new(HostToolMapping),
     )?);
     let auth = Arc::new(Authorization {
         principals: Arc::new(principals),
@@ -1102,7 +1124,7 @@ mod tests {
     struct AuthFixture {
         auth: Authorization,
         signer: Identity,
-        config: mcp::Config,
+        config: mcp::Config<Route>,
         operations: Arc<BTreeMap<String, OperationsTarget>>,
     }
 
@@ -1131,11 +1153,10 @@ mod tests {
                 node::protocol::Namespace::jlucraft(),
                 relay.peer_id().to_string(),
                 &principals,
+                &operations,
                 capacity,
             );
-            let verifier = Arc::new(
-                mcp::Verifier::new(config.clone(), audiences(&principals, &operations)).unwrap(),
-            );
+            let verifier = Arc::new(mcp::Verifier::new(config.clone()).unwrap());
             Self {
                 auth: Authorization {
                     principals,
@@ -1148,22 +1169,15 @@ mod tests {
         }
 
         fn refresh(&mut self) {
-            self.config.principals = self
-                .auth
-                .principals
-                .iter()
-                .map(|principal| mcp::Principal {
-                    peer: principal.peer.clone(),
-                    operations: principal.operations.iter().cloned().collect(),
-                })
-                .collect();
-            self.auth.verifier = Arc::new(
-                mcp::Verifier::new(
-                    self.config.clone(),
-                    audiences(&self.auth.principals, &self.operations),
-                )
-                .unwrap(),
-            );
+            self.config.principals = gateway_config(
+                self.config.namespace.clone(),
+                self.config.relay_peer.clone(),
+                &self.auth.principals,
+                &self.operations,
+                self.config.replay_capacity,
+            )
+            .principals;
+            self.auth.verifier = Arc::new(mcp::Verifier::new(self.config.clone()).unwrap());
         }
 
         fn sign(&self, request: &serde_json::Value) -> McpEnvelope {
