@@ -110,7 +110,7 @@ pub enum EventAction {
     #[serde(untagged)]
     Competition(crate::LeagueAction),
 }
-impl Domain for EventsDomain {
+impl flows::Workflow for EventsDomain {
     fn point_balance(state: &Self::State, account: &protocol::PointAccount) -> Result<u64> {
         Ok(points::balance(state, account))
     }
@@ -277,6 +277,8 @@ impl Domain for EventsDomain {
             action => Self::transition(state, ctx, action),
         }
     }
+}
+impl Domain for EventsDomain {
     type State = EventsState;
     type Action = EventAction;
     fn transition(state: &mut Self::State, ctx: &Context<'_>, action: Self::Action) -> Result<()> {

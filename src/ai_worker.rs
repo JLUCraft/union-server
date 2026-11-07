@@ -8,8 +8,8 @@ use identity::Identity;
 use serde::Deserialize;
 use std::path::PathBuf;
 
-/// File storage capabilities needed in addition to the workflow hooks on `Domain`.
-pub(crate) trait AiDomain: state::Domain {
+/// File storage capabilities needed in addition to the hooks on `flows::Workflow`.
+pub(crate) trait AiDomain: flows::Workflow {
     fn files(state: &Self::State) -> &events::office::files::FileStore;
     fn put_block(block: node::protocol::IpldBlock) -> Self::Action;
 }
@@ -45,7 +45,7 @@ pub(crate) fn prepare(config: Config) -> Result<Prepared> {
         })?,
     })
 }
-async fn apply<D: state::Domain>(
+async fn apply<D: flows::Workflow>(
     authority: &Authority<flows::Flows<D>>,
     identity: &Identity,
     action: F<D>,
@@ -213,7 +213,7 @@ pub(crate) async fn serve<D: AiDomain>(
         .await;
     }
 }
-async fn recover<D: state::Domain>(
+async fn recover<D: flows::Workflow>(
     authority: &Authority<flows::Flows<D>>,
     identity: &Identity,
 ) -> Result<()> {
@@ -316,7 +316,7 @@ async fn execute<D: AiDomain>(
     Ok((cid, completion.usage))
 }
 
-fn running<D: state::Domain>(
+fn running<D: flows::Workflow>(
     state: &state::State<flows::Flows<D>>,
     identity: &Identity,
     job: &flows::AiJob,

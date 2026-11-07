@@ -29,7 +29,7 @@ use std::{
 use web_push::{ContentEncoding, SubscriptionInfo, VapidSignatureBuilder, WebPushMessageBuilder};
 
 /// Notification data and checkpoint actions supplied by the application domain.
-pub(crate) trait NotificationDomain: state::Domain {
+pub(crate) trait NotificationDomain: flows::Workflow {
     fn notices(state: &Self::State) -> &BTreeMap<String, Notice>;
     fn task<'a>(state: &'a Self::State, id: &str) -> Option<&'a Task>;
     fn is_open(state: &Self::State, event: &str) -> bool;
@@ -532,6 +532,7 @@ mod tests {
             Ok(())
         }
     }
+    impl flows::Workflow for OfficeDomain {}
     impl NotificationDomain for OfficeDomain {
         fn notices(state: &Self::State) -> &BTreeMap<String, Notice> {
             &state.notices

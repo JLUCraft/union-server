@@ -6,6 +6,15 @@ The JLUCraft service host for authority nodes, Minecraft connections, scoring, a
 
 Keep sibling `union-core` and `minecraftd` checkouts available. The production entry is `federated-server`; initialization and signed host registration use its subcommands. Configuration is defined by the Rust types and command parser in `src/`. The workspace includes `game/league`, retaining the `league` crate name and its league API. Its `events` module combines office records with game state; `application`, `points`, `discovery`, `files`, and `trust` provide game clients. Game integration tests reuse the generic fixture in `../union-core/tests/support/mod.rs`. Production keys and founder authorization stay outside the repository.
 
+Workflow composition requires an explicit `flows::Workflow` implementation in
+addition to `state::Domain`. `EventsDomain` implements the workflow hooks for
+points, AI allowances and documents, review material, worker selection, club
+approvals, and artifact-backed transitions. `Domain` retains its state and action
+types and its transition; `LeagueDomain` continues to implement only
+`Domain`. Hooks omitted from a `Workflow` implementation use the library defaults.
+The host's `AiDomain` and `NotificationDomain` traits both extend `Workflow` and
+add their file-storage and notification capabilities without redefining its hooks.
+
 ## Protocol namespace
 
 The required `node.namespace` object configures transport, discovery, service

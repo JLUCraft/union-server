@@ -214,6 +214,18 @@ impl state::Domain for OfficeDomain {
     type State = OfficeState;
     type Action = OfficeAction;
 
+    fn transition(
+        state: &mut Self::State,
+        _: &state::Context<'_>,
+        action: Self::Action,
+    ) -> node::Result<()> {
+        match action {
+            OfficeAction::PutBlock(block) => state.files.put(block),
+            OfficeAction::Review(_) => Ok(()),
+        }
+    }
+}
+impl flows::Workflow for OfficeDomain {
     fn artifact(state: &Self::State, cid: &str) -> node::Result<Vec<u8>> {
         state.files.read(&cid.parse()?)
     }
@@ -231,17 +243,6 @@ impl state::Domain for OfficeDomain {
 
     fn workflow_worker(_: &Self::State, _: &Self::Action) -> Option<String> {
         Some("worker".into())
-    }
-
-    fn transition(
-        state: &mut Self::State,
-        _: &state::Context<'_>,
-        action: Self::Action,
-    ) -> node::Result<()> {
-        match action {
-            OfficeAction::PutBlock(block) => state.files.put(block),
-            OfficeAction::Review(_) => Ok(()),
-        }
     }
 }
 impl AiDomain for OfficeDomain {
