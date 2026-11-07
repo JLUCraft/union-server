@@ -13,7 +13,7 @@ pub mod files;
 pub mod points;
 mod profile;
 pub mod trust;
-pub use profile::{GAME_PROFILE, validate_game_profile};
+pub use profile::{GAME_PROFILE, Suggestions, validate_game_profile};
 
 pub use client::{
     AddressProtocol, Identity, Multiaddr, Node, NodeConfig, endpoint, generic, journal,
