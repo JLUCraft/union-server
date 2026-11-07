@@ -344,6 +344,11 @@ async fn session(
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("identity required"))?;
     let admission: node::protocol::TrustAdmission = serde_json::from_slice(claims)?;
+    let verified_profile = admission
+        .attributes
+        .get(league::GAME_PROFILE)
+        .ok_or_else(|| anyhow::anyhow!("member has no verified game profile"))?;
+    league::validate_game_profile(verified_profile)?;
     let peer = incoming.peer.to_string();
     let service = incoming.service.to_string();
     let mut witness: Option<crate::activity::WitnessGuard> = None;
@@ -389,7 +394,7 @@ async fn session(
         };
         let profile = {
             ensure!(
-                admission.game_profile.as_deref() == Some(uuid.simple().to_string().as_str()),
+                verified_profile == &uuid.simple().to_string(),
                 "verified identity does not match Minecraft profile"
             );
             crate::forwarding::validate_name(&name)?;

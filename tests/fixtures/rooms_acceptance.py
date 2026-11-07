@@ -130,7 +130,7 @@ try:
         append({'type': 'confirm_member', 'member': member, 'club': school['school'], 'device': school['identities']['host'],
             'evidence': 'manual_verification', 'verifier': None}, [path / 'root.key', path / 'host.key'])
         append({'type': 'bind_device', 'member': member, 'device': school['identities']['player']}, [path / 'host.key', path / 'player.key'])
-        append({'type': 'bind_game_profile', 'member': member, 'club': school['school'], 'profile': school['profile']['id']}, [path / 'root.key', path / 'host.key'])
+        append({'type': 'bind_attribute', 'member': member, 'club': school['school'], 'kind': run([SERVER, 'game-profile-kind']), 'value': school['profile']['id']}, [path / 'root.key', path / 'host.key'])
     print('Both skin stations stopped; chairs confirmed members in the unified identity log.', flush=True)
     hosts = []
     for index, school in enumerate(schools):

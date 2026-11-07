@@ -312,8 +312,10 @@ class Acceptance:
                 self.trust({'type': 'grant_permission', 'id': str(uuid.uuid4()), 'member': member,
                             'service': 'application', 'permission': permission}, ['host'])
             for member, profile in self.meta['profiles'].items():
-                self.trust({'type': 'bind_game_profile', 'member': member, 'club': CLUB,
-                            'profile': profile['id']}, ['host', member])
+                self.trust({'type': 'bind_attribute', 'member': member, 'club': CLUB,
+                            'kind': run([DRIVER, 'game-profile-kind']), 'value': profile['id']}, ['host', member])
+            self.trust({'type': 'bind_attribute', 'member': 'operator', 'club': CLUB,
+                        'kind': run([DRIVER, 'game-profile-kind']), 'value': uuid.uuid4().hex}, ['host', 'operator'])
             (self.state / 'registered').touch()
         snapshot = self.application()['state']
         self.baseline = snapshot['organization']['points'].get(CLUB, {}).get('active', 0)

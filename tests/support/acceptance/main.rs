@@ -11,6 +11,7 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
+    GameProfileKind,
     Application {
         #[arg(long)]
         key: PathBuf,
@@ -69,6 +70,7 @@ pub(crate) use federated_server::bootstrap::write_new as write_json;
 async fn main() -> Result<()> {
     terminal_runtime::init_logging();
     match Args::parse().command {
+        Command::GameProfileKind => println!("{}", league::GAME_PROFILE),
         Command::Application { key, input } => {
             let response = league::application::execute(
                 node::Identity::load(key)?,

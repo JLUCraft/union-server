@@ -100,7 +100,12 @@ async fn session(
                 .as_ref()
                 .is_none_or(|admitted| admitted.contains(*member))
         })
-        .map(|member| (member.clone(), identity.profile(member).map(str::to_owned)))
+        .map(|member| {
+            let profile = identity
+                .attribute(member, league::GAME_PROFILE)
+                .filter(|value| league::validate_game_profile(value).is_ok());
+            (member.clone(), profile.map(str::to_owned))
+        })
         .collect::<BTreeMap<_, _>>();
     Ok(Json(
         serde_json::json!({"protocol_version":node::protocol::GAME_ADAPTER_VERSION,"league":id,"phase":league.phase,"rules":league.rules,"teams":league.teams,"admitted":league.admitted,"profiles":players,"seats":league.seats}),
@@ -170,6 +175,99 @@ pub async fn serve(
 mod tests {
     use super::*;
     use authority::journal::{Journal, now_ms};
+    #[tokio::test]
+    async fn scoring_profiles_require_the_game_kind_and_canonical_uuid() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let player = Identity::generate();
+        let ids = crate::test_identity::Identities::new(&[(&player, "player", "a")], "player");
+        let view = ids.log.view(std::time::Duration::from_secs(60))?;
+        let mut journal = Journal::open_with_namespace(
+            directory.path().join("journal"),
+            ids.genesis(),
+            node::protocol::Namespace::jlucraft(),
+        )?;
+        let now = now_ms()?;
+        for action in [
+            league::LeagueAction::CreateLeague {
+                league: "cup".into(),
+                rules: Default::default(),
+                host: player.peer_id().to_string(),
+                scorer: player.peer_id().to_string(),
+            },
+            league::LeagueAction::CreateTeam {
+                league: "cup".into(),
+                team: "team".into(),
+            },
+            league::LeagueAction::Register {
+                league: "cup".into(),
+                team: "team".into(),
+            },
+        ] {
+            ids.run(
+                &mut journal,
+                &player,
+                now,
+                league::application::competition(action),
+            )?;
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            "Bearer test-scoring-token-with-32-characters".parse()?,
+        );
+        let root = ids.root("a");
+        let log = Arc::new(Mutex::new(ids.log));
+        let context = Context {
+            journal: league::application::Authority::Local {
+                journal: Arc::new(Mutex::new(journal)),
+                log: log.clone(),
+                view,
+            },
+            identity: player.clone(),
+            token: Arc::new(b"test-scoring-token-with-32-characters".to_vec()),
+        };
+        let canonical = "0123456789abcdef0123456789abcdef";
+        for (kind, value, expected) in [
+            ("other", canonical, None),
+            (
+                league::GAME_PROFILE,
+                "0123456789ABCDEF0123456789ABCDEF",
+                None,
+            ),
+            (
+                league::GAME_PROFILE,
+                "01234567-89ab-cdef-0123-456789abcdef",
+                None,
+            ),
+            (league::GAME_PROFILE, canonical, Some(canonical)),
+        ] {
+            {
+                let mut log = log.lock().await;
+                let mut record = log
+                    .state()
+                    .draft(node::protocol::TrustAction::BindAttribute {
+                        member: "player".into(),
+                        club: "a".into(),
+                        kind: kind.into(),
+                        value: value.into(),
+                    });
+                for signer in [&root, &player] {
+                    identity::trust::sign_with_namespace(
+                        &mut record,
+                        signer,
+                        log.state().namespace(),
+                    )?;
+                }
+                log.append(record)?;
+            }
+            let Json(response) =
+                session(State(context.clone()), headers.clone(), Path("cup".into()))
+                    .await
+                    .map_err(|status| anyhow::anyhow!("session: {status}"))?;
+            assert_eq!(response["profiles"]["player"], serde_json::json!(expected));
+        }
+        Ok(())
+    }
     #[tokio::test]
     async fn scoring_only_identity_and_bearer_cannot_manage_the_league() -> anyhow::Result<()> {
         let directory = tempfile::tempdir()?;

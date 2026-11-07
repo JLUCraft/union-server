@@ -417,13 +417,10 @@ impl OracleContext {
         let mut members = BTreeMap::new();
         let mut witnesses = BTreeMap::new();
         for uuid in report.players.keys() {
-            let Ok(profile) = uuid::Uuid::parse_str(uuid) else {
-                continue;
-            };
-            if uuid != &profile.simple().to_string() {
+            if league::validate_game_profile(uuid).is_err() {
                 continue;
             }
-            let uuid = profile.simple().to_string();
+            let uuid = uuid.clone();
             let witness = self
                 .witnesses
                 .covering(
@@ -439,7 +436,7 @@ impl OracleContext {
                 && witness.clubs.contains(&member.club)
                 && trust.member_for_device(&witness.device) == Some(witness.member.as_str())
                 && trust.is_member(&witness.member, &member.club)
-                && trust.profile(&witness.member) == Some(uuid.as_str())
+                && trust.attribute(&witness.member, league::GAME_PROFILE) == Some(uuid.as_str())
             {
                 let mut witness = witness;
                 witness.clubs = [member.club.clone()].into();
@@ -525,8 +522,9 @@ impl OracleContext {
                     continue;
                 };
                 if !core.members.contains_key(member)
+                    || league::validate_game_profile(uuid).is_err()
                     || trust.member_for_device(&witness.device) != Some(member.as_str())
-                    || trust.profile(member) != Some(uuid.as_str())
+                    || trust.attribute(member, league::GAME_PROFILE) != Some(uuid.as_str())
                 {
                     continue;
                 }

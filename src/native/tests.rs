@@ -234,10 +234,11 @@ async fn native_cross_node_transfer_substitution_and_returner_fencing() -> Resul
         let root = identities.root("jlu");
         for (i, member) in members.iter().enumerate() {
             identities.append(
-                node::protocol::TrustAction::BindGameProfile {
+                node::protocol::TrustAction::BindAttribute {
                     club: "jlu".into(),
                     member: (*member).into(),
-                    profile: profiles[i].uuid.simple().to_string(),
+                    kind: league::GAME_PROFILE.into(),
+                    value: profiles[i].uuid.simple().to_string(),
                 },
                 &[&root, &users[i]],
             );

@@ -236,7 +236,7 @@ async fn application_commands_share_one_journal_and_revocation() -> Result {
         let host_key = Identity::generate(); host_key.save_new(dir.path().join("node.key"))?;
         let admin = Identity::generate();let member = Identity::generate();
         let operations = ServiceId::new();
-        let (identity_config, cache, binding, root) = setup_identity(dir.path(), &admin, &host_key, Some((&member, operations)))?;
+        let (identity_config, mut cache, binding, root) = setup_identity(dir.path(), &admin, &host_key, Some((&member, operations)))?;
         let genesis = state::State::<Application>::new(binding)?;
         write(&dir.path().join("genesis.json"), &genesis)?;
         let pin = node::protocol::digest(&serde_json::to_vec(&genesis)?);
@@ -259,6 +259,14 @@ async fn application_commands_share_one_journal_and_revocation() -> Result {
         assert_eq!(snapshot.domain.inner.files.read(&cid)?,b"shared application");
         let admin_node=Node::start(admin.clone(),NodeConfig::new(node::protocol::Namespace::jlucraft())).await?;
         admin_node.dial(status.addresses[0].parse()?).await?;
+        let mut profile = cache.state().draft(node::protocol::TrustAction::BindAttribute {
+            member: "chair".into(), club: "school".into(), kind: league::GAME_PROFILE.into(),
+            value: "fedcba9876543210fedcba9876543210".into(),
+        });
+        client::trust::sign_with_namespace(&mut profile, &admin, &node::protocol::Namespace::jlucraft())?;
+        let response = client::trust::request(&admin_node, host_key.peer_id(), node::protocol::TrustRequest::Append { record: profile.clone() }).await?;
+        assert!(response.error.is_none(), "{:?}", response.error);
+        cache.append(profile)?;
         let initial_revision = snapshot.revision;
         let now = authority::journal::now_ms()?;
         let activity = state::governance::Action::<Application>::Domain(flows::FlowAction::Inner(league::events::EventAction::Create {
@@ -395,6 +403,12 @@ fn setup_identity(
                 device: Some(member.peer_id().to_string()),
                 evidence: "manual".into(),
                 verifier: None,
+            },
+            A::BindAttribute {
+                member: "alice".into(),
+                club: "school".into(),
+                kind: league::GAME_PROFILE.into(),
+                value: "0123456789abcdef0123456789abcdef".into(),
             },
             A::RegisterService {
                 service: operations.to_string(),

@@ -8,6 +8,7 @@ use axum::{
 use client::trust::{
     Config as TrustConfig, Input, Operation, TrustAction, TrustGenesis, TrustRecord,
 };
+use league::{GAME_PROFILE, validate_game_profile};
 use serde::Deserialize;
 use std::{
     net::SocketAddr,
@@ -132,7 +133,13 @@ impl Bridge {
                     && evidence == "institutional_email"
                     && verifier == &self.config.verifier
             }
-            TrustAction::BindGameProfile { club, .. } => club == &self.config.club,
+            TrustAction::BindAttribute {
+                club, kind, value, ..
+            } => {
+                club == &self.config.club
+                    && kind == GAME_PROFILE
+                    && validate_game_profile(value).is_ok()
+            }
             _ => false,
         };
         if allowed {
@@ -284,6 +291,10 @@ mod tests {
         for action in [
             serde_json::json!({"type":"confirm_member","member":"m","club":"other","device":"p","evidence":"institutional_email","verifier":"skin"}),
             serde_json::json!({"type":"confirm_member","member":"m","club":"school","device":"p","evidence":"manual","verifier":"skin"}),
+            serde_json::json!({"type":"bind_attribute","member":"m","club":"other","kind":GAME_PROFILE,"value":"0".repeat(32)}),
+            serde_json::json!({"type":"bind_attribute","member":"m","club":"school","kind":"other","value":"0".repeat(32)}),
+            serde_json::json!({"type":"bind_attribute","member":"m","club":"school","kind":GAME_PROFILE,"value":"ABCDEF0123456789ABCDEF0123456789"}),
+            serde_json::json!({"type":"unbind_attribute","member":"m","kind":GAME_PROFILE}),
             serde_json::json!({"type":"register_service","service":"s","audience":"p","club":"school"}),
         ] {
             assert_eq!(
@@ -300,6 +311,66 @@ mod tests {
         }
         task.abort();
         let _ = task.await;
+    }
+    #[test]
+    fn game_profile_scope_accepts_only_canonical_bindings_and_keeps_membership_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, genesis) = setup(dir.path());
+        let bridge = Bridge {
+            trust: TrustConfig {
+                namespace: config.namespace.clone(),
+                genesis_hash: client::trust::TrustState::genesis_digest(&genesis).unwrap(),
+                genesis,
+                log: config.log.clone(),
+                address: config.address.clone(),
+                peer: config.peer.clone(),
+            },
+            config,
+            identity: node::Identity::generate(),
+            token: String::new(),
+            serial: Mutex::new(()),
+        };
+        assert!(
+            bridge
+                .scoped(&TrustAction::BindAttribute {
+                    member: "m".into(),
+                    club: "school".into(),
+                    kind: GAME_PROFILE.into(),
+                    value: "0123456789abcdef0123456789abcdef".into(),
+                })
+                .is_ok()
+        );
+        for (club, kind, value) in [
+            ("other", GAME_PROFILE, "0123456789abcdef0123456789abcdef"),
+            ("school", "other", "0123456789abcdef0123456789abcdef"),
+            ("school", GAME_PROFILE, "0123456789ABCDEF0123456789ABCDEF"),
+            (
+                "school",
+                GAME_PROFILE,
+                "01234567-89ab-cdef-0123-456789abcdef",
+            ),
+        ] {
+            assert_eq!(
+                bridge.scoped(&TrustAction::BindAttribute {
+                    member: "m".into(),
+                    club: club.into(),
+                    kind: kind.into(),
+                    value: value.into(),
+                }),
+                Err(StatusCode::FORBIDDEN)
+            );
+        }
+        assert!(
+            bridge
+                .scoped(&TrustAction::ConfirmMember {
+                    member: "m".into(),
+                    club: "school".into(),
+                    device: Some("p".into()),
+                    evidence: "institutional_email".into(),
+                    verifier: Some("skin".into()),
+                })
+                .is_ok()
+        );
     }
     #[test]
     fn public_bind_and_invalid_roots_are_rejected_and_tokens_are_stable() {

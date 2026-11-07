@@ -17,6 +17,13 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Result<Self> {
+        Self::with_binding(
+            league::GAME_PROFILE,
+            uuid::Uuid::from_u128(42).simple().to_string(),
+        )
+        .await
+    }
+    async fn with_binding(kind: &str, profile: String) -> Result<Self> {
         let directory = tempfile::tempdir()?;
         let keys: Vec<_> = (0..5).map(|_| Identity::generate()).collect();
         let mut identities = crate::test_identity::Identities::new(
@@ -29,12 +36,12 @@ impl Fixture {
             ],
             "admin",
         );
-        let profile = uuid::Uuid::from_u128(42).simple().to_string();
         identities.append(
-            node::protocol::TrustAction::BindGameProfile {
+            node::protocol::TrustAction::BindAttribute {
                 member: "player".into(),
                 club: "a".into(),
-                profile: profile.clone(),
+                kind: kind.into(),
+                value: profile.clone(),
             },
             &[&identities.root("a"), &keys[3]],
         );
@@ -512,6 +519,60 @@ async fn a_plugin_report_without_a_gateway_witness_never_mints_points() -> Resul
     );
     oracle.stop().await?;
     assert_eq!(fixture.balance().await?, 0);
+    Ok(())
+}
+#[tokio::test]
+async fn malformed_or_unrelated_attributes_never_mint_activity_points() -> Result<()> {
+    for (kind, profile, expected) in [
+        (league::GAME_PROFILE, "0123456789ABCDEF0123456789ABCDEF", 0),
+        (
+            league::GAME_PROFILE,
+            "01234567-89ab-cdef-0123-456789abcdef",
+            0,
+        ),
+        ("other", "0123456789abcdef0123456789abcdef", 0),
+        (league::GAME_PROFILE, "0123456789abcdef0123456789abcdef", 60),
+    ] {
+        let fixture = Fixture::with_binding(kind, profile.into()).await?;
+        let witnesses = Witnesses::default();
+        let end = now_ms()? / ACTIVITY_SLICE_MS * ACTIVITY_SLICE_MS;
+        let start = end - BATCH_WINDOW_MS;
+        let guard = fixture.witness(&witnesses, start, end)?;
+        let config = fixture.config();
+        let context = OracleContext {
+            authority: fixture.authority.clone(),
+            identity: fixture.keys[1].clone(),
+            witnesses,
+            bindings: [(
+                "survival".into(),
+                Binding {
+                    service: fixture.service.clone(),
+                    token: TOKEN.as_bytes().to_vec(),
+                },
+            )]
+            .into(),
+            pending: Default::default(),
+            _spool_lock: std::fs::File::create(config.spool.with_extension("lock"))?,
+            spool: config.spool,
+            evidence: crate::activity_evidence::EvidenceStore::new(config.evidence_directory)?,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {TOKEN}").parse()?);
+        for index in 0..6 {
+            assert_eq!(
+                context
+                    .submit(
+                        "survival",
+                        &headers,
+                        fixture.report(start + index * ACTIVITY_SLICE_MS, true)
+                    )
+                    .await,
+                Ok(StatusCode::NO_CONTENT)
+            );
+        }
+        drop(guard);
+        assert_eq!(fixture.balance().await?, expected, "{kind}: {profile}");
+    }
     Ok(())
 }
 async fn provider() -> Result<(String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>)> {

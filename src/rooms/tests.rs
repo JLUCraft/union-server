@@ -112,10 +112,11 @@ async fn unified_members_from_two_clubs_join_over_relay_without_qualification_ex
                     evidence: "manual".into(),
                     verifier: None,
                 },
-                TrustAction::BindGameProfile {
+                TrustAction::BindAttribute {
                     member: format!("person-{i}"),
                     club: format!("club-{i}"),
-                    profile: uuid::Uuid::from_u128(i as u128 + 1).simple().to_string(),
+                    kind: league::GAME_PROFILE.into(),
+                    value: uuid::Uuid::from_u128(i as u128 + 1).simple().to_string(),
                 },
             ] {
                 let mut record = log.state().draft(action);
@@ -142,7 +143,8 @@ async fn unified_members_from_two_clubs_join_over_relay_without_qualification_ex
                 ..NodeConfig::new(node::protocol::Namespace::jlucraft())
             },
         )
-        .await?;
+        .await
+        .context("start room relay")?;
         let mut external = relay.addresses()[0].clone();
         external.pop();
         relay.add_external_address(external).await?;
@@ -156,13 +158,16 @@ async fn unified_members_from_two_clubs_join_over_relay_without_qualification_ex
                         ..NodeConfig::new(node::protocol::Namespace::jlucraft())
                     },
                 )
-                .await?,
+                .await
+                .context("start room member node")?,
             );
         }
         let mut receivers = Vec::new();
         let mut services = Vec::new();
         for peer in &mut peers {
-            terminal_runtime::reserve_relays(peer, &relay.addresses()).await?;
+            terminal_runtime::reserve_relays(peer, &relay.addresses())
+                .await
+                .context("reserve member relay circuit")?;
             receivers.push(peer.take_incoming()?);
             let service = ServiceId::new();
             services.push(service);
@@ -181,15 +186,55 @@ async fn unified_members_from_two_clubs_join_over_relay_without_qualification_ex
             })
             .await?;
         }
-        let secret = directory.path().join("forwarding");
-        std::fs::write(&secret, "test-forwarding-key-at-least-32-bytes")?;
+        // Reservations connect each member to the relay, not to the other member.
+        // Establish both circuit routes before any fixture opens a room service.
         for (from, to) in [(0, 1), (1, 0)] {
             let circuit = peers[to]
                 .addresses()
                 .into_iter()
                 .find(|a| a.to_string().contains("/p2p-circuit/"))
                 .context("no relay circuit")?;
-            peers[from].dial(circuit).await?;
+            peers[from].dial(circuit).await.with_context(|| {
+                format!("dial room relay circuit from peer {from} to peer {to}")
+            })?;
+        }
+        let secret = directory.path().join("forwarding");
+        std::fs::write(&secret, "test-forwarding-key-at-least-32-bytes")?;
+        // Generic trust accepts these values; the game consumer must reject them itself.
+        for (kind, value) in [
+            (league::GAME_PROFILE, "0123456789ABCDEF0123456789ABCDEF"),
+            (league::GAME_PROFILE, "01234567-89ab-cdef-0123-456789abcdef"),
+            ("other", "0123456789abcdef0123456789abcdef"),
+        ] {
+            let stream = peers[0]
+                .open_service(peers[1].peer_id(), services[1])
+                .await
+                .context("open room for invalid attribute fixture from peer 0 to peer 1")?;
+            let mut session = receivers[1].recv().await.context("no admission")?;
+            let mut claims: node::protocol::TrustAdmission =
+                serde_json::from_slice(session.claims.as_deref().context("no claims")?)?;
+            claims.attributes = [(kind.into(), value.into())].into();
+            session.claims = Some(serde_json::to_vec(&claims)?);
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let error = super::bridge(session, listener.local_addr()?, &secret, None, None)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains(if kind == league::GAME_PROFILE {
+                    "denied"
+                } else {
+                    "member has no verified game profile"
+                }),
+                "{error}"
+            );
+            assert!(
+                timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err()
+            );
+            drop(stream);
+        }
+        for (from, to) in [(0, 1), (1, 0)] {
             let stream = peers[from]
                 .open_service(peers[to].peer_id(), services[to])
                 .await?;
@@ -197,6 +242,10 @@ async fn unified_members_from_two_clubs_join_over_relay_without_qualification_ex
             let claims: node::protocol::TrustAdmission =
                 serde_json::from_slice(session.claims.as_deref().context("no claims")?)?;
             assert_eq!(claims.member, format!("person-{from}"));
+            assert_eq!(
+                claims.attributes.get(league::GAME_PROFILE),
+                Some(&uuid::Uuid::from_u128(from as u128 + 1).simple().to_string())
+            );
             // An authenticated device still cannot substitute another member's Minecraft UUID.
             let listener = TcpListener::bind("127.0.0.1:0").await?;
             let backend = listener.local_addr()?;

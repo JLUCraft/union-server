@@ -15,6 +15,29 @@ types and its transition; `LeagueDomain` continues to implement only
 The host's `AiDomain` and `NotificationDomain` traits both extend `Workflow` and
 add their file-storage and notification capabilities without redefining its hooks.
 
+## Identity bindings and sessions
+
+Game profiles use the generic identity action `BindAttribute { member, club,
+kind, value }`, with `league::GAME_PROFILE` as the kind and verifier evidence.
+`UnbindAttribute { member, kind }` removes the binding. The identity library
+checks membership, signatures, verifier authority, and value uniqueness within
+each kind. A bind requires the member's signature plus the club chair or an
+active verifier authorized for that kind; unbinding requires the member or
+recovery authorization. `league::validate_game_profile` defines the game format:
+exactly 32 lowercase hexadecimal digits, without UUID separators. The identity
+bridge accepts only this kind and valid values for its configured club; its
+membership evidence remains `institutional_email`.
+
+The host selects `node::attribute_session(league::GAME_PROFILE)`. Trusted game
+sessions require the binding and close when it changes or is removed; other
+identity checks still apply. Admission claims carry `TrustAdmission.attributes`.
+Native and room connections validate the game attribute and compare it with the
+actual Minecraft login UUID before forwarding. Scoring exposes only valid game
+profiles, and activity processing checks the same attribute against witnessed
+play. Format validation belongs to these game consumers; the identity core accepts
+generic attribute values. Existing signed identity logs require a separate
+migration to the new action schema.
+
 ## Protocol namespace
 
 The required `node.namespace` object configures transport, discovery, service

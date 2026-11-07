@@ -249,14 +249,17 @@ class Acceptance:
         self.complete_registration()
 
     def complete_registration(self):
+        self.trust({'type': 'bind_attribute', 'member': 'operator', 'club': CLUB,
+                    'kind': self.invoke('game-profile-kind'),
+                    'value': uuid.uuid5(uuid.UUID(self.service), 'operator:game-profile').hex}, ['operator'])
         self.trust({'type': 'grant_permission', 'id': self.host_write_permission_id, 'member': 'host',
                     'service': 'application', 'permission': 'write'}, ['operator'])
         for member in ['alice', 'bob']:
             self.trust({'type': 'confirm_member', 'member': member, 'club': CLUB,
                         'device': self.ids[member], 'evidence': 'isolated_test_identity',
                         'verifier': None}, ['operator', member])
-            self.trust({'type': 'bind_game_profile', 'member': member, 'club': CLUB,
-                        'profile': self.profiles[member]['id']}, ['operator', member])
+            self.trust({'type': 'bind_attribute', 'member': member, 'club': CLUB,
+                        'kind': self.invoke('game-profile-kind'), 'value': self.profiles[member]['id']}, ['operator', member])
             permission_id = str(uuid.uuid5(uuid.UUID(self.service), member + ':application:write'))
             self.trust({'type': 'grant_permission', 'id': permission_id, 'member': member,
                         'service': 'application', 'permission': 'write'}, ['operator'])

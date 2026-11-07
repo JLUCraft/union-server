@@ -395,9 +395,10 @@ async fn bridge(
         .context("verified member claims required")?;
     let admission = serde_json::from_slice::<node::protocol::TrustAdmission>(claims)?;
     let verified_profile = admission
-        .game_profile
-        .as_deref()
+        .attributes
+        .get(league::GAME_PROFILE)
         .context("member has no verified game profile")?;
+    league::validate_game_profile(verified_profile)?;
     let service = session.service.to_string();
     let mut witness = None;
     let mut client = session.stream.compat();
@@ -427,7 +428,7 @@ async fn bridge(
             let profile = uuid::Uuid::from_slice(fields.bytes(16)?)?;
             fields.finish()?;
             ensure!(
-                profile.simple().to_string() == verified_profile,
+                &profile.simple().to_string() == verified_profile,
                 "login UUID differs from verified credential"
             );
             tracing::info!(member = %admission.member, device = %session.peer, profile = %profile, display_name = %name, "verified room identity forwarding");

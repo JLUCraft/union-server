@@ -3,8 +3,9 @@ use crate::{ai_worker, ops, rooms};
 use anyhow::{Context, Result, ensure};
 use authority::authority::Authority;
 use authority::journal::Journal;
+use league::GAME_PROFILE;
 use node::{
-    AccessPolicy, Identity, Node, NodeConfig, PeerId, Service, ServiceId, game_profile_session,
+    AccessPolicy, Identity, Node, NodeConfig, PeerId, Service, ServiceId, attribute_session,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -352,7 +353,7 @@ impl Config {
             relay: self.services.relay.config(),
             discovery_server: self.services.directory,
             lan_discovery: self.node.lan_discovery,
-            session_policy: Some(Arc::new(game_profile_session)),
+            session_policy: Some(attribute_session(GAME_PROFILE)),
             ..NodeConfig::new(self.node.namespace.clone())
         };
         if !self.node.listen.is_empty() {
@@ -1085,7 +1086,45 @@ mod tests {
                 "key": "unused.key"
             }
         }))?;
-        assert!(config.network()?.session_policy.is_some());
+        let policy = config.network()?.session_policy.context("missing policy")?;
+        let member = Identity::generate();
+        let mut ids = crate::test_identity::Identities::new(&[(&member, "player", "a")], "player");
+        let root = ids.root("a");
+        assert_eq!(policy(ids.log.state(), "player"), None);
+        ids.append(
+            node::protocol::TrustAction::BindAttribute {
+                member: "player".into(),
+                club: "a".into(),
+                kind: "other".into(),
+                value: "unrelated".into(),
+            },
+            &[&root, &member],
+        );
+        assert_eq!(policy(ids.log.state(), "player"), None);
+        for value in ["0".repeat(32), "f".repeat(32)] {
+            ids.append(
+                node::protocol::TrustAction::BindAttribute {
+                    member: "player".into(),
+                    club: "a".into(),
+                    kind: GAME_PROFILE.into(),
+                    value: value.clone(),
+                },
+                &[&root, &member],
+            );
+            assert_eq!(policy(ids.log.state(), "player"), Some(value));
+        }
+        ids.append(
+            node::protocol::TrustAction::UnbindAttribute {
+                member: "player".into(),
+                kind: GAME_PROFILE.into(),
+            },
+            &[&member],
+        );
+        assert_eq!(policy(ids.log.state(), "player"), None);
+        assert_eq!(
+            ids.log.state().attribute("player", "other"),
+            Some("unrelated")
+        );
         Ok(())
     }
 }
