@@ -399,7 +399,7 @@ mod tests {
         let executor = Identity::generate();
         let other = Identity::generate();
         let genesis = TrustGenesis {
-            namespace: node::protocol::Namespace::jlucraft(),
+            namespace: node::protocol::Namespace::builtin(),
             quorum: 1,
             founders: vec![TrustFounder {
                 member: "chair".into(),
@@ -419,7 +419,7 @@ mod tests {
         client::trust::sign_with_namespace(
             &mut record,
             &chair,
-            &node::protocol::Namespace::jlucraft(),
+            &node::protocol::Namespace::builtin(),
         )
         .unwrap();
         assert!(
@@ -448,7 +448,7 @@ mod tests {
         client::trust::sign_with_namespace(
             &mut registration,
             &chair,
-            &node::protocol::Namespace::jlucraft(),
+            &node::protocol::Namespace::builtin(),
         )
         .unwrap();
         assert!(
@@ -472,7 +472,7 @@ mod tests {
         client::trust::sign_with_namespace(
             &mut grant,
             &chair,
-            &node::protocol::Namespace::jlucraft(),
+            &node::protocol::Namespace::builtin(),
         )
         .unwrap();
         assert!(sign_possession(&executor, &genesis, grant, PossessionProof::Device).is_err());
@@ -494,7 +494,7 @@ mod tests {
         let journal = authority::journal::Journal::open_with_namespace(
             dir.path().join("journal"),
             state,
-            node::protocol::Namespace::jlucraft(),
+            node::protocol::Namespace::builtin(),
         )
         .unwrap();
         assert_eq!(pin, journal.genesis_hash());

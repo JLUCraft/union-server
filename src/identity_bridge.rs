@@ -237,7 +237,7 @@ mod tests {
     fn setup(dir: &Path) -> (Config, TrustGenesis) {
         let founder = node::Identity::generate();
         let config = Config {
-            namespace: node::protocol::Namespace::jlucraft(),
+            namespace: node::protocol::Namespace::builtin(),
             bind: "127.0.0.1:0".parse().unwrap(),
             key: dir.join("issuer.key"),
             token: dir.join("token.json"),
@@ -248,7 +248,7 @@ mod tests {
             verifier: "skin".into(),
         };
         let genesis = TrustGenesis {
-            namespace: node::protocol::Namespace::jlucraft(),
+            namespace: node::protocol::Namespace::builtin(),
             quorum: 1,
             founders: vec![node::protocol::TrustFounder {
                 member: "chair".into(),

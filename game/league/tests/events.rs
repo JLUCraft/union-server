@@ -17,18 +17,18 @@ async fn events_invalidate_snapshots_and_reject_outsiders() -> Result<(), Box<dy
     let journal = Arc::new(Mutex::new(Journal::open_with_namespace(
         dir.path().join("journal"),
         identities.genesis(),
-        node::protocol::Namespace::jlucraft(),
+        node::protocol::Namespace::builtin(),
     )?));
     let host = Arc::new(
         Node::start(
             Identity::generate(),
-            NodeConfig::new(node::protocol::Namespace::jlucraft()),
+            NodeConfig::new(node::protocol::Namespace::builtin()),
         )
         .await?,
     );
     let client = Node::start(
         identity.clone(),
-        NodeConfig::new(node::protocol::Namespace::jlucraft()),
+        NodeConfig::new(node::protocol::Namespace::builtin()),
     )
     .await?;
     client.dial(host.addresses()[0].clone()).await?;
@@ -64,7 +64,7 @@ async fn events_invalidate_snapshots_and_reject_outsiders() -> Result<(), Box<dy
                 },
             },
         },
-        &node::protocol::Namespace::jlucraft(),
+        &node::protocol::Namespace::builtin(),
     )?;
     j.execute(command, current.history_since(None)?, current.state(), 10)?;
     drop(j);
@@ -80,7 +80,7 @@ async fn events_invalidate_snapshots_and_reject_outsiders() -> Result<(), Box<dy
     .await??;
     let outsider = Node::start(
         Identity::generate(),
-        NodeConfig::new(node::protocol::Namespace::jlucraft()),
+        NodeConfig::new(node::protocol::Namespace::builtin()),
     )
     .await?;
     outsider.dial(host.addresses()[0].clone()).await?;

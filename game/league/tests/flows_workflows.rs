@@ -234,7 +234,7 @@ fn ai_receipts_pin_inputs_reject_duplicates_and_replay_without_inference() {
     let replay = Journal::<Office>::open_with_namespace(
         &h.path,
         h.genesis,
-        node::protocol::Namespace::jlucraft(),
+        node::protocol::Namespace::builtin(),
     )
     .unwrap();
     assert_eq!(replay.state(), &state);
@@ -308,7 +308,7 @@ impl Harness {
         let journal = Journal::open_with_namespace(
             &path,
             genesis.clone(),
-            node::protocol::Namespace::jlucraft(),
+            node::protocol::Namespace::builtin(),
         )
         .unwrap();
         let mut h = Self {
@@ -501,7 +501,7 @@ fn multistage_authorization_execution_and_signed_replay() {
     let restored = Journal::<Office>::open_with_namespace(
         &h.path,
         h.genesis,
-        node::protocol::Namespace::jlucraft(),
+        node::protocol::Namespace::builtin(),
     )
     .unwrap();
     assert_eq!(expected, serde_json::to_vec(restored.state()).unwrap());
@@ -906,7 +906,7 @@ fn review_decisions_control_execution_and_survive_replay() {
             Journal::<Office>::open_with_namespace(
                 &h.path,
                 h.genesis,
-                node::protocol::Namespace::jlucraft()
+                node::protocol::Namespace::builtin()
             )
             .unwrap()
             .state(),
@@ -1139,7 +1139,7 @@ fn default_president_approval_revises_and_restarts_without_templates() {
         Journal::<Office>::open_with_namespace(
             &h.path,
             h.genesis,
-            node::protocol::Namespace::jlucraft()
+            node::protocol::Namespace::builtin()
         )
         .unwrap()
         .state(),

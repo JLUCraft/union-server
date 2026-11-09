@@ -64,9 +64,13 @@ The MCP relay and workflow clients inherit the host namespace. A custom
 organization selects `x-<organization>-envelope` and `<organization>-control`.
 The standalone identity bridge also requires an explicit namespace. Exported
 identity client settings always include it. `jlucraft-agent` accepts
-`--organization` and `--protocol-version`; its explicit JLUCraft defaults retain
-signing version 1 when the wire version changes. Acceptance terminal node
-arguments require both namespace flags.
+`--organization` and `--protocol-version`; its default organization comes from
+the compile-time variable `UNION_ORGANIZATION` (default: `jlucraft`), with wire
+and signing versions defaulting to 1. Signing version remains 1 when the wire
+version changes. FollyLauncher must be built with `UNION_ORGANIZATION` matching
+this server's configured `node.namespace.organization`; otherwise, handshake
+protocol names will not match. Acceptance terminal node arguments require both
+namespace flags.
 
 ## Network operations
 

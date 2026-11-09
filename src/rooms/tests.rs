@@ -43,12 +43,12 @@ async fn managed_room_publishes_after_readiness_and_withdraws_on_stop() -> Resul
         let host_identity = Identity::generate();
         let identities=crate::test_identity::Identities::new(&[(&host_identity,"host","a")],"host");
         let view=identities.log.view(Duration::from_secs(60))?;
-        let mut host = Node::start(host_identity, NodeConfig::new(node::protocol::Namespace::jlucraft())).await?;
+        let mut host = Node::start(host_identity, NodeConfig::new(node::protocol::Namespace::builtin())).await?;
         let incoming=host.take_incoming()?;
         let host=Arc::new(host);
         let peer = host.peer_id();
         let address = host.addresses()[0].clone();
-        let client = Node::start(Identity::generate(), NodeConfig::new(node::protocol::Namespace::jlucraft())).await?;
+        let client = Node::start(Identity::generate(), NodeConfig::new(node::protocol::Namespace::builtin())).await?;
         client.dial(address).await?;
         assert!(client.list_services(peer).await?.is_empty());
         let key = dir.path().join("forwarding.key");
@@ -83,7 +83,7 @@ async fn unified_members_from_two_clubs_join_over_relay_without_qualification_ex
         let roots = [Identity::generate(), Identity::generate()];
         let users = [Identity::generate(), Identity::generate()];
         let genesis = TrustGenesis {
-            namespace: node::protocol::Namespace::jlucraft(),
+            namespace: node::protocol::Namespace::builtin(),
             quorum: 2,
             founders: roots
                 .iter()
@@ -101,7 +101,7 @@ async fn unified_members_from_two_clubs_join_over_relay_without_qualification_ex
             &directory.path().join("identity.jsonl"),
             &genesis,
             &pin,
-            node::protocol::Namespace::jlucraft(),
+            node::protocol::Namespace::builtin(),
         )?;
         for (i, user) in users.iter().enumerate() {
             for action in [
@@ -123,12 +123,12 @@ async fn unified_members_from_two_clubs_join_over_relay_without_qualification_ex
                 identity::trust::sign_with_namespace(
                     &mut record,
                     &roots[i],
-                    &node::protocol::Namespace::jlucraft(),
+                    &node::protocol::Namespace::builtin(),
                 )?;
                 identity::trust::sign_with_namespace(
                     &mut record,
                     user,
-                    &node::protocol::Namespace::jlucraft(),
+                    &node::protocol::Namespace::builtin(),
                 )?;
                 log.append(record)?;
             }
@@ -140,7 +140,7 @@ async fn unified_members_from_two_clubs_join_over_relay_without_qualification_ex
             NodeConfig {
                 listen: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse()?],
                 relay: Some(RelayConfig::default()),
-                ..NodeConfig::new(node::protocol::Namespace::jlucraft())
+                ..NodeConfig::new(node::protocol::Namespace::builtin())
             },
         )
         .await
@@ -155,7 +155,7 @@ async fn unified_members_from_two_clubs_join_over_relay_without_qualification_ex
                     user,
                     NodeConfig {
                         hole_punching: false,
-                        ..NodeConfig::new(node::protocol::Namespace::jlucraft())
+                        ..NodeConfig::new(node::protocol::Namespace::builtin())
                     },
                 )
                 .await
@@ -355,7 +355,7 @@ async fn unified_members_from_two_clubs_join_over_relay_without_qualification_ex
         identity::trust::sign_with_namespace(
             &mut revoke,
             &roots[0],
-            &node::protocol::Namespace::jlucraft(),
+            &node::protocol::Namespace::builtin(),
         )?;
         log.append(revoke)?;
         assert!(

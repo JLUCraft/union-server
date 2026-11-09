@@ -676,7 +676,7 @@ mod tests {
                             digest: mcp::request_digest(&request).unwrap(),
                         },
                         &self.signer,
-                        &node::protocol::Namespace::jlucraft(),
+                        &node::protocol::Namespace::builtin(),
                     )
                     .unwrap(),
                     tool: tool.into(),
@@ -868,7 +868,7 @@ mod tests {
                 request: &mcp::canonical_request(&delegation.tool, delegation.arguments.as_ref()),
                 replay_cache: &gateway_cache,
             },
-            &node::protocol::Namespace::jlucraft(),
+            &node::protocol::Namespace::builtin(),
         )?;
         assert_eq!(
             fixture.authorize(&request, &ReplayCache::default())?,
@@ -1015,7 +1015,7 @@ mod tests {
             *envelope = mcp::sign_with_namespace(
                 claims.clone(),
                 &fixture.signer,
-                &node::protocol::Namespace::jlucraft(),
+                &node::protocol::Namespace::builtin(),
             )?;
             assert_code(
                 fixture.authorize(&changed, &cache),
@@ -1203,7 +1203,7 @@ mod tests {
             )?;
             let mut host = Node::start(
                 fixture_identity.host.clone(),
-                NodeConfig::new(node::protocol::Namespace::jlucraft()),
+                NodeConfig::new(node::protocol::Namespace::builtin()),
             )
             .await?;
             let incoming = host.take_incoming()?;
@@ -1222,12 +1222,12 @@ mod tests {
             .await?;
             let relay = Node::start(
                 fixture_identity.relay.clone(),
-                NodeConfig::new(node::protocol::Namespace::jlucraft()),
+                NodeConfig::new(node::protocol::Namespace::builtin()),
             )
             .await?;
             let signer = Node::start(
                 fixture_identity.signer.clone(),
-                NodeConfig::new(node::protocol::Namespace::jlucraft()),
+                NodeConfig::new(node::protocol::Namespace::builtin()),
             )
             .await?;
             relay.dial(host.addresses()[0].clone()).await?;
@@ -1275,7 +1275,7 @@ mod tests {
             *envelope = identity::mcp_envelope::sign_with_namespace(
                 envelope.claims.clone(),
                 &fixture_identity.signer,
-                &node::protocol::Namespace::jlucraft(),
+                &node::protocol::Namespace::builtin(),
             )?;
             assert_eq!(
                 client::ops::execute(&signer, host.peer_id(), service, &denied)
@@ -1482,7 +1482,7 @@ mod tests {
             })?);
             let mut host = Node::start(
                 host_key.clone(),
-                NodeConfig::new(node::protocol::Namespace::jlucraft()),
+                NodeConfig::new(node::protocol::Namespace::builtin()),
             )
             .await?;
             let incoming = host.take_incoming()?;
@@ -1509,7 +1509,7 @@ mod tests {
             })
             .await?;
             let client =
-                Node::start(user, NodeConfig::new(node::protocol::Namespace::jlucraft())).await?;
+                Node::start(user, NodeConfig::new(node::protocol::Namespace::builtin())).await?;
             client.dial(host.addresses()[0].clone()).await?;
             let mut tasks = JoinSet::new();
             let host = Arc::new(host);
@@ -1578,7 +1578,7 @@ mod tests {
             );
             let read_only = Node::start(
                 reader,
-                NodeConfig::new(node::protocol::Namespace::jlucraft()),
+                NodeConfig::new(node::protocol::Namespace::builtin()),
             )
             .await?;
             read_only.dial(host.addresses()[0].clone()).await?;

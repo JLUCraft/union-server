@@ -18,7 +18,7 @@ impl Cache {
             &self.log,
             &read(&self.genesis)?,
             &self.genesis_hash,
-            node::protocol::Namespace::jlucraft(),
+            node::protocol::Namespace::builtin(),
         )?)
     }
 }
@@ -41,7 +41,7 @@ impl Target {
         );
         let node = node::Node::start(
             node::Identity::load(&self.key)?,
-            node::NodeConfig::new(node::protocol::Namespace::jlucraft()),
+            node::NodeConfig::new(node::protocol::Namespace::builtin()),
         )
         .await?;
         if let Err(error) = node.dial(address).await {
@@ -147,7 +147,7 @@ pub async fn execute(command: Command) -> Result<()> {
             client::trust::sign_with_namespace(
                 &mut record,
                 &node::Identity::load(key)?,
-                &node::protocol::Namespace::jlucraft(),
+                &node::protocol::Namespace::builtin(),
             )?;
             crate::write_json(&out, &record)?;
         }

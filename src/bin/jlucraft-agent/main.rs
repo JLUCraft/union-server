@@ -15,9 +15,9 @@ use std::{
 #[derive(Parser)]
 #[command(name = "jlucraft-agent", about = "Sign locally with an agent identity")]
 struct Cli {
-    #[arg(long, global = true, default_value_t = node::protocol::Namespace::jlucraft().organization)]
+    #[arg(long, global = true, default_value_t = node::protocol::Namespace::builtin().organization)]
     organization: String,
-    #[arg(long, global = true, default_value_t = node::protocol::Namespace::jlucraft().wire_version)]
+    #[arg(long, global = true, default_value_t = node::protocol::Namespace::builtin().wire_version)]
     protocol_version: u32,
     #[command(subcommand)]
     command: Operation,
@@ -100,7 +100,7 @@ fn read_json<T: DeserializeOwned>(input: &str, kind: &str) -> Result<T> {
 
 #[cfg(test)]
 fn run(command: Operation) -> Result<Value> {
-    run_with_namespace(command, &node::protocol::Namespace::jlucraft())
+    run_with_namespace(command, &node::protocol::Namespace::builtin())
 }
 
 fn run_with_namespace(command: Operation, namespace: &node::protocol::Namespace) -> Result<Value> {

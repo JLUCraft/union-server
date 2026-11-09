@@ -247,7 +247,7 @@ async fn application_commands_share_one_journal_and_revocation() -> Result {
         }}))?;
         let host = Host::start(Config::load(&path, Some(&root))?).await?;
         let status = host.status()?;
-        let node = Node::start(member.clone(),NodeConfig::new(node::protocol::Namespace::jlucraft())).await?;
+        let node = Node::start(member.clone(),NodeConfig::new(node::protocol::Namespace::builtin())).await?;
         node.dial(status.addresses[0].parse()?).await?;
         let services = node.list_services(host_key.peer_id()).await?;
         assert_eq!(services.len(),1);
@@ -257,13 +257,13 @@ async fn application_commands_share_one_journal_and_revocation() -> Result {
         },&cache).await?;
         let snapshot = league::files::snapshot(&node,host_key.peer_id(),&pin).await?;
         assert_eq!(snapshot.domain.inner.files.read(&cid)?,b"shared application");
-        let admin_node=Node::start(admin.clone(),NodeConfig::new(node::protocol::Namespace::jlucraft())).await?;
+        let admin_node=Node::start(admin.clone(),NodeConfig::new(node::protocol::Namespace::builtin())).await?;
         admin_node.dial(status.addresses[0].parse()?).await?;
         let mut profile = cache.state().draft(node::protocol::TrustAction::BindAttribute {
             member: "chair".into(), club: "school".into(), kind: league::GAME_PROFILE.into(),
             value: "fedcba9876543210fedcba9876543210".into(),
         });
-        client::trust::sign_with_namespace(&mut profile, &admin, &node::protocol::Namespace::jlucraft())?;
+        client::trust::sign_with_namespace(&mut profile, &admin, &node::protocol::Namespace::builtin())?;
         let response = client::trust::request(&admin_node, host_key.peer_id(), node::protocol::TrustRequest::Append { record: profile.clone() }).await?;
         assert!(response.error.is_none(), "{:?}", response.error);
         cache.append(profile)?;
@@ -286,7 +286,7 @@ async fn application_commands_share_one_journal_and_revocation() -> Result {
         assert!(response.ok && response.instances.is_empty());
         let mut stream=node.open_service(host_key.peer_id(),operations).await?;
         let mut record=cache.state().draft(node::protocol::TrustAction::RevokeDevice{member:"alice".into(),device:member.peer_id().to_string()});
-        client::trust::sign_with_namespace(&mut record,&admin, &node::protocol::Namespace::jlucraft())?;
+        client::trust::sign_with_namespace(&mut record,&admin, &node::protocol::Namespace::builtin())?;
         let response=client::trust::request(&admin_node,host_key.peer_id(),node::protocol::TrustRequest::Append{record}).await?;
         assert!(response.error.is_none(),"{:?}",response.error);
         assert!(node.open_service(host_key.peer_id(),operations).await.is_err());
@@ -295,7 +295,7 @@ async fn application_commands_share_one_journal_and_revocation() -> Result {
         admin_node.shutdown().await?;
         node.shutdown().await?;
         host.close().await?;
-        let replay = authority::journal::Journal::<Application>::open_with_namespace(dir.path().join("journal"),genesis, node::protocol::Namespace::jlucraft())?;
+        let replay = authority::journal::Journal::<Application>::open_with_namespace(dir.path().join("journal"),genesis, node::protocol::Namespace::builtin())?;
         assert_eq!(replay.state().domain.inner.files.read(&cid)?,b"shared application");
         assert!(replay.state().domain.events.contains_key("activity"));
         assert!(replay.state().domain.leagues.contains_key("competition"));
@@ -326,7 +326,7 @@ async fn failed_start_and_dropped_host_release_governance_ownership() -> Result 
     drop(authority::journal::Journal::open_with_namespace(
         dir.path().join("journal"),
         genesis.clone(),
-        node::protocol::Namespace::jlucraft(),
+        node::protocol::Namespace::builtin(),
     )?);
     value["services"]
         .as_object_mut()
@@ -340,7 +340,7 @@ async fn failed_start_and_dropped_host_release_governance_ownership() -> Result 
             if authority::journal::Journal::open_with_namespace(
                 dir.path().join("journal"),
                 genesis.clone(),
-                node::protocol::Namespace::jlucraft(),
+                node::protocol::Namespace::builtin(),
             )
             .is_ok()
             {
@@ -366,7 +366,7 @@ fn setup_identity(
 )> {
     use node::protocol::{TrustAction as A, TrustBusinessBinding, TrustFounder, TrustGenesis};
     let genesis = TrustGenesis {
-        namespace: node::protocol::Namespace::jlucraft(),
+        namespace: node::protocol::Namespace::builtin(),
         quorum: 1,
         founders: vec![TrustFounder {
             member: "chair".into(),
@@ -380,7 +380,7 @@ fn setup_identity(
         &dir.join("identity.jsonl"),
         &genesis,
         &pin,
-        node::protocol::Namespace::jlucraft(),
+        node::protocol::Namespace::builtin(),
     )?;
     let mut actions = vec![
         A::RegisterService {
@@ -443,7 +443,7 @@ fn setup_identity(
                 client::trust::sign_with_namespace(
                     &mut record,
                     key,
-                    &node::protocol::Namespace::jlucraft(),
+                    &node::protocol::Namespace::builtin(),
                 )?;
             }
         }
@@ -453,7 +453,7 @@ fn setup_identity(
         &dir.join("cache.jsonl"),
         &genesis,
         &pin,
-        node::protocol::Namespace::jlucraft(),
+        node::protocol::Namespace::builtin(),
     )?;
     for record in log.history_since(None)?.records {
         cache.append(record)?;
@@ -496,7 +496,7 @@ async fn document_terminal_download_checks_hash_and_live_read_permission() -> Re
     let host = Host::start(Config::load(&path, Some(&root))?).await?;
     let status = host.status()?;
     let input = || client::documents::Input {
-        namespace: node::protocol::Namespace::jlucraft(),
+        namespace: node::protocol::Namespace::builtin(),
         address: status.addresses[0].clone(),
         peer: status.peer.clone(),
         service: documents.to_string(),
@@ -510,7 +510,7 @@ async fn document_terminal_download_checks_hash_and_live_read_permission() -> Re
     );
     let node = Node::start(
         admin.clone(),
-        NodeConfig::new(node::protocol::Namespace::jlucraft()),
+        NodeConfig::new(node::protocol::Namespace::builtin()),
     )
     .await?;
     node.dial(status.addresses[0].parse()?).await?;
@@ -520,7 +520,7 @@ async fn document_terminal_download_checks_hash_and_live_read_permission() -> Re
         service: documents.to_string(),
         permission: "read".into(),
     });
-    client::trust::sign_with_namespace(&mut grant, &admin, &node::protocol::Namespace::jlucraft())?;
+    client::trust::sign_with_namespace(&mut grant, &admin, &node::protocol::Namespace::builtin())?;
     let response = client::trust::request(
         &node,
         host_key.peer_id(),
@@ -545,11 +545,7 @@ async fn document_terminal_download_checks_hash_and_live_read_permission() -> Re
     let mut revoke = cache.state().draft(TrustAction::RevokePermission {
         id: "doc-read".into(),
     });
-    client::trust::sign_with_namespace(
-        &mut revoke,
-        &admin,
-        &node::protocol::Namespace::jlucraft(),
-    )?;
+    client::trust::sign_with_namespace(&mut revoke, &admin, &node::protocol::Namespace::builtin())?;
     assert!(
         client::trust::request(
             &node,
@@ -577,10 +573,7 @@ fn namespace_configuration_requires_explicit_namespace_and_rejects_invalid_compo
         .to_string();
     assert!(error.contains("missing field `namespace`"), "{error}");
     let default: Config = serde_json::from_value(baseline.clone())?;
-    assert_eq!(
-        default.node.namespace,
-        node::protocol::Namespace::jlucraft()
-    );
+    assert_eq!(default.node.namespace, node::protocol::Namespace::builtin());
     default.validate()?;
     let mut custom = baseline;
     custom["node"]["namespace"] = json!({"organization":"acme", "version":2});

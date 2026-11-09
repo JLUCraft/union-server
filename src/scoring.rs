@@ -184,7 +184,7 @@ mod tests {
         let mut journal = Journal::open_with_namespace(
             directory.path().join("journal"),
             ids.genesis(),
-            node::protocol::Namespace::jlucraft(),
+            node::protocol::Namespace::builtin(),
         )?;
         let now = now_ms()?;
         for action in [
@@ -281,7 +281,7 @@ mod tests {
         let mut journal = Journal::open_with_namespace(
             directory.path().join("journal"),
             ids.genesis(),
-            node::protocol::Namespace::jlucraft(),
+            node::protocol::Namespace::builtin(),
         )?;
         let now = now_ms()?;
         for action in [

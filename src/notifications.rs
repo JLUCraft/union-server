@@ -622,7 +622,7 @@ mod tests {
                 authority::journal::Journal::open_with_namespace(
                     dir.path().join("office"),
                     genesis.clone(),
-                    node::protocol::Namespace::jlucraft(),
+                    node::protocol::Namespace::builtin(),
                 )?,
             )),
             view: identities.log.view(Duration::from_secs(60))?,
@@ -692,7 +692,7 @@ mod tests {
         let replay = authority::journal::Journal::<Office>::open_with_namespace(
             dir.path().join("office"),
             genesis,
-            node::protocol::Namespace::jlucraft(),
+            node::protocol::Namespace::builtin(),
         )?;
         assert_eq!(replay.state(), &current);
         Ok(())

@@ -600,7 +600,7 @@ mod tests {
         let journal = Journal::open_with_namespace(
             directory.path().join("application"),
             genesis,
-            node::protocol::Namespace::jlucraft(),
+            node::protocol::Namespace::builtin(),
         )?;
         let pin = journal.genesis_hash().to_owned();
         let authority = Authority::Local {

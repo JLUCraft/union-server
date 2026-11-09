@@ -32,13 +32,13 @@ async fn snapshot_exceeds_single_frame_and_rejects_out_of_order_chunks()
         let journal = Arc::new(Mutex::new(Journal::open_with_namespace(
             dir.path().join("journal"),
             state.clone(),
-            node::protocol::Namespace::jlucraft(),
+            node::protocol::Namespace::builtin(),
         )?));
         let genesis_hash = journal.lock().await.genesis_hash().to_owned();
         let host = Arc::new(
             Node::start(
                 Identity::generate(),
-                NodeConfig::new(node::protocol::Namespace::jlucraft()),
+                NodeConfig::new(node::protocol::Namespace::builtin()),
             )
             .await?,
         );
@@ -47,11 +47,8 @@ async fn snapshot_exceeds_single_frame_and_rejects_out_of_order_chunks()
             tokio::spawn(
                 async move { journal::serve(&server, journal, view, journal::PROTOCOL).await },
             );
-        let client = Node::start(
-            admin,
-            NodeConfig::new(node::protocol::Namespace::jlucraft()),
-        )
-        .await?;
+        let client =
+            Node::start(admin, NodeConfig::new(node::protocol::Namespace::builtin())).await?;
         client.dial(host.addresses()[0].clone()).await?;
         let response = journal::request::<league::application::Application>(
             &client,
@@ -73,7 +70,7 @@ async fn snapshot_exceeds_single_frame_and_rejects_out_of_order_chunks()
         assert!(missing.verify(&genesis_hash).is_err());
         let rogue = Node::start(
             Identity::generate(),
-            NodeConfig::new(node::protocol::Namespace::jlucraft()),
+            NodeConfig::new(node::protocol::Namespace::builtin()),
         )
         .await?;
         let mut incoming = rogue.accept_protocol(journal::PROTOCOL)?;

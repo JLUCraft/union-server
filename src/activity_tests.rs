@@ -50,7 +50,7 @@ impl Fixture {
             &directory.path().join("identity"),
             identities.log.genesis(),
             &identities.binding.genesis,
-            node::protocol::Namespace::jlucraft(),
+            node::protocol::Namespace::builtin(),
         )?;
         for record in identities.log.history_since(None)?.records {
             log.append(record)?;
@@ -60,7 +60,7 @@ impl Fixture {
         let journal = Journal::open_with_namespace(
             directory.path().join("application"),
             genesis.clone(),
-            node::protocol::Namespace::jlucraft(),
+            node::protocol::Namespace::builtin(),
         )?;
         let authority = Authority::Local {
             journal: Arc::new(tokio::sync::Mutex::new(journal)),
@@ -742,7 +742,7 @@ async fn witnessed_play_mints_then_a_normal_member_funds_local_inference_settles
         let replay = Journal::<Application>::open_with_namespace(
             path,
             genesis,
-            node::protocol::Namespace::jlucraft(),
+            node::protocol::Namespace::builtin(),
         )?;
         assert_eq!(replay.state(), &stored);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -832,7 +832,7 @@ async fn an_assigned_provider_executes_from_a_follower_replica() -> Result<()> {
             nodes.push(Arc::new(
                 node::Node::start(
                     Identity::generate(),
-                    node::NodeConfig::new(node::protocol::Namespace::jlucraft()),
+                    node::NodeConfig::new(node::protocol::Namespace::builtin()),
                 )
                 .await?,
             ));

@@ -322,7 +322,7 @@ pub async fn serve_with_namespace(
 
 #[cfg(test)]
 async fn serve_with_listener(config: Config, listener: tokio::net::TcpListener) -> Result<()> {
-    serve_with_listener_and_namespace(config, listener, node::protocol::Namespace::jlucraft()).await
+    serve_with_listener_and_namespace(config, listener, node::protocol::Namespace::builtin()).await
 }
 
 async fn serve_with_listener_and_namespace(
@@ -1077,7 +1077,7 @@ mod tests {
                 digest: envelope::request_digest(&request_commitment(request).unwrap()).unwrap(),
             },
             signer,
-            &node::protocol::Namespace::jlucraft(),
+            &node::protocol::Namespace::builtin(),
         )
         .unwrap()
     }
@@ -1150,7 +1150,7 @@ mod tests {
             }]);
             let operations = Arc::new(BTreeMap::from([("ops".into(), target)]));
             let config = gateway_config(
-                node::protocol::Namespace::jlucraft(),
+                node::protocol::Namespace::builtin(),
                 relay.peer_id().to_string(),
                 &principals,
                 &operations,
@@ -1245,7 +1245,7 @@ mod tests {
                         envelope::sign_with_namespace(
                             claims,
                             &fixture.signer,
-                            &node::protocol::Namespace::jlucraft()
+                            &node::protocol::Namespace::builtin()
                         )
                         .unwrap(),
                         &serde_json::to_vec(&body).unwrap(),
@@ -1351,7 +1351,7 @@ mod tests {
             let bad = envelope::sign_with_namespace(
                 claims,
                 &fixture.signer,
-                &node::protocol::Namespace::jlucraft(),
+                &node::protocol::Namespace::builtin(),
             )
             .unwrap();
             assert_eq!(
@@ -1423,7 +1423,7 @@ mod tests {
                 let bad = envelope::sign_with_namespace(
                     claims,
                     &fixture.signer,
-                    &node::protocol::Namespace::jlucraft(),
+                    &node::protocol::Namespace::builtin(),
                 )
                 .unwrap();
                 assert_eq!(
@@ -1512,7 +1512,7 @@ mod tests {
             let wrong = envelope::sign_with_namespace(
                 claims,
                 &fixture.signer,
-                &node::protocol::Namespace::jlucraft(),
+                &node::protocol::Namespace::builtin(),
             )
             .unwrap();
             assert_eq!(
@@ -1528,7 +1528,7 @@ mod tests {
             let correct = envelope::sign_with_namespace(
                 correct,
                 &fixture.signer,
-                &node::protocol::Namespace::jlucraft(),
+                &node::protocol::Namespace::builtin(),
             )
             .unwrap();
             authenticate_request(&fixture.auth, http_request(&correct, &body))
@@ -1606,7 +1606,7 @@ mod tests {
                 ),
                 replay_cache: &ReplayCache::default(),
             },
-            &node::protocol::Namespace::jlucraft(),
+            &node::protocol::Namespace::builtin(),
         )
         .unwrap();
     }
@@ -1701,7 +1701,7 @@ mod tests {
                     ),
                     replay_cache: &ReplayCache::default(),
                 },
-                &node::protocol::Namespace::jlucraft(),
+                &node::protocol::Namespace::builtin(),
             )
             .unwrap();
         }
@@ -1928,7 +1928,7 @@ mod tests {
             })?);
             let mut host = node::Node::start(
                 host_key.clone(),
-                node::NodeConfig::new(node::protocol::Namespace::jlucraft()),
+                node::NodeConfig::new(node::protocol::Namespace::builtin()),
             )
             .await?;
             let incoming = host.take_incoming()?;
@@ -2122,7 +2122,7 @@ mod tests {
         let mut journal = Journal::<Application>::open_with_namespace(
             directory.path().join("journal"),
             ids.genesis(),
-            node::protocol::Namespace::jlucraft(),
+            node::protocol::Namespace::builtin(),
         )?;
         let target = Arc::make_mut(&mut auth.auth.principals)[0]
             .application
@@ -2161,7 +2161,7 @@ mod tests {
             snapshot,
             ids.log.state().checkpoint().clone(),
             host.peer_id(),
-            &node::protocol::Namespace::jlucraft(),
+            &node::protocol::Namespace::builtin(),
         );
         let context = result.structured_content.unwrap();
         assert_eq!(context["peer"], host.peer_id().to_string());
@@ -2192,7 +2192,7 @@ mod tests {
                     },
                 },
             },
-            &node::protocol::Namespace::jlucraft(),
+            &node::protocol::Namespace::builtin(),
         )?;
         let history = ids.log.history_since(None)?;
         let (_, arguments) = client::journal::mcp::request_tool(&Request::Execute {
@@ -2289,7 +2289,7 @@ mod tests {
                 &directory.path().join("identity"),
                 ids.log.genesis(),
                 &ids.binding.genesis,
-                node::protocol::Namespace::jlucraft(),
+                node::protocol::Namespace::builtin(),
             )?;
             for record in ids.log.history_since(None)?.records {
                 log.append(record)?;
@@ -2299,7 +2299,7 @@ mod tests {
             let journal = client::journal::Journal::open_with_namespace(
                 directory.path().join("journal"),
                 ids.genesis(),
-                node::protocol::Namespace::jlucraft(),
+                node::protocol::Namespace::builtin(),
             )?;
             let genesis_hash = journal.genesis_hash().to_owned();
             let log = Arc::new(tokio::sync::Mutex::new(log));
@@ -2307,7 +2307,7 @@ mod tests {
             let host = Arc::new(
                 node::Node::start(
                     host_key,
-                    node::NodeConfig::new(node::protocol::Namespace::jlucraft()),
+                    node::NodeConfig::new(node::protocol::Namespace::builtin()),
                 )
                 .await?,
             );
@@ -2426,7 +2426,7 @@ mod tests {
                                 },
                             },
                     },
-                    &node::protocol::Namespace::jlucraft(),
+                    &node::protocol::Namespace::builtin(),
                 )?;
             let base64 = base64::engine::general_purpose::STANDARD;
             self.call("application_submit", serde_json::json!({"command": {
@@ -2450,7 +2450,7 @@ mod tests {
             client::trust::sign_with_namespace(
                 &mut record,
                 &self.root,
-                &node::protocol::Namespace::jlucraft(),
+                &node::protocol::Namespace::builtin(),
             )?;
             self.call("identity_submit", serde_json::to_value(record)?)
                 .await
@@ -2487,7 +2487,7 @@ mod tests {
                 client::trust::sign_with_namespace(
                     &mut record,
                     &f.root,
-                    &node::protocol::Namespace::jlucraft(),
+                    &node::protocol::Namespace::builtin(),
                 )?;
                 log.append(record)?;
             }
@@ -2495,7 +2495,7 @@ mod tests {
         }
         let reader = node::Node::start(
             Identity::generate(),
-            node::NodeConfig::new(node::protocol::Namespace::jlucraft()),
+            node::NodeConfig::new(node::protocol::Namespace::builtin()),
         )
         .await?;
         let (address, peer) = client::endpoint(

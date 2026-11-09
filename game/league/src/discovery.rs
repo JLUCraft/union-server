@@ -179,7 +179,7 @@ mod tests {
             peer: Identity::generate().peer_id(),
             address: "/ip4/127.0.0.1/udp/40000/quic-v1".into(),
             genesis: TrustGenesis {
-                namespace: node::protocol::Namespace::jlucraft(),
+                namespace: node::protocol::Namespace::builtin(),
                 founders: Vec::new(),
                 quorum: 1,
             },
@@ -225,7 +225,7 @@ mod tests {
                         .parse()
                         .map_err(Error::protocol)?,
                 ],
-                ..node::NodeConfig::new(node::protocol::Namespace::jlucraft())
+                ..node::NodeConfig::new(node::protocol::Namespace::builtin())
             },
         )
         .await?;
@@ -235,7 +235,7 @@ mod tests {
         let found = probe_address(
             server.peer_id(),
             vec![unreachable, address.clone()],
-            node::protocol::Namespace::jlucraft(),
+            node::protocol::Namespace::builtin(),
         )
         .await;
         server.shutdown().await?;

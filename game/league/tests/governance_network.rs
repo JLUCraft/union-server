@@ -21,13 +21,13 @@ async fn governance_binds_signed_actor_to_authenticated_stream_and_rejects_repla
         let journal = Arc::new(Mutex::new(Journal::open_with_namespace(
             directory.path().join("journal"),
             identities.genesis(),
-            node::protocol::Namespace::jlucraft(),
+            node::protocol::Namespace::builtin(),
         )?));
         let genesis_hash = journal.lock().await.genesis_hash().to_owned();
         let server = Arc::new(
             Node::start(
                 Identity::generate(),
-                NodeConfig::new(node::protocol::Namespace::jlucraft()),
+                NodeConfig::new(node::protocol::Namespace::builtin()),
             )
             .await?,
         );
@@ -42,12 +42,12 @@ async fn governance_binds_signed_actor_to_authenticated_stream_and_rejects_repla
         tokio::task::yield_now().await;
         let client = Node::start(
             admin.clone(),
-            NodeConfig::new(node::protocol::Namespace::jlucraft()),
+            NodeConfig::new(node::protocol::Namespace::builtin()),
         )
         .await?;
         let stranger = Node::start(
             outsider,
-            NodeConfig::new(node::protocol::Namespace::jlucraft()),
+            NodeConfig::new(node::protocol::Namespace::builtin()),
         )
         .await?;
         client.dial(server.addresses()[0].clone()).await?;
@@ -79,7 +79,7 @@ async fn governance_binds_signed_actor_to_authenticated_stream_and_rejects_repla
                     },
                 },
             },
-            &node::protocol::Namespace::jlucraft(),
+            &node::protocol::Namespace::builtin(),
         )?;
         let history = identities.log.history_since(None)?;
         let wrong = journal::request::<league::application::Application>(

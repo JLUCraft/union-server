@@ -114,7 +114,7 @@ async fn room_host(
     let address = listener.local_addr()?;
     let mut node = Node::start(
         Identity::generate(),
-        NodeConfig::new(node::protocol::Namespace::jlucraft()),
+        NodeConfig::new(node::protocol::Namespace::builtin()),
     )
     .await?;
     let id = ServiceId::new();
@@ -246,7 +246,7 @@ async fn native_cross_node_transfer_substitution_and_returner_fencing() -> Resul
         let mut journal = Journal::open_with_namespace(
             dir.path().join("journal"),
             identities.genesis(),
-            node::protocol::Namespace::jlucraft(),
+            node::protocol::Namespace::builtin(),
         )?;
         let now = now_ms()?;
         for (signer, action) in [
@@ -299,7 +299,7 @@ async fn native_cross_node_transfer_substitution_and_returner_fencing() -> Resul
         let journal = Arc::new(Mutex::new(journal));
         let mut gateway = Node::start(
             admin.clone(),
-            NodeConfig::new(node::protocol::Namespace::jlucraft()),
+            NodeConfig::new(node::protocol::Namespace::builtin()),
         )
         .await?;
         let service = ServiceId::new();
@@ -352,12 +352,12 @@ async fn native_cross_node_transfer_substitution_and_returner_fencing() -> Resul
         let clients = [
             Node::start(
                 users[0].clone(),
-                NodeConfig::new(node::protocol::Namespace::jlucraft()),
+                NodeConfig::new(node::protocol::Namespace::builtin()),
             )
             .await?,
             Node::start(
                 users[1].clone(),
-                NodeConfig::new(node::protocol::Namespace::jlucraft()),
+                NodeConfig::new(node::protocol::Namespace::builtin()),
             )
             .await?,
         ];
