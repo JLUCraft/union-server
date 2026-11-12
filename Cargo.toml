@@ -58,6 +58,10 @@ default-members = [".", "game/league"]
 client = { package = "federation-client", version = "0.2.0", path = "../union-core/crates/client", features = ["rooms"] }
 tempfile = "3"
 
+[build-dependencies]
+serde_json = "1"
+typify = "0.6"
+
 [features]
 default = ["server"]
 server = ["authority/consensus"]

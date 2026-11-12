@@ -2,6 +2,13 @@
 
 The JLUCraft service host for authority nodes, Minecraft connections, scoring, activity delivery, organization workflows, and AI workers.
 
+The centralization program moves account and game authority to the skin station.
+The Yggdrasil session profile is already generated at build time from
+`../federated-skinstation/shared/contracts/session-profile.schema.json` using
+`typify`, and the textures client consumes that generated type. Keep the skin
+station checkout available when building. Federation host removal and native
+login authentication follow the identity and business migration.
+
 ## Setup and structure
 
 Keep sibling `union-core` and `minecraftd` checkouts available. The production entry is `federated-server`; initialization and signed host registration use its subcommands. Configuration is defined by the Rust types and command parser in `src/`. The workspace includes `game/league`, retaining the `league` crate name and its league API. Its `events` module combines office records with game state; `application`, `points`, `discovery`, `files`, and `trust` provide game clients. Game integration tests reuse the generic fixture in `../union-core/tests/support/mod.rs`. Production keys and founder authorization stay outside the repository.

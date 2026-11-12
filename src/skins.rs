@@ -3,6 +3,7 @@
 //! There is exactly one skin station. Textures are cosmetic: any failure yields no textures
 //! and never blocks a login.
 use crate::forwarding::{TEXTURES_PROPERTY, Textures};
+use crate::skin_contracts::SessionProfile;
 use anyhow::{Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::{Client, StatusCode, Url, redirect::Policy};
@@ -46,18 +47,6 @@ impl TryFrom<String> for SkinSite {
     }
 }
 
-#[derive(Deserialize)]
-struct RemoteProfile {
-    id: uuid::Uuid,
-    name: String,
-    properties: Vec<RemoteProperty>,
-}
-#[derive(Deserialize)]
-struct RemoteProperty {
-    name: String,
-    value: String,
-    signature: Option<String>,
-}
 #[derive(Deserialize)]
 struct TexturesValue {
     #[serde(rename = "profileId")]
@@ -107,9 +96,9 @@ impl SkinSite {
             return Ok(None);
         }
         ensure!(response.status().is_success(), "skin site rejected request");
-        let profile: RemoteProfile = serde_json::from_slice(&read_limited(response).await?)?;
+        let profile: SessionProfile = serde_json::from_slice(&read_limited(response).await?)?;
         ensure!(
-            profile.id == uuid && profile.name == name,
+            uuid::Uuid::parse_str(&profile.id)? == uuid && profile.name == name,
             "skin site returned a different profile"
         );
         let Some(property) = profile

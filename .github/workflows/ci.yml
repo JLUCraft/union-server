@@ -41,6 +41,12 @@ jobs:
           repository: JLUCraft/minecraftd
           path: workspace/minecraftd
 
+      - uses: actions/checkout@v7
+        with:
+          repository: JLUCraft/federated-skinstation
+          ref: refactor/central-skinstation-p0
+          path: workspace/federated-skinstation
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -53,7 +59,6 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
-      # Siblings use their main branches, and the lockfile matches this combination.
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 

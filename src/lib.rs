@@ -13,6 +13,11 @@ pub mod rooms;
 pub mod scoring;
 pub mod skins;
 
+#[allow(dead_code)]
+mod skin_contracts {
+    include!(concat!(env!("OUT_DIR"), "/skin_contracts.rs"));
+}
+
 pub use node::{Error, Result};
 
 fn operation_error(error: anyhow::Error) -> Error {
