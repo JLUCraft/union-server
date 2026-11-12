@@ -9,6 +9,24 @@ The Yggdrasil session profile is already generated at build time from
 station checkout available when building. Federation host removal and native
 login authentication follow the identity and business migration.
 
+Scoring now uses the skin station's league service. The local Paper adapter
+exposes `GET /v1/session/:id`, `POST /v1/score`, and `POST /v1/finish`.
+Its session response contains the central competition in `league` and current
+Minecraft UUID lists keyed by account ID in `profiles`. Score keys are account
+IDs. The skin station checks the designated scorer, club membership, replay
+payloads, and competition state on every operation.
+
+Configure `services.scoring` with `bind`, `skin_site`, `session_token`, and
+`token`. `bind` must be loopback; `skin_site` is a bare HTTPS origin, with HTTP
+allowed for loopback development. The two credential paths resolve relative to
+the host configuration file. `session_token` contains a Yggdrasil session for
+the scorer account and is read on every request so it can be replaced after
+renewal. `token` contains the separate 32–256 character Paper bearer loaded at
+startup. Keep both files outside the repository with owner-only permissions.
+Scoring no longer needs a device key, identity log, or governance journal.
+The host's remaining federation services are removed in subsequent batches;
+operations M1–M6 stay frozen.
+
 ## Setup and structure
 
 Keep sibling `union-core` and `minecraftd` checkouts available. The production entry is `federated-server`; initialization and signed host registration use its subcommands. Configuration is defined by the Rust types and command parser in `src/`. The workspace includes `game/league`, retaining the `league` crate name and its league API. Its `events` module combines office records with game state; `application`, `points`, `discovery`, `files`, and `trust` provide game clients. Game integration tests reuse the generic fixture in `../union-core/tests/support/mod.rs`. Production keys and founder authorization stay outside the repository.

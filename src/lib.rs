@@ -18,6 +18,11 @@ mod skin_contracts {
     include!(concat!(env!("OUT_DIR"), "/skin_contracts.rs"));
 }
 
+#[allow(dead_code, clippy::unwrap_used, clippy::possible_missing_else)]
+mod game_contracts {
+    include!(concat!(env!("OUT_DIR"), "/game_contracts.rs"));
+}
+
 pub use node::{Error, Result};
 
 fn operation_error(error: anyhow::Error) -> Error {

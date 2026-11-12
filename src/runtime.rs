@@ -158,13 +158,7 @@ pub struct LeagueProxy {
     pub config: crate::native::Config,
     pub key: PathBuf,
 }
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Scoring {
-    pub bind: std::net::SocketAddr,
-    pub key: PathBuf,
-    pub token: PathBuf,
-}
+pub use crate::scoring::Config as Scoring;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IdentityService {
@@ -279,7 +273,7 @@ impl Config {
             relative(base, &mut proxy.config.arena.forwarding_secret);
         }
         if let Some(scoring) = &mut config.services.scoring {
-            relative(base, &mut scoring.key);
+            relative(base, &mut scoring.session_token);
             relative(base, &mut scoring.token);
         }
         if let Some(board) = &mut config.services.report_board {
@@ -407,7 +401,7 @@ impl Config {
             self.services.member_rooms.is_empty() || self.services.identity.is_some(),
             "member rooms require unified identity"
         );
-        if self.services.league_proxy.is_some() || self.services.scoring.is_some() {
+        if self.services.league_proxy.is_some() {
             ensure!(
                 self.services.identity.is_some() && self.services.governance.is_some(),
                 "game adapters require application governance"
@@ -599,6 +593,10 @@ impl Host {
         receiver
     }
     async fn prepare(&mut self, mut services: Services) -> Result<()> {
+        if let Some(scoring) = services.scoring.take() {
+            self.tasks.spawn(crate::scoring::serve(scoring));
+            self.services.push("scoring".into());
+        }
         if let Some(config) = services.identity.take() {
             let genesis = match config.root {
                 Some(genesis) => genesis,
@@ -704,7 +702,7 @@ impl Host {
         authority: Authority<Application>,
         services: &mut Services,
     ) -> Result<()> {
-        if services.league_proxy.is_none() && services.scoring.is_none() {
+        if services.league_proxy.is_none() {
             return Ok(());
         }
         let view = authority.identity_view();
@@ -737,17 +735,6 @@ impl Host {
                 Some(self.witnesses.clone()),
             ));
             self.services.push(format!("league_proxy:{id}"));
-        }
-        if let Some(scoring) = services.scoring.take() {
-            ensure!(
-                std::fs::metadata(&scoring.token)?.len() <= 258,
-                "scoring token too large"
-            );
-            let token = std::fs::read_to_string(&scoring.token)?.trim().to_owned();
-            let key = Identity::load(&scoring.key)?;
-            self.tasks
-                .spawn(crate::scoring::serve(scoring.bind, authority, key, token));
-            self.services.push("scoring".into());
         }
         Ok(())
     }

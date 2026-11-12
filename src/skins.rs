@@ -78,6 +78,14 @@ async fn read_limited(mut response: reqwest::Response) -> Result<Vec<u8>> {
 }
 
 impl SkinSite {
+    pub(crate) fn url(&self, segments: &[&str]) -> Result<Url> {
+        let mut url = self.0.clone();
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("skin site has no path"))?
+            .extend(segments);
+        Ok(url)
+    }
+
     async fn fetch(&self, uuid: uuid::Uuid, name: &str) -> Result<Option<Textures>> {
         let client = Client::builder()
             .redirect(Policy::none())
