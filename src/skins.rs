@@ -1,7 +1,4 @@
-//! Player textures for identity forwarding, fetched from the province's skin station.
-//!
-//! There is exactly one skin station. Textures are cosmetic: any failure yields no textures
-//! and never blocks a login.
+//! Central session authorization and validated cosmetic textures.
 use crate::forwarding::{TEXTURES_PROPERTY, Textures};
 use crate::skin_contracts::SessionProfile;
 use anyhow::{Result, ensure};
@@ -86,32 +83,6 @@ impl SkinSite {
         Ok(url)
     }
 
-    async fn fetch(&self, uuid: uuid::Uuid, name: &str) -> Result<Option<Textures>> {
-        let client = Client::builder()
-            .redirect(Policy::none())
-            .timeout(FETCH_TIMEOUT)
-            .build()?;
-        let url = self.0.join(&format!(
-            "sessionserver/session/minecraft/profile/{}",
-            uuid.simple()
-        ))?;
-        let response = client
-            .get(url)
-            .query(&[("unsigned", "false")])
-            .send()
-            .await?;
-        if response.status() == StatusCode::NO_CONTENT {
-            return Ok(None);
-        }
-        ensure!(response.status().is_success(), "skin site rejected request");
-        let profile: SessionProfile = serde_json::from_slice(&read_limited(response).await?)?;
-        ensure!(
-            uuid::Uuid::parse_str(&profile.id)? == uuid && profile.name == name,
-            "skin site returned a different profile"
-        );
-        self.profile_textures(profile, uuid)
-    }
-
     fn profile_textures(
         &self,
         profile: SessionProfile,
@@ -180,23 +151,12 @@ impl SkinSite {
             textures,
         })
     }
-
-    /// The player's `textures` property, or none when the station lacks it or misbehaves.
-    pub async fn textures(&self, uuid: uuid::Uuid, name: &str) -> Option<Textures> {
-        match self.fetch(uuid, name).await {
-            Ok(textures) => textures,
-            Err(error) => {
-                tracing::debug!(%error, "skin site lookup failed");
-                None
-            }
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Json, Router, extract::Path, http::StatusCode as Status, routing::get};
+    use axum::{Json, Router, extract::Query, http::StatusCode as Status, routing::get};
 
     fn profile(id: &str, name: &str, texture_url: &str) -> serde_json::Value {
         let value = STANDARD.encode(
@@ -215,18 +175,24 @@ mod tests {
             ]
         })
     }
-    /// A station serving `payload(origin, id)` for one profile and 204 otherwise.
+    /// A station authorizing one signed session and returning its canonical profile.
     async fn station(known: uuid::Uuid, payload: fn(&str, &str) -> serde_json::Value) -> SkinSite {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let served = origin.clone();
         let router = Router::new().route(
-            "/sessionserver/session/minecraft/profile/{id}",
-            get(move |Path(id): Path<String>| {
+            "/sessionserver/session/minecraft/hasJoined",
+            get(move |Query(query): Query<BTreeMap<String, String>>| {
                 let served = served.clone();
                 async move {
-                    if id == known.simple().to_string() {
-                        Ok(Json(payload(&served, &id)))
+                    if query
+                        .get("username")
+                        .is_some_and(|name| name.eq_ignore_ascii_case("Alice"))
+                        && query
+                            .get("serverId")
+                            .is_some_and(|id| id == "signed-digest")
+                    {
+                        Ok(Json(payload(&served, &known.simple().to_string())))
                     } else {
                         Err(Status::NO_CONTENT)
                     }
@@ -244,13 +210,18 @@ mod tests {
             profile(id, "Alice", &format!("{origin}/textures/abc"))
         })
         .await;
-        let textures = site.textures(known, "Alice").await.unwrap();
+        let authorized = site
+            .has_joined(known, "alice", "signed-digest")
+            .await
+            .unwrap();
+        assert_eq!(authorized.name, "Alice");
+        let textures = authorized.textures.unwrap();
         assert_eq!(textures.signature(), Some("sig"));
         assert!(!textures.value().is_empty());
         assert!(
-            site.textures(uuid::Uuid::from_u128(8), "Bob")
+            site.has_joined(uuid::Uuid::from_u128(8), "Bob", "signed-digest")
                 .await
-                .is_none()
+                .is_err()
         );
     }
 
@@ -261,12 +232,24 @@ mod tests {
             profile(id, "Alice", "https://elsewhere.example/textures/abc")
         })
         .await;
-        assert!(foreign.textures(known, "Alice").await.is_none());
+        assert!(
+            foreign
+                .has_joined(known, "Alice", "signed-digest")
+                .await
+                .unwrap()
+                .textures
+                .is_none()
+        );
         let renamed = station(known, |origin, id| {
             profile(id, "Impostor", &format!("{origin}/textures/abc"))
         })
         .await;
-        assert!(renamed.textures(known, "Alice").await.is_none());
+        assert!(
+            renamed
+                .has_joined(known, "Alice", "signed-digest")
+                .await
+                .is_err()
+        );
     }
 
     #[test]

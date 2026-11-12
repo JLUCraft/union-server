@@ -31,6 +31,20 @@ pub(crate) fn credential(path: &FilePath, maximum: usize) -> Result<String> {
     Ok(value.into())
 }
 
+pub(crate) fn require_private(path: &FilePath, what: &str) -> anyhow::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    anyhow::ensure!(metadata.is_file(), "{what} must be a regular file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        anyhow::ensure!(
+            metadata.permissions().mode() & 0o077 == 0,
+            "{what} must be private (chmod 600)"
+        );
+    }
+    Ok(())
+}
+
 impl Central {
     pub(crate) fn new(skin_site: SkinSite, session_token: PathBuf) -> Result<Self> {
         credential(&session_token, MAX_SESSION_TOKEN_BYTES)?;

@@ -18,28 +18,14 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    env:
-      # This public test identity establishes test readiness, not production trust approval.
-      FOUNDER_MANIFEST: ${{ github.workspace }}/workspace/federated-server/tests/fixtures/founders.json
     defaults:
       run:
         working-directory: workspace/federated-server
     steps:
-      # The server links the shared library crates and the game daemon through
-      # sibling paths, so CI reproduces the local workspace layout.
+      # Shared contracts come from the sibling central service checkout.
       - uses: actions/checkout@v7
         with:
           path: workspace/federated-server
-
-      - uses: actions/checkout@v7
-        with:
-          repository: JLUCraft/union-core
-          path: workspace/union-core
-
-      - uses: actions/checkout@v7
-        with:
-          repository: JLUCraft/minecraftd
-          path: workspace/minecraftd
 
       - uses: actions/checkout@v7
         with:

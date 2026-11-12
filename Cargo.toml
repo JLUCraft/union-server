@@ -4,90 +4,48 @@ default-run = "federated-server"
 version = "0.2.0"
 edition = "2024"
 authors = ["JLUCraft"]
-description = "Federated Minecraft service host: league authority, native protocol proxy and Paper scoring bridge"
+description = "Central Minecraft gateway with skin station scoring and activity adapters"
 license = "GPL-3.0-only"
 repository = "https://github.com/JLUCraft/federated-server"
 publish = false
 
-[package.metadata.cargo-machete]
-ignored = ["openssl"]
-
 [dependencies]
 base64 = "0.22"
-aes-gcm = "0.11"
 aes = "0.8"
 cfb8 = "0.8"
 rsa = "0.9"
 sha1 = "0.11"
-state = { package = "federation-state", version = "0.2.0", path = "../union-core/crates/state" }
-mcp = { package = "federation-mcp", version = "0.2.0", path = "../union-core/crates/mcp", features = ["forwarding"] }
-client = { package = "federation-client", version = "0.2.0", path = "../union-core/crates/client", features = ["documents"] }
-events = { package = "federation-events", version = "0.2.0", path = "../union-core/crates/events", features = ["documents"] }
-flows = { package = "federation-flows", version = "0.2.0", path = "../union-core/crates/flows" }
-llm-gateway = { package = "federation-llm-gateway", version = "0.2.0", path = "../union-core/crates/llm-gateway" }
 flate2 = "1"
 hmac = "0.13"
 sha2 = "0.11"
 uuid = { version = "1", features = ["serde"] }
-tokio-util = { version = "0.7", features = ["compat"] }
 serde_json = "1"
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }
 subtle = "2"
-league = { path = "game/league" }
-authority = { package = "federation-authority", version = "0.2.0", path = "../union-core/crates/authority" }
-node = { package = "federation-node", version = "0.2.0", path = "../union-core/crates/node" }
-identity = { package = "federation-identity", version = "0.2.0", path = "../union-core/crates/identity" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time", "signal"] }
-terminal-runtime = { package = "federation-terminal-runtime", version = "0.2.0", path = "../union-core/crates/terminal-runtime" }
-minecraftd = { path = "../minecraftd" }
-web-push = { version = "0.11", default-features = false }
-reqwest = { version = "0.13", features = ["json"] }
+reqwest = { version = "0.13", features = ["json", "query"] }
 regress = "0.11"
-sysinfo = "0.36"
 futures = "0.3"
-rmcp = { version = "2.2.0", features = ["server", "transport-streamable-http-server"] }
 
 [lints.rust]
 unsafe_code = "forbid"
 
 [workspace]
 resolver = "2"
-members = ["game/league"]
-default-members = [".", "game/league"]
 
 [dev-dependencies]
-client = { package = "federation-client", version = "0.2.0", path = "../union-core/crates/client", features = ["rooms"] }
 tempfile = "3"
 
 [build-dependencies]
 serde_json = "1"
 typify = "0.6"
 
-[features]
-default = ["server"]
-server = ["authority/consensus"]
-
 [[bin]]
 name = "federated-server"
 path = "src/main.rs"
-required-features = ["server"]
-
-[[bin]]
-name = "jlucraft-agent"
-path = "src/bin/jlucraft-agent/main.rs"
-
-# Explicitly built acceptance fixture, never installed as a production terminal.
-[[example]]
-name = "acceptance-driver"
-path = "tests/support/acceptance/main.rs"
-required-features = ["server"]
-
-# web-push pulls ece, whose only crypto backend links OpenSSL. Build it from
-# source on the platforms that do not ship a usable OpenSSL toolkit so hosted
-# CI needs no extra setup.
-[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
-openssl = { version = "0.10", features = ["vendored"] }

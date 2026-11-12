@@ -241,7 +241,7 @@ impl RunningOracle {
                 .enable_all()
                 .build()?;
             runtime.block_on(async {
-                let oracle = Oracle::start(config, witnesses).await?;
+                let oracle = super::start(config, witnesses).await?;
                 let _ = ready.send(oracle.address());
                 if command.await.unwrap_or(false) {
                     oracle.stop().await?;

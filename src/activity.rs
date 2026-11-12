@@ -22,7 +22,6 @@ use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
 };
-use tokio::sync::oneshot;
 const MAX_SESSIONS: usize = 65_536;
 const MAX_REPORT_BYTES: usize = 512 * 1024;
 const MAX_SPOOL_BYTES: usize = 64 * 1024 * 1024;
@@ -628,95 +627,88 @@ async fn evidence(
         .map(Json)
         .map_err(|_| StatusCode::BAD_GATEWAY)
 }
-pub struct Oracle {
-    stop: Option<oneshot::Sender<()>>,
-    task: Option<tokio::task::JoinHandle<Result<()>>>,
-    completion: tokio::sync::watch::Receiver<()>,
-    address: SocketAddr,
-}
-impl Oracle {
-    pub async fn start(config: Config, witnesses: Witnesses) -> Result<Self> {
+pub async fn start(config: Config, witnesses: Witnesses) -> Result<crate::Service> {
+    ensure!(
+        config.bind.ip().is_loopback(),
+        "activity adapter must bind loopback"
+    );
+    ensure!(
+        !config.probes.is_empty() && config.probes.len() <= MAX_REPORT_PLAYERS,
+        "invalid activity probe count"
+    );
+    let central = Central::new(config.skin_site, config.session_token)?;
+    let mut bindings = BTreeMap::new();
+    for probe in config.probes {
         ensure!(
-            config.bind.ip().is_loopback(),
-            "activity adapter must bind loopback"
+            !probe.source.is_empty()
+                && probe.source.len() <= 128
+                && !probe.resource.is_empty()
+                && probe.resource.len() <= 128,
+            "invalid activity assignment"
         );
+        crate::central::require_private(&probe.token, "activity probe token")?;
+        let token = crate::central::credential(&probe.token, 256)?.into_bytes();
         ensure!(
-            !config.probes.is_empty() && config.probes.len() <= MAX_REPORT_PLAYERS,
-            "invalid activity probe count"
+            bindings
+                .insert(
+                    probe.source,
+                    Binding {
+                        resource: probe.resource,
+                        token
+                    }
+                )
+                .is_none(),
+            "duplicate activity source"
         );
-        let central = Central::new(config.skin_site, config.session_token)?;
-        let mut bindings = BTreeMap::new();
-        for probe in config.probes {
-            ensure!(
-                !probe.source.is_empty()
-                    && probe.source.len() <= 128
-                    && !probe.resource.is_empty()
-                    && probe.resource.len() <= 128,
-                "invalid activity assignment"
-            );
-            crate::bootstrap::require_private(&probe.token, "activity probe token")?;
-            let token = crate::central::credential(&probe.token, 256)?.into_bytes();
-            ensure!(
-                bindings
-                    .insert(
-                        probe.source,
-                        Binding {
-                            resource: probe.resource,
-                            token
-                        }
-                    )
-                    .is_none(),
-                "duplicate activity source"
-            );
-        }
-        let parent = config
-            .spool
-            .parent()
-            .context("activity spool directory missing")?;
-        ensure!(parent.is_dir(), "activity spool directory missing");
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let lock = options.open(config.spool.with_extension("lock"))?;
-        lock.try_lock().context("activity spool already open")?;
-        let pending: BTreeMap<String, SourceState> = if config.spool.exists() {
-            crate::bootstrap::require_private(&config.spool, "activity evidence spool")?;
-            ensure!(
-                std::fs::metadata(&config.spool)?.len() <= MAX_SPOOL_BYTES as u64,
-                "activity evidence spool too large"
-            );
-            serde_json::from_slice(&std::fs::read(&config.spool)?)?
-        } else {
-            BTreeMap::new()
-        };
+    }
+    let parent = config
+        .spool
+        .parent()
+        .context("activity spool directory missing")?;
+    ensure!(parent.is_dir(), "activity spool directory missing");
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock = options.open(config.spool.with_extension("lock"))?;
+    lock.try_lock().context("activity spool already open")?;
+    let pending: BTreeMap<String, SourceState> = if config.spool.exists() {
+        crate::central::require_private(&config.spool, "activity evidence spool")?;
         ensure!(
-            pending.keys().all(|source| bindings.contains_key(source)),
-            "activity spool has unconfigured sources"
+            std::fs::metadata(&config.spool)?.len() <= MAX_SPOOL_BYTES as u64,
+            "activity evidence spool too large"
         );
-        let context = Arc::new(OracleContext {
-            central,
-            witnesses,
-            bindings,
-            pending: tokio::sync::Mutex::new(pending),
-            spool: config.spool,
-            _spool_lock: lock,
-        });
-        let listener = tokio::net::TcpListener::bind(config.bind).await?;
-        let address = listener.local_addr()?;
-        let router = Router::new()
-            .route("/v1/activity/{source}/slice", post(report))
-            .route("/v1/activity/{source}/flush", post(flush))
-            .route("/v1/activity/{source}/evidence/{id}", get(evidence))
-            .layer(DefaultBodyLimit::max(MAX_REPORT_BYTES))
-            .with_state(context.clone());
-        let (stop, stopping) = oneshot::channel();
-        let (completed, completion) = tokio::sync::watch::channel(());
-        let task = tokio::spawn(async move {
-            let _completed = completed;
+        serde_json::from_slice(&std::fs::read(&config.spool)?)?
+    } else {
+        BTreeMap::new()
+    };
+    ensure!(
+        pending.keys().all(|source| bindings.contains_key(source)),
+        "activity spool has unconfigured sources"
+    );
+    let context = Arc::new(OracleContext {
+        central,
+        witnesses,
+        bindings,
+        pending: tokio::sync::Mutex::new(pending),
+        spool: config.spool,
+        _spool_lock: lock,
+    });
+    let listener = tokio::net::TcpListener::bind(config.bind).await?;
+    let address = listener.local_addr()?;
+    let router = Router::new()
+        .route("/v1/activity/{source}/slice", post(report))
+        .route("/v1/activity/{source}/flush", post(flush))
+        .route("/v1/activity/{source}/evidence/{id}", get(evidence))
+        .layer(DefaultBodyLimit::max(MAX_REPORT_BYTES))
+        .with_state(context.clone());
+    Ok(crate::Service::spawn(
+        "activity_oracle",
+        address,
+        move |stopping| async move {
             axum::serve(listener, router)
                 .with_graceful_shutdown(async {
                     let _ = stopping.await;
@@ -736,38 +728,10 @@ impl Oracle {
                 return Err(error);
             }
             Ok(())
-        });
-        Ok(Self {
-            stop: Some(stop),
-            task: Some(task),
-            completion,
-            address,
-        })
-    }
-    pub fn address(&self) -> SocketAddr {
-        self.address
-    }
-    pub async fn closed(&self) {
-        let mut completion = self.completion.clone();
-        let _ = completion.changed().await;
-    }
-    pub async fn stop(mut self) -> Result<()> {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        if let Some(task) = self.task.take() {
-            task.await??;
-        }
-        Ok(())
-    }
+        },
+    ))
 }
-impl Drop for Oracle {
-    fn drop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-    }
-}
+
 #[cfg(test)]
 #[path = "activity_tests.rs"]
 mod tests;

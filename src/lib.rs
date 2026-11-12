@@ -1,16 +1,12 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
-//! Shared embedded and standalone Minecraft room runtime.
+//! Central Minecraft gateway, scoring, and activity host.
 pub mod activity;
 mod bearer;
 mod central;
 pub mod forwarding;
 mod login;
-mod mcp;
 pub mod native;
-pub mod ops;
-mod ops_extended;
 pub mod protocol;
-pub mod rooms;
 pub mod scoring;
 pub mod skins;
 
@@ -29,23 +25,21 @@ mod point_contracts {
     include!(concat!(env!("OUT_DIR"), "/point_contracts.rs"));
 }
 
-pub use node::{Error, Result};
-
-fn operation_error(error: anyhow::Error) -> Error {
-    match error.downcast::<Error>() {
-        Ok(error) => error,
-        Err(error) => Error::Protocol(error.to_string()),
-    }
+mod service;
+pub use service::Service;
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("host configuration: {0}")]
+    Configuration(#[source] anyhow::Error),
+    #[error("{service}: {source}")]
+    Service {
+        service: &'static str,
+        #[source]
+        source: anyhow::Error,
+    },
+    #[error("{0} service stopped")]
+    ServiceStopped(&'static str),
 }
+pub type Result<T> = std::result::Result<T, Error>;
 
-mod ai_worker;
-pub mod bootstrap;
-pub mod identity_bridge;
-mod notifications;
-mod report_board;
 pub mod runtime;
-mod workflow_worker;
-
-#[cfg(test)]
-#[path = "../../union-core/tests/support/mod.rs"]
-mod test_identity;

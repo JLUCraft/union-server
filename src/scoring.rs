@@ -124,15 +124,23 @@ fn router(context: Context) -> Router {
         .with_state(context)
 }
 
-pub async fn serve(config: Config) -> Result<()> {
+pub async fn start(config: Config) -> Result<crate::Service> {
     let address = config.bind;
     let context = Context::new(config)?;
-    axum::serve(
-        tokio::net::TcpListener::bind(address).await?,
-        router(context),
-    )
-    .await?;
-    Ok(())
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    let address = listener.local_addr()?;
+    Ok(crate::Service::spawn(
+        "scoring",
+        address,
+        move |stopping| async move {
+            axum::serve(listener, router(context))
+                .with_graceful_shutdown(async {
+                    let _ = stopping.await;
+                })
+                .await?;
+            Ok(())
+        },
+    ))
 }
 
 #[cfg(test)]

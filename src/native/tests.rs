@@ -179,6 +179,7 @@ struct Fixture {
     address: SocketAddr,
     station: Station,
     witnesses: Witnesses,
+    gateway: Option<crate::Service>,
     tasks: JoinSet<()>,
 }
 impl Fixture {
@@ -257,11 +258,9 @@ impl Fixture {
                 }}
             });
         }
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let address = listener.local_addr()?;
         let config = Config {
             league: "auto".into(),
-            bind: address,
+            bind: "127.0.0.1:0".parse()?,
             transfer: Transfer {
                 host: "gateway.test".into(),
                 port: 25565,
@@ -271,23 +270,16 @@ impl Fixture {
             skin_site: site,
             session_token: token,
         };
-        config.validate()?;
-        let central = Central::new(config.skin_site.clone(), config.session_token.clone())?;
-        let key = Arc::new(RsaPrivateKey::new(&mut OsRng, 1024)?);
-        let serving = config.clone();
         let witnesses = Witnesses::default();
-        let collector = witnesses.clone();
-        tasks.spawn(async move {
-            serve_scheduled(serving, central, key, Arc::new(listener), collector)
-                .await
-                .unwrap();
-        });
+        let gateway = super::start(config.clone(), witnesses.clone()).await?;
+        let address = gateway.address();
         Ok(Self {
             _directory: directory,
             config,
             address,
             station,
             witnesses,
+            gateway: Some(gateway),
             tasks,
         })
     }
@@ -415,6 +407,7 @@ async fn encrypted_gateway_routes_accounts_and_fences_existing_sessions_on_revoc
             .is_err()
     );
     assert!(fixture.station.down.load(Ordering::SeqCst));
+    fixture.gateway.take().unwrap().stop().await?;
     fixture.tasks.shutdown().await;
     Ok(())
 }
@@ -449,6 +442,7 @@ async fn encrypted_gateway_rejects_profile_substitution_challenge_forgery_and_du
             .await?
             .is_err()
     );
+    fixture.gateway.take().unwrap().stop().await?;
     fixture.tasks.shutdown().await;
     Ok(())
 }

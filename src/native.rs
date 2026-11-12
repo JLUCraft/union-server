@@ -644,12 +644,26 @@ async fn session(
     finish(&shared, &member, id).await?;
     result
 }
-pub async fn serve(config: Config, witnesses: Witnesses) -> Result<()> {
+pub async fn start(config: Config, witnesses: Witnesses) -> Result<crate::Service> {
     config.validate()?;
     let central = Central::new(config.skin_site.clone(), config.session_token.clone())?;
     let key = tokio::task::spawn_blocking(|| RsaPrivateKey::new(&mut OsRng, 1024)).await??;
     let listener = Arc::new(TcpListener::bind(config.bind).await?);
-    serve_scheduled(config, central, Arc::new(key), listener, witnesses).await
+    let address = listener.local_addr()?;
+    Ok(crate::Service::spawn(
+        "league_proxy",
+        address,
+        move |stopping| {
+            serve_scheduled(
+                config,
+                central,
+                Arc::new(key),
+                listener,
+                witnesses,
+                stopping,
+            )
+        },
+    ))
 }
 async fn serve_scheduled(
     config: Config,
@@ -657,6 +671,7 @@ async fn serve_scheduled(
     key: Arc<RsaPrivateKey>,
     listener: Arc<TcpListener>,
     witnesses: Witnesses,
+    mut stopping: oneshot::Receiver<()>,
 ) -> Result<()> {
     if config.league != "auto" {
         action(
@@ -665,8 +680,7 @@ async fn serve_scheduled(
             serde_json::json!({"action":"infrastructure","healthy":false}),
         )
         .await?;
-        let (_stop, stopped) = oneshot::channel();
-        return serve_listener(config, central, key, listener, witnesses, stopped).await;
+        return serve_listener(config, central, key, listener, witnesses, stopping).await;
     }
     let mut tasks = JoinSet::new();
     let mut selected = String::new();
@@ -678,6 +692,7 @@ async fn serve_scheduled(
     loop {
         if initialized {
             tokio::select! {
+                _=&mut stopping=>break,
                 _=interval.tick()=>{},
                 incoming=listener.accept(),if tasks.is_empty()=>{let (stream,_)=incoming?;drop(stream);continue;},
                 result=tasks.join_next(),if !tasks.is_empty()=>{ if !matches!(result,Some(Ok(Ok(())))) {tracing::warn!("scheduled game route stopped");} selected.clear(); continue; }
@@ -730,6 +745,12 @@ async fn serve_scheduled(
             });
         }
     }
+    if let Some(stop) = route_stop.take() {
+        let _ = stop.send(());
+    }
+    let _ = timeout(AUTHORIZATION_MAX_AGE, tasks.join_next()).await;
+    tasks.shutdown().await;
+    Ok(())
 }
 async fn serve_listener(
     config: Config,
