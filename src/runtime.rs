@@ -156,7 +156,6 @@ impl RelayLimits {
 #[serde(deny_unknown_fields)]
 pub struct LeagueProxy {
     pub config: crate::native::Config,
-    pub key: PathBuf,
 }
 pub use crate::scoring::Config as Scoring;
 #[derive(Deserialize)]
@@ -268,7 +267,7 @@ impl Config {
             relative(base, &mut identity.log);
         }
         if let Some(proxy) = &mut config.services.league_proxy {
-            relative(base, &mut proxy.key);
+            relative(base, &mut proxy.config.session_token);
             relative(base, &mut proxy.config.waiting.forwarding_secret);
             relative(base, &mut proxy.config.arena.forwarding_secret);
         }
@@ -401,11 +400,8 @@ impl Config {
             self.services.member_rooms.is_empty() || self.services.identity.is_some(),
             "member rooms require unified identity"
         );
-        if self.services.league_proxy.is_some() {
-            ensure!(
-                self.services.identity.is_some() && self.services.governance.is_some(),
-                "game adapters require application governance"
-            );
+        if let Some(proxy) = &self.services.league_proxy {
+            proxy.config.validate()?;
         }
         if let Some(scoring) = &self.services.scoring {
             ensure!(
@@ -446,9 +442,6 @@ impl Config {
             ensure!(ids.insert(id.parse::<ServiceId>()?), "duplicate service ID");
             Ok(())
         };
-        if let Some(proxy) = &self.services.league_proxy {
-            register(&proxy.config.service)?;
-        }
         if let Some(o) = &self.services.operations {
             register(&o.service)?;
         }
@@ -593,6 +586,10 @@ impl Host {
         receiver
     }
     async fn prepare(&mut self, mut services: Services) -> Result<()> {
+        if let Some(proxy) = services.league_proxy.take() {
+            self.tasks.spawn(crate::native::serve(proxy.config));
+            self.services.push("league_proxy".into());
+        }
         if let Some(scoring) = services.scoring.take() {
             self.tasks.spawn(crate::scoring::serve(scoring));
             self.services.push("scoring".into());
@@ -697,47 +694,6 @@ impl Host {
 
         Ok(())
     }
-    async fn game_adapters(
-        &mut self,
-        authority: Authority<Application>,
-        services: &mut Services,
-    ) -> Result<()> {
-        if services.league_proxy.is_none() {
-            return Ok(());
-        }
-        let view = authority.identity_view();
-        let club = authority.stored_state().await.core.identity.club.clone();
-        if let Some(proxy) = services.league_proxy.take() {
-            let id = proxy.config.service.parse()?;
-            let key = Identity::load(&proxy.key)?;
-            self.node()?
-                .publish(Service {
-                    id,
-                    name: proxy.config.league.clone(),
-                    protocol: "minecraft/java/26.3".into(),
-                    metadata: Vec::new(),
-                    access: AccessPolicy::Trust {
-                        view,
-                        requirement: node::protocol::TrustRequirement {
-                            clubs: [club].into(),
-                            permission: None,
-                        },
-                    },
-                })
-                .await?;
-            let incoming = self.route(id);
-            self.tasks.spawn(crate::native::serve_scheduled(
-                proxy.config,
-                self.node()?,
-                authority.clone(),
-                key,
-                incoming,
-                Some(self.witnesses.clone()),
-            ));
-            self.services.push(format!("league_proxy:{id}"));
-        }
-        Ok(())
-    }
     async fn open_authority<D: state::Domain>(
         &mut self,
         config: &Governance,
@@ -836,7 +792,6 @@ impl Host {
             );
             self.services.push("activity_oracle".into());
         }
-        self.game_adapters(authority.clone(), services).await?;
         if let Some(config) = services.report_board.take() {
             self.tasks
                 .spawn(crate::report_board::serve(authority.clone(), config));

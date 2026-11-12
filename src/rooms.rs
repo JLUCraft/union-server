@@ -467,7 +467,11 @@ async fn bridge(
                 let packet = Packet::decode(&raw, compression)?;
                 use crate::forwarding::LoginStep;
                 match negotiation.receive(&packet, compression, &profile, || {
-                    crate::forwarding::encode(secret, &profile)
+                    crate::forwarding::encode(
+                        secret,
+                        &profile,
+                        std::net::Ipv4Addr::LOCALHOST.into(),
+                    )
                 })? {
                     LoginStep::Compression(threshold) => {
                         protocol::write_frame(&mut client, &raw).await?;

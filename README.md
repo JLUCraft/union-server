@@ -6,8 +6,9 @@ The centralization program moves account and game authority to the skin station.
 The Yggdrasil session profile is already generated at build time from
 `../federated-skinstation/shared/contracts/session-profile.schema.json` using
 `typify`, and the textures client consumes that generated type. Keep the skin
-station checkout available when building. Federation host removal and native
-login authentication follow the identity and business migration.
+station checkout available when building. The native TCP gateway uses encrypted
+Minecraft login and Yggdrasil `hasJoined`. Remaining federation host services
+are removed in subsequent centralization batches.
 
 Scoring now uses the skin station's league service. The local Paper adapter
 exposes `GET /v1/session/:id`, `POST /v1/score`, and `POST /v1/finish`.
@@ -26,6 +27,50 @@ startup. Keep both files outside the repository with owner-only permissions.
 Scoring no longer needs a device key, identity log, or governance journal.
 The host's remaining federation services are removed in subsequent batches;
 operations M1–M6 stay frozen.
+
+## Native Minecraft gateway
+
+`services.league_proxy.config` configures a standalone TCP listener. It uses a
+Yggdrasil session for the league's designated host account; the credential file
+is read on every central request. It does not publish a federation game service
+or require an identity/governance service. The current host assembly still
+requires its node configuration for the remaining services.
+
+```json
+{
+  "league": "cup",
+  "bind": "0.0.0.0:25565",
+  "transfer": { "host": "game.example.test", "port": 25565 },
+  "skin_site": "https://skin.jlucraft.com",
+  "session_token": "host.session",
+  "waiting": { "address": "127.0.0.1:25566", "forwarding_secret": "waiting.secret" },
+  "arena": { "address": "127.0.0.1:25567", "forwarding_secret": "arena.secret" }
+}
+```
+
+Paths resolve relative to the host configuration file. Keep that configuration
+and all credentials outside the repository, with secret files accessible only
+to their owner. Both Paper servers must bind loopback and enable their built-in
+Velocity identity forwarding with their respective secrets.
+
+Players connect directly to the configured TCP address. The gateway performs
+RSA challenge verification and AES-128-CFB8 encryption, authenticates the
+claimed profile through the skin station, and forwards its canonical identity
+and validated textures with the TCP client address to Paper. Admission maps the current UUID to its central
+account. Connections are unique per account, including extra profiles.
+Candidate rooms and seat epochs come from current central admission; explicit
+transfer configuration supplies the public reconnect target. Backend status,
+presence, infrastructure changes, and expiry ticks use the central league API.
+
+Set `league` to `auto` to follow the host account's assigned competitions. Exactly
+one playing assignment opens the route; zero or multiple assignments close it.
+Assignment changes close the previous connections before serving the new game.
+
+Active admission is refreshed each second. Connections close when an admission
+request fails or the last accepted decision is ten seconds old. Routing updates
+transfer clients between waiting and arena rooms, including seat replacement
+and pause changes. This path no longer feeds the federation activity oracle;
+central activity delivery is the following consumer migration.
 
 ## Setup and structure
 

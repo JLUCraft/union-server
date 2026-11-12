@@ -109,6 +109,14 @@ impl SkinSite {
             uuid::Uuid::parse_str(&profile.id)? == uuid && profile.name == name,
             "skin site returned a different profile"
         );
+        self.profile_textures(profile, uuid)
+    }
+
+    fn profile_textures(
+        &self,
+        profile: SessionProfile,
+        uuid: uuid::Uuid,
+    ) -> Result<Option<Textures>> {
         let Some(property) = profile
             .properties
             .into_iter()
@@ -132,6 +140,45 @@ impl SkinSite {
             );
         }
         Ok(Some(Textures::new(property.value, property.signature)))
+    }
+
+    pub(crate) async fn has_joined(
+        &self,
+        uuid: uuid::Uuid,
+        name: &str,
+        server_id: &str,
+    ) -> Result<crate::forwarding::Profile> {
+        let client = Client::builder()
+            .redirect(Policy::none())
+            .timeout(FETCH_TIMEOUT)
+            .build()?;
+        let response = client
+            .get(self.url(&["sessionserver", "session", "minecraft", "hasJoined"])?)
+            .query(&[("username", name), ("serverId", server_id)])
+            .send()
+            .await?;
+        ensure!(
+            response.status() == StatusCode::OK,
+            "Minecraft session not authorized"
+        );
+        let profile: SessionProfile = serde_json::from_slice(&read_limited(response).await?)?;
+        ensure!(
+            uuid::Uuid::parse_str(&profile.id)? == uuid && profile.name.eq_ignore_ascii_case(name),
+            "session profile mismatch"
+        );
+        crate::forwarding::validate_name(&profile.name)?;
+        let canonical_name = profile.name.clone();
+        let textures = self
+            .profile_textures(profile, uuid)
+            .unwrap_or_else(|error| {
+                tracing::debug!(%error, "session textures dropped");
+                None
+            });
+        Ok(crate::forwarding::Profile {
+            uuid,
+            name: canonical_name,
+            textures,
+        })
     }
 
     /// The player's `textures` property, or none when the station lacks it or misbehaves.

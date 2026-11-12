@@ -58,11 +58,11 @@ pub fn read_secret(path: &Path) -> Result<String> {
     Ok(secret.to_owned())
 }
 
-pub fn encode(path: &Path, profile: &Profile) -> Result<Vec<u8>> {
+pub fn encode(path: &Path, profile: &Profile, address: std::net::IpAddr) -> Result<Vec<u8>> {
     let secret = read_secret(path)?;
     let mut data = vec![];
     protocol::varint(1, &mut data);
-    protocol::string("127.0.0.1", &mut data)?;
+    protocol::string(&address.to_string(), &mut data)?;
     data.extend(profile.uuid.as_bytes());
     protocol::string(&profile.name, &mut data)?;
     match &profile.textures {
@@ -173,7 +173,7 @@ mod tests {
                 name: "Alice".into(),
                 textures: textures.clone(),
             };
-            let encoded = encode(&path, &profile)?;
+            let encoded = encode(&path, &profile, std::net::Ipv4Addr::LOCALHOST.into())?;
             let (mac, data) = encoded.split_at(32);
             let mut expected = Hmac::<Sha256>::new_from_slice("s".repeat(32).as_bytes())?;
             expected.update(data);

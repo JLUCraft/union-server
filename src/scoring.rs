@@ -6,21 +6,11 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
-use reqwest::{Client, Method, redirect::Policy};
+use reqwest::Method;
 use serde::Deserialize;
-use std::{
-    collections::BTreeMap,
-    io::Read,
-    net::SocketAddr,
-    path::{Path as FilePath, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, sync::Arc};
 
 const MAX_REQUEST_BYTES: usize = 65536;
-const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
-const MAX_SESSION_TOKEN_BYTES: usize = 4096;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -33,9 +23,7 @@ pub struct Config {
 
 #[derive(Clone)]
 struct Context {
-    client: Client,
-    skin_site: SkinSite,
-    session_token: PathBuf,
+    central: crate::central::Central,
     token: Arc<Vec<u8>>,
 }
 
@@ -54,90 +42,17 @@ struct Finish {
     league: String,
 }
 
-fn credential(path: &FilePath, maximum: usize) -> Result<String> {
-    let mut value = String::new();
-    std::fs::File::open(path)?
-        .take((maximum + 3) as u64)
-        .read_to_string(&mut value)?;
-    ensure!(value.len() <= maximum + 2, "scoring credential too large");
-    let value = value.trim();
-    ensure!(
-        (32..=maximum).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_graphic()),
-        "invalid scoring credential"
-    );
-    Ok(value.into())
-}
-
 impl Context {
     fn new(config: Config) -> Result<Self> {
         ensure!(
             config.bind.ip().is_loopback(),
             "scoring adapter must bind loopback"
         );
-        let token = credential(&config.token, 256)?;
-        credential(&config.session_token, MAX_SESSION_TOKEN_BYTES)?;
+        let token = crate::central::credential(&config.token, 256)?;
         Ok(Self {
-            client: Client::builder()
-                .redirect(Policy::none())
-                .timeout(REQUEST_TIMEOUT)
-                .build()?,
-            skin_site: config.skin_site,
-            session_token: config.session_token,
+            central: crate::central::Central::new(config.skin_site, config.session_token)?,
             token: Arc::new(token.into_bytes()),
         })
-    }
-
-    async fn request(
-        &self,
-        method: Method,
-        league: &str,
-        operation: &str,
-        body: Option<serde_json::Value>,
-    ) -> std::result::Result<Vec<u8>, StatusCode> {
-        if league.is_empty()
-            || league.len() > 128
-            || !league
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-        {
-            return Err(StatusCode::BAD_REQUEST);
-        }
-        let token = credential(&self.session_token, MAX_SESSION_TOKEN_BYTES)
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        let url = self
-            .skin_site
-            .url(&["api", "leagues", league, operation])
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        let mut request = self.client.request(method, url).bearer_auth(token);
-        if let Some(body) = body {
-            request = request.json(&body);
-        }
-        let mut response = request
-            .send()
-            .await
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        if !response.status().is_success() {
-            return Err(match response.status().as_u16() {
-                400 => StatusCode::BAD_REQUEST,
-                401 | 403 => StatusCode::FORBIDDEN,
-                404 => StatusCode::NOT_FOUND,
-                409 => StatusCode::CONFLICT,
-                429 => StatusCode::TOO_MANY_REQUESTS,
-                _ => StatusCode::SERVICE_UNAVAILABLE,
-            });
-        }
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
-        {
-            if bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
-                return Err(StatusCode::BAD_GATEWAY);
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        Ok(bytes)
     }
 }
 
@@ -147,7 +62,10 @@ async fn session(
     Path(id): Path<String>,
 ) -> std::result::Result<Json<GameScoringSession>, StatusCode> {
     crate::bearer::require_bearer(&headers, &context.token)?;
-    let body = context.request(Method::GET, &id, "scoring", None).await?;
+    let body = context
+        .central
+        .league(Method::GET, &id, "scoring", None)
+        .await?;
     let session: GameScoringSession =
         serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_GATEWAY)?;
     if session.league.id != id {
@@ -163,7 +81,8 @@ async fn score(
 ) -> std::result::Result<StatusCode, StatusCode> {
     crate::bearer::require_bearer(&headers, &context.token)?;
     context
-        .request(
+        .central
+        .league(
             Method::POST,
             &score.league,
             "actions",
@@ -185,7 +104,8 @@ async fn finish(
 ) -> std::result::Result<StatusCode, StatusCode> {
     crate::bearer::require_bearer(&headers, &context.token)?;
     context
-        .request(
+        .central
+        .league(
             Method::POST,
             &finish.league,
             "actions",
@@ -219,6 +139,7 @@ pub async fn serve(config: Config) -> Result<()> {
 mod tests {
     use super::*;
     use axum::extract::State;
+    use reqwest::Client;
     use serde_json::{Value, json};
     use tokio::sync::Mutex;
 
