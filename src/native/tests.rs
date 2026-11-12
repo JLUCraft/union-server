@@ -178,6 +178,7 @@ struct Fixture {
     config: Config,
     address: SocketAddr,
     station: Station,
+    witnesses: Witnesses,
     tasks: JoinSet<()>,
 }
 impl Fixture {
@@ -274,8 +275,10 @@ impl Fixture {
         let central = Central::new(config.skin_site.clone(), config.session_token.clone())?;
         let key = Arc::new(RsaPrivateKey::new(&mut OsRng, 1024)?);
         let serving = config.clone();
+        let witnesses = Witnesses::default();
+        let collector = witnesses.clone();
         tasks.spawn(async move {
-            serve_scheduled(serving, central, key, Arc::new(listener))
+            serve_scheduled(serving, central, key, Arc::new(listener), collector)
                 .await
                 .unwrap();
         });
@@ -284,6 +287,7 @@ impl Fixture {
             config,
             address,
             station,
+            witnesses,
             tasks,
         })
     }
@@ -393,6 +397,11 @@ async fn encrypted_gateway_routes_accounts_and_fences_existing_sessions_on_revoc
     fixture.station.mode.store(1, Ordering::SeqCst);
     fixture.transfer(&mut waiting).await?;
     let mut arena = fixture.play().await?;
+    assert!(fixture.witnesses.recorded(
+        "arena",
+        "account-alice",
+        &fixture.station.uuid.simple().to_string()
+    ));
     fixture.station.mode.store(4, Ordering::SeqCst);
     fixture.transfer(&mut arena).await?;
     let mut substitute = fixture.play().await?;

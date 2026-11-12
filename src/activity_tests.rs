@@ -1,211 +1,10 @@
 use super::*;
-use authority::{journal::Journal, trust::TrustLog};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-type A = league::application::Action;
-type F = flows::FlowAction<league::events::EventsDomain>;
-type O = league::events::workflows::OrganizationAction;
-const TOKEN: &str = "activity-test-token-abcdefghijklmnopqrstuvwxyz";
-const OTHER_TOKEN: &str = "other-test-token-abcdefghijklmnopqrstuvwxyz";
-struct Fixture {
-    directory: tempfile::TempDir,
-    keys: Vec<Identity>,
-    authority: Authority<Application>,
-    genesis: state::State<Application>,
-    service: String,
-    profile: String,
-}
-impl Fixture {
-    async fn new() -> Result<Self> {
-        Self::with_binding(
-            league::GAME_PROFILE,
-            uuid::Uuid::from_u128(42).simple().to_string(),
-        )
-        .await
-    }
-    async fn with_binding(kind: &str, profile: String) -> Result<Self> {
-        let directory = tempfile::tempdir()?;
-        let keys: Vec<_> = (0..5).map(|_| Identity::generate()).collect();
-        let mut identities = crate::test_identity::Identities::new(
-            &[
-                (&keys[0], "admin", "a"),
-                (&keys[1], "oracle", "a"),
-                (&keys[2], "worker", "a"),
-                (&keys[3], "player", "a"),
-                (&keys[4], "ghost", "b"),
-            ],
-            "admin",
-        );
-        identities.append(
-            node::protocol::TrustAction::BindAttribute {
-                member: "player".into(),
-                club: "a".into(),
-                kind: kind.into(),
-                value: profile.clone(),
-            },
-            &[&identities.root("a"), &keys[3]],
-        );
-        let genesis = identities.genesis::<Application>();
-        let mut log = TrustLog::open_with_namespace(
-            &directory.path().join("identity"),
-            identities.log.genesis(),
-            &identities.binding.genesis,
-            node::protocol::Namespace::builtin(),
-        )?;
-        for record in identities.log.history_since(None)?.records {
-            log.append(record)?;
-        }
-        log.mark_current()?;
-        let view = log.view(std::time::Duration::from_secs(60))?;
-        let journal = Journal::open_with_namespace(
-            directory.path().join("application"),
-            genesis.clone(),
-            node::protocol::Namespace::builtin(),
-        )?;
-        let authority = Authority::Local {
-            journal: Arc::new(tokio::sync::Mutex::new(journal)),
-            log: Arc::new(tokio::sync::Mutex::new(log)),
-            view,
-        };
-        let service = node::ServiceId::new().to_string();
-        let fixture = Self {
-            directory,
-            keys,
-            authority,
-            genesis,
-            service,
-            profile,
-        };
-        fixture
-            .apply(
-                0,
-                F::Inner(league::events::EventAction::Organization(
-                    O::ActivityPolicy {
-                        policy: league::events::points::ActivityPolicy {
-                            daily_member_cap: 100,
-                        },
-                    },
-                )),
-            )
-            .await?;
-        fixture
-            .apply(
-                0,
-                F::Inner(league::events::EventAction::Organization(O::OracleSource {
-                    id: "survival".into(),
-                    source: league::events::points::OracleSourcePolicy {
-                        title: "Verified survival".into(),
-                        club: "a".into(),
-                        oracle_device: fixture.keys[1].peer_id().to_string(),
-                        service: fixture.service.clone(),
-                        weight_bps: 10_000,
-                        points_per_slice: 10,
-                        max_bonus_per_slice: 0,
-                        daily_source_cap: 1000,
-                        enabled: true,
-                    },
-                })),
-            )
-            .await?;
-        for (name, key) in [
-            ("oracle.key", &fixture.keys[1]),
-            ("worker.key", &fixture.keys[2]),
-        ] {
-            key.save_new(fixture.directory.path().join(name))?;
-        }
-        for (name, value) in [("probe.token", TOKEN), ("other.token", OTHER_TOKEN)] {
-            let path = fixture.directory.path().join(name);
-            std::fs::write(&path, value)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-            }
-        }
-        Ok(fixture)
-    }
-    async fn apply(&self, key: usize, action: F) -> Result<()> {
-        self.authority
-            .apply(&self.keys[key], A::Domain(action))
-            .await?;
-        Ok(())
-    }
-    fn config(&self) -> Config {
-        Config {
-            bind: "127.0.0.1:0".parse().unwrap(),
-            key: self.directory.path().join("oracle.key"),
-            spool: self.directory.path().join("pending.json"),
-            evidence_directory: self.directory.path().join("evidence"),
-            probes: vec![
-                Probe {
-                    source: "survival".into(),
-                    service: self.service.clone(),
-                    token: self.directory.path().join("probe.token"),
-                },
-                Probe {
-                    source: "other".into(),
-                    service: self.service.clone(),
-                    token: self.directory.path().join("other.token"),
-                },
-            ],
-        }
-    }
-    async fn file(&self, bytes: &[u8]) -> Result<node::protocol::Cid> {
-        let state = self.authority.state(self.keys[0].peer_id()).await?;
-        let (cid, blocks) = state.domain.inner.files.version(None, bytes)?;
-        for block in blocks {
-            self.apply(3, F::Inner(league::events::EventAction::PutBlock { block }))
-                .await?;
-        }
-        Ok(cid)
-    }
-    async fn balance(&self) -> Result<u64> {
-        Ok(self
-            .authority
-            .state(self.keys[0].peer_id())
-            .await?
-            .domain
-            .inner
-            .organization
-            .points
-            .get("a")
-            .and_then(|m| m.get("player"))
-            .copied()
-            .unwrap_or(0))
-    }
-    fn witness(&self, witnesses: &Witnesses, start: u64, end: u64) -> Result<WitnessGuard> {
-        let guard = witnesses.begin_at(
-            &self.service,
-            &self.profile,
-            "player",
-            &self.keys[3].peer_id().to_string(),
-            ["a".into()].into(),
-            start,
-        )?;
-        let mut current = start;
-        while current < end {
-            guard.touch_at(current + ACTIVITY_SLICE_MS - 1);
-            current += ACTIVITY_SLICE_MS;
-        }
-        Ok(guard)
-    }
-    fn report(&self, start: u64, active: bool) -> ProbeReport {
-        let mut value = metrics();
-        if !active {
-            value.look_samples = 0;
-            value.yaw_variance_milli = 0;
-        }
-        ProbeReport {
-            window_start_ms: start,
-            window_end_ms: start + ACTIVITY_SLICE_MS,
-            players: [
-                (self.profile.clone(), value),
-                (uuid::Uuid::from_u128(999).simple().to_string(), metrics()),
-            ]
-            .into(),
-        }
-    }
-}
+use axum::http::HeaderMap;
+use serde_json::{Value, json};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::task::JoinSet;
+const TOKEN: &str = "activity-paper-token-abcdefghijklmnopqrstuvwxyz";
+const PROFILE: &str = "0000000000000000000000000000002a";
 fn metrics() -> ActivityMetrics {
     ActivityMetrics {
         movement_steps: 20,
@@ -216,121 +15,6 @@ fn metrics() -> ActivityMetrics {
         world_interactions: 3,
         progress_events: 0,
     }
-}
-fn http() -> reqwest::Client {
-    reqwest::Client::builder().no_proxy().build().unwrap()
-}
-
-#[tokio::test]
-async fn report_player_limit_and_expiration_do_not_block_later_valid_reports() -> Result<()> {
-    let fixture = Fixture::new().await?;
-    let oracle = Oracle::start(
-        fixture.config(),
-        fixture.authority.clone(),
-        Witnesses::default(),
-    )
-    .await?;
-    let client = http();
-    let end = now_ms()? / ACTIVITY_SLICE_MS * ACTIVITY_SLICE_MS;
-    let mut report = fixture.report(end - 2 * ACTIVITY_SLICE_MS, true);
-    report.players = (0..=MAX_REPORT_PLAYERS)
-        .map(|index| {
-            (
-                uuid::Uuid::from_u128(index as u128).simple().to_string(),
-                metrics(),
-            )
-        })
-        .collect();
-    assert_eq!(
-        post(&client, &oracle, "survival", TOKEN, &report).await?,
-        422
-    );
-    let mut expired = report.clone();
-    expired.window_start_ms -= MAX_REPORT_LAG_MS + ACTIVITY_SLICE_MS;
-    expired.window_end_ms -= MAX_REPORT_LAG_MS + ACTIVITY_SLICE_MS;
-    assert_eq!(
-        post(&client, &oracle, "survival", TOKEN, &expired).await?,
-        410
-    );
-    report.players.pop_last();
-    assert_eq!(report.players.len(), MAX_REPORT_PLAYERS);
-    assert_eq!(
-        post(&client, &oracle, "survival", TOKEN, &report).await?,
-        204
-    );
-    assert_eq!(
-        post(
-            &client,
-            &oracle,
-            "survival",
-            TOKEN,
-            &fixture.report(end - ACTIVITY_SLICE_MS, true)
-        )
-        .await?,
-        204
-    );
-    oracle.stop().await?;
-    assert_eq!(fixture.balance().await?, 0);
-    Ok(())
-}
-
-#[tokio::test]
-async fn evidence_write_failure_remains_retryable_instead_of_a_permanent_conflict() -> Result<()> {
-    let fixture = Fixture::new().await?;
-    let oracle = Oracle::start(
-        fixture.config(),
-        fixture.authority.clone(),
-        Witnesses::default(),
-    )
-    .await?;
-    let client = http();
-    let end = now_ms()? / ACTIVITY_SLICE_MS * ACTIVITY_SLICE_MS;
-    let start = end - BATCH_WINDOW_MS;
-    for index in 0..5 {
-        assert_eq!(
-            post(
-                &client,
-                &oracle,
-                "survival",
-                TOKEN,
-                &fixture.report(start + index * ACTIVITY_SLICE_MS, true)
-            )
-            .await?,
-            204
-        );
-    }
-    let blocked = fixture
-        .config()
-        .evidence_directory
-        .join(node::protocol::digest(b"survival"));
-    std::fs::write(&blocked, b"injected evidence storage failure")?;
-    let last = fixture.report(end - ACTIVITY_SLICE_MS, true);
-    assert_eq!(post(&client, &oracle, "survival", TOKEN, &last).await?, 503);
-    std::fs::remove_file(blocked)?;
-    assert_eq!(post(&client, &oracle, "survival", TOKEN, &last).await?, 204);
-    oracle.stop().await?;
-    Ok(())
-}
-
-async fn post(
-    client: &reqwest::Client,
-    oracle: &Oracle,
-    source: &str,
-    token: &str,
-    report: &ProbeReport,
-) -> Result<u16> {
-    Ok(client
-        .post(format!(
-            "http://{}/v1/activity/{source}/slice",
-            oracle.address()
-        ))
-        .header("Connection", "close")
-        .bearer_auth(token)
-        .json(report)
-        .send()
-        .await?
-        .status()
-        .as_u16())
 }
 #[test]
 fn idle_fixed_view_and_two_position_loops_fail_the_activity_predicate() {
@@ -347,430 +31,18 @@ fn idle_fixed_view_and_two_position_loops_fail_the_activity_predicate() {
     value.progress_events = 2;
     assert!(value.active());
 }
-#[tokio::test]
-async fn bearer_scope_actual_gateway_intervals_and_duplicate_reports_control_minting() -> Result<()>
-{
-    let fixture = Fixture::new().await?;
-    let witnesses = Witnesses::default();
-    let end = now_ms()? / ACTIVITY_SLICE_MS * ACTIVITY_SLICE_MS;
-    let start = end - BATCH_WINDOW_MS;
-    let guard = fixture.witness(&witnesses, start, end)?;
-    let oracle = Oracle::start(fixture.config(), fixture.authority.clone(), witnesses).await?;
-    let client = http();
-    let first = fixture.report(start, true);
-    assert_eq!(
-        post(&client, &oracle, "survival", "wrong-token", &first).await?,
-        401
-    );
-    assert_eq!(post(&client, &oracle, "other", TOKEN, &first).await?, 401);
-    let future = fixture.report(end + ACTIVITY_SLICE_MS, true);
-    assert_eq!(
-        post(&client, &oracle, "survival", TOKEN, &future).await?,
-        422
-    );
-    for index in 0..6 {
-        assert_eq!(
-            post(
-                &client,
-                &oracle,
-                "survival",
-                TOKEN,
-                &fixture.report(start + index * ACTIVITY_SLICE_MS, true)
-            )
-            .await?,
-            204
-        );
-    }
-    assert_eq!(fixture.balance().await?, 60);
-    assert_eq!(
-        post(&client, &oracle, "survival", TOKEN, &first).await?,
-        204
-    );
-    let mut changed = first;
-    changed
-        .players
-        .get_mut(&fixture.profile)
-        .unwrap()
-        .world_interactions += 1;
-    assert_eq!(
-        post(&client, &oracle, "survival", TOKEN, &changed).await?,
-        409
-    );
-    assert_eq!(fixture.balance().await?, 60);
-    let state = fixture.authority.state(fixture.keys[0].peer_id()).await?;
-    assert!(
-        !state
-            .domain
-            .inner
-            .organization
-            .points
-            .get("b")
-            .is_some_and(|m| m.contains_key("ghost"))
-    );
-    assert_eq!(
-        state.domain.inner.organization.activity_members["player"].active_slices,
-        6
-    );
-    assert!(state.domain.inner.files.is_empty());
-    let receipt = state
-        .domain
-        .inner
-        .organization
-        .activity_receipts
-        .values()
-        .next()
-        .context("missing receipt")?;
-    let evidence: serde_json::Value = client
-        .get(format!(
-            "http://{}/v1/activity/survival/evidence/{}",
-            oracle.address(),
-            receipt.evidence
-        ))
-        .bearer_auth(TOKEN)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    assert_eq!(
-        evidence["slices"]
-            .as_array()
-            .context("missing slices")?
-            .len(),
-        6
-    );
-    let attestation: Attestation = serde_json::from_value(evidence["attestation"].clone())?;
-    assert_eq!(attestation, receipt.attestation);
-    drop(guard);
-    oracle.stop().await?;
-    Ok(())
-}
-#[tokio::test]
-async fn acknowledged_pending_evidence_survives_an_adapter_crash_without_recreating_witnesses()
--> Result<()> {
-    let fixture = Fixture::new().await?;
-    let witnesses = Witnesses::default();
-    let end = now_ms()? / ACTIVITY_SLICE_MS * ACTIVITY_SLICE_MS;
-    let start = end - 3 * ACTIVITY_SLICE_MS;
-    let guard = fixture.witness(&witnesses, start, end)?;
-    let mut oracle = Oracle::start(fixture.config(), fixture.authority.clone(), witnesses).await?;
-    let client = http();
-    for index in 0..3 {
-        assert_eq!(
-            post(
-                &client,
-                &oracle,
-                "survival",
-                TOKEN,
-                &fixture.report(start + index * ACTIVITY_SLICE_MS, true)
-            )
-            .await?,
-            204
-        );
-    }
-    assert_eq!(fixture.balance().await?, 0);
-    oracle.task.as_ref().unwrap().abort();
-    let _ = oracle.task.take().unwrap().await;
-    drop(oracle);
-    drop(guard);
-    let recovered = Oracle::start(
-        fixture.config(),
-        fixture.authority.clone(),
-        Witnesses::default(),
-    )
-    .await?;
-    assert_eq!(
-        client
-            .post(format!(
-                "http://{}/v1/activity/survival/flush",
-                recovered.address()
-            ))
-            .bearer_auth(TOKEN)
-            .send()
-            .await?
-            .status()
-            .as_u16(),
-        204
-    );
-    assert_eq!(fixture.balance().await?, 30);
-    recovered.stop().await?;
-    Ok(())
-}
-#[tokio::test]
-async fn a_plugin_report_without_a_gateway_witness_never_mints_points() -> Result<()> {
-    let fixture = Fixture::new().await?;
-    let oracle = Oracle::start(
-        fixture.config(),
-        fixture.authority.clone(),
-        Witnesses::default(),
-    )
-    .await?;
-    let end = now_ms()? / ACTIVITY_SLICE_MS * ACTIVITY_SLICE_MS;
-    assert_eq!(
-        post(
-            &http(),
-            &oracle,
-            "survival",
-            TOKEN,
-            &fixture.report(end - ACTIVITY_SLICE_MS, true)
-        )
-        .await?,
-        204
-    );
-    oracle.stop().await?;
-    assert_eq!(fixture.balance().await?, 0);
-    Ok(())
-}
-#[tokio::test]
-async fn malformed_or_unrelated_attributes_never_mint_activity_points() -> Result<()> {
-    for (kind, profile, expected) in [
-        (league::GAME_PROFILE, "0123456789ABCDEF0123456789ABCDEF", 0),
-        (
-            league::GAME_PROFILE,
-            "01234567-89ab-cdef-0123-456789abcdef",
-            0,
-        ),
-        ("other", "0123456789abcdef0123456789abcdef", 0),
-        (league::GAME_PROFILE, "0123456789abcdef0123456789abcdef", 60),
-    ] {
-        let fixture = Fixture::with_binding(kind, profile.into()).await?;
-        let witnesses = Witnesses::default();
-        let end = now_ms()? / ACTIVITY_SLICE_MS * ACTIVITY_SLICE_MS;
-        let start = end - BATCH_WINDOW_MS;
-        let guard = fixture.witness(&witnesses, start, end)?;
-        let config = fixture.config();
-        let context = OracleContext {
-            authority: fixture.authority.clone(),
-            identity: fixture.keys[1].clone(),
-            witnesses,
-            bindings: [(
-                "survival".into(),
-                Binding {
-                    service: fixture.service.clone(),
-                    token: TOKEN.as_bytes().to_vec(),
-                },
-            )]
-            .into(),
-            pending: Default::default(),
-            _spool_lock: std::fs::File::create(config.spool.with_extension("lock"))?,
-            spool: config.spool,
-            evidence: crate::activity_evidence::EvidenceStore::new(config.evidence_directory)?,
-        };
-        let mut headers = HeaderMap::new();
-        headers.insert("authorization", format!("Bearer {TOKEN}").parse()?);
-        for index in 0..6 {
-            assert_eq!(
-                context
-                    .submit(
-                        "survival",
-                        &headers,
-                        fixture.report(start + index * ACTIVITY_SLICE_MS, true)
-                    )
-                    .await,
-                Ok(StatusCode::NO_CONTENT)
-            );
-        }
-        drop(guard);
-        assert_eq!(fixture.balance().await?, expected, "{kind}: {profile}");
-    }
-    Ok(())
-}
-async fn provider() -> Result<(String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>)> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let url = format!("http://{}/v1/chat/completions", listener.local_addr()?);
-    let calls = Arc::new(AtomicUsize::new(0));
-    let count = calls.clone();
-    let task = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut header = Vec::new();
-        while !header.ends_with(b"\r\n\r\n") {
-            header.push(stream.read_u8().await.unwrap());
-            assert!(header.len() < 16_384);
-        }
-        let header = String::from_utf8(header).unwrap();
-        let length = header
-            .lines()
-            .find_map(|v| {
-                v.to_ascii_lowercase()
-                    .strip_prefix("content-length:")
-                    .and_then(|n| n.trim().parse::<usize>().ok())
-            })
-            .unwrap();
-        let mut bytes = vec![0; length];
-        stream.read_exact(&mut bytes).await.unwrap();
-        let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(request["model"], "fixture");
-        assert_eq!(request["stream_options"]["include_usage"], true);
-        count.fetch_add(1, Ordering::SeqCst);
-        let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"A verified activity report.\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":16,\"completion_tokens\":8,\"total_tokens\":24}}\n\ndata: [DONE]\n\n";
-        stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
-    });
-    Ok((url, calls, task))
-}
-#[tokio::test]
-async fn witnessed_play_mints_then_a_normal_member_funds_local_inference_settles_and_replays()
--> Result<()> {
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        let fixture = Fixture::new().await?;
-        let (url, calls, provider) = provider().await?;
-        fixture
-            .apply(
-                0,
-                F::AiPricing {
-                    model: "fixture".into(),
-                    pricing: flows::ai::AiPricing {
-                        base_points: 1,
-                        input_points_per_1k: 2,
-                        output_points_per_1k: 3,
-                        max_input_tokens: 1000,
-                        settlement: flows::ai::Settlement::Burn,
-                    },
-                },
-            )
-            .await?;
-        fixture
-            .apply(
-                2,
-                F::AiWorker {
-                    models: ["fixture".into()].into(),
-                    active: true,
-                },
-            )
-            .await?;
-        let input = fixture.file(b"Summarize my activity.").await?;
-        let request = F::RequestAi {
-            id: "paid-member-job".into(),
-            input,
-            worker: "worker".into(),
-            model: "fixture".into(),
-            max_tokens: 32,
-            max_points: 4,
-        };
-        assert!(fixture.apply(3, request.clone()).await.is_err());
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-        let witnesses = Witnesses::default();
-        let end = now_ms()? / ACTIVITY_SLICE_MS * ACTIVITY_SLICE_MS;
-        let start = end - BATCH_WINDOW_MS;
-        let guard = fixture.witness(&witnesses, start, end)?;
-        let oracle = Oracle::start(fixture.config(), fixture.authority.clone(), witnesses).await?;
-        let client = http();
-        for index in 0..6 {
-            assert_eq!(
-                post(
-                    &client,
-                    &oracle,
-                    "survival",
-                    TOKEN,
-                    &fixture.report(start + index * ACTIVITY_SLICE_MS, true)
-                )
-                .await?,
-                204
-            );
-        }
-        assert_eq!(fixture.balance().await?, 60);
-        fixture.apply(3, request).await?;
-        assert_eq!(fixture.balance().await?, 56);
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-        let prepared = crate::ai_worker::prepare(crate::ai_worker::Config {
-            key: fixture.directory.path().join("worker.key"),
-            providers: vec![llm_gateway::Provider {
-                id: "local-fixture".into(),
-                protocol: llm_gateway::ApiDialect::ChatCompletions,
-                url,
-                key_env: None,
-                key_file: None,
-                authentication: None,
-                models: ["fixture".into()].into(),
-                capabilities: BTreeSet::new(),
-                context_tokens: 8192,
-            }],
-            concurrency: 1,
-        })?;
-        let worker = tokio::spawn(crate::ai_worker::serve(fixture.authority.clone(), prepared));
-        let mut updates = fixture.authority.watch().await;
-        let snapshot = loop {
-            updates.borrow_and_update();
-            let snapshot = fixture.authority.state(fixture.keys[0].peer_id()).await?;
-            if snapshot.domain.flows["paid-member-job"].status == flows::Status::Executed {
-                break snapshot;
-            }
-            updates.changed().await?;
-        };
-        assert_eq!(fixture.balance().await?, 58);
-        assert_eq!(snapshot.domain.ai_burned_points, 2);
-        let flow = &snapshot.domain.flows["paid-member-job"];
-        assert_eq!(flow.payer.member, "player");
-        assert_eq!(flow.records[0].escrowed_points, 0);
-        assert_eq!(flow.records[0].ai_runs[0].charged_points, 2);
-        assert_eq!(flow.records[0].ai_runs[0].refunded_points, 2);
-        assert_eq!(
-            league::points::output(&snapshot, "paid-member-job", 0)?,
-            "A verified activity report."
-        );
-        let trust = fixture.authority.identity_view().state()?;
-        let view = snapshot.identity_presentation(&trust)?;
-        let presentation = league::points::present(
-            &snapshot,
-            &view,
-            &fixture.keys[3],
-            &fixture.authority.genesis_hash().await,
-            now_ms()?,
-        )?
-        .context("missing point view")?;
-        assert_eq!(presentation.overview.available_points, "58");
-        assert_eq!(presentation.overview.frozen_points, "0");
-        assert_eq!(presentation.overview.earned_today, "60");
-        assert!(fixture.keys[3].public_key().verify(
-            presentation.statement.payload.as_bytes(),
-            &presentation.statement.signature
-        ));
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        provider.await?;
-        worker.abort();
-        let _ = worker.await;
-        drop(guard);
-        oracle.stop().await?;
-        let stored = fixture.authority.stored_state().await;
-        let path = fixture.directory.path().join("application");
-        let Fixture {
-            authority,
-            genesis,
-            directory,
-            ..
-        } = fixture;
-        drop(authority);
-        let replay = Journal::<Application>::open_with_namespace(
-            path,
-            genesis,
-            node::protocol::Namespace::builtin(),
-        )?;
-        assert_eq!(replay.state(), &stored);
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        drop(replay);
-        drop(directory);
-        Ok::<(), anyhow::Error>(())
-    })
-    .await?
-}
 #[test]
 fn packets_from_a_later_slice_cannot_fill_a_silent_earlier_gateway_window() {
     let witnesses = Witnesses::default();
     let guard = witnesses
-        .begin_at(
-            "service",
-            "uuid",
-            "member",
-            "device",
-            ["a".into()].into(),
-            0,
-        )
+        .begin_at("service", "00000000000000000000000000000001", "account", 0)
         .unwrap();
     guard.touch_at(2 * ACTIVITY_SLICE_MS - 1);
     assert!(
         witnesses
             .covering(
                 "service",
-                "uuid",
+                "00000000000000000000000000000001",
                 0,
                 ACTIVITY_SLICE_MS,
                 2 * ACTIVITY_SLICE_MS
@@ -782,7 +54,7 @@ fn packets_from_a_later_slice_cannot_fill_a_silent_earlier_gateway_window() {
         witnesses
             .covering(
                 "service",
-                "uuid",
+                "00000000000000000000000000000001",
                 ACTIVITY_SLICE_MS,
                 2 * ACTIVITY_SLICE_MS,
                 2 * ACTIVITY_SLICE_MS
@@ -791,185 +63,357 @@ fn packets_from_a_later_slice_cannot_fill_a_silent_earlier_gateway_window() {
             .is_some()
     );
 }
-#[cfg(feature = "server")]
-#[tokio::test]
-async fn an_assigned_provider_executes_from_a_follower_replica() -> Result<()> {
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        use authority::consensus::{Cluster, Peer};
-        let fixture = Fixture::new().await?;
-        let (url, calls, provider) = provider().await?;
-        let mut genesis = fixture.genesis.clone();
-        genesis
-            .domain
-            .inner
-            .organization
-            .points
-            .insert("a".into(), [("player".into(), 10)].into());
-        genesis.domain.ai_pricing.insert(
-            "fixture".into(),
-            flows::ai::AiPricing {
-                base_points: 1,
-                input_points_per_1k: 2,
-                output_points_per_1k: 3,
-                max_input_tokens: 1000,
-                settlement: flows::ai::Settlement::Burn,
-            },
-        );
-        let (input, blocks) = genesis
-            .domain
-            .inner
-            .files
-            .version(None, b"Follower provider task")?;
-        for block in blocks {
-            genesis.domain.inner.files.put(block)?;
+
+#[derive(Clone)]
+struct Station {
+    token: Arc<tokio::sync::Mutex<String>>,
+    enabled: Arc<AtomicBool>,
+    lose_reply: Arc<AtomicBool>,
+    reject_delivery: Arc<AtomicBool>,
+    owns_profile: Arc<AtomicBool>,
+    receipts: Arc<tokio::sync::Mutex<BTreeMap<String, (Value, Value)>>>,
+}
+impl Station {
+    async fn authorize(&self, headers: &HeaderMap) -> Result<(), StatusCode> {
+        crate::bearer::require_bearer(headers, self.token.lock().await.as_bytes())
+    }
+}
+async fn assignments(
+    State(state): State<Station>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    state.authorize(&headers).await?;
+    let cursor = state
+        .receipts
+        .lock()
+        .await
+        .values()
+        .map(|(delivery, _)| delivery["windowEndMs"].as_u64().unwrap())
+        .max()
+        .unwrap_or(0);
+    Ok(Json(
+        json!({"sources": if state.enabled.load(Ordering::SeqCst) { vec![json!({"config": {"id":"survival", "title":"World", "club":"jlu", "account":"host", "resource":"world", "weightBps":10000, "pointsPerSlice":"10", "maxBonusPerSlice":"0", "dailySourceCap":"1000", "enabled":true}, "lastWindowEndMs":cursor})] } else {vec![]} }),
+    ))
+}
+async fn delivery(
+    State(state): State<Station>,
+    headers: HeaderMap,
+    Json(delivery): Json<ActivityDelivery>,
+) -> Result<Json<Value>, StatusCode> {
+    state.authorize(&headers).await?;
+    if !state.enabled.load(Ordering::SeqCst) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if state.reject_delivery.load(Ordering::SeqCst) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let id = format!(
+        "{}:{}:{}",
+        delivery.source.as_str(),
+        delivery.window_start_ms,
+        delivery.window_end_ms
+    );
+    let input = serde_json::to_value(&delivery).unwrap();
+    let mut receipts = state.receipts.lock().await;
+    if let Some((previous, receipt)) = receipts.get(&id) {
+        if previous != &input {
+            return Err(StatusCode::CONFLICT);
         }
-        let (log, view) = match &fixture.authority {
-            Authority::Local { log, view, .. } => (log.clone(), view.clone()),
-            _ => unreachable!(),
+        return Ok(Json(receipt.clone()));
+    }
+    if !delivery.profiles.is_empty() && !state.owns_profile.load(Ordering::SeqCst) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let receipt = json!({"id":id, "attestation":{"source":delivery.source,"windowStartMs":delivery.window_start_ms,"windowEndMs":delivery.window_end_ms,"players":delivery.players,"evidence":format!("artifact-{}", receipts.len())}, "creditedAt":0, "creditedDay":0, "accounts":{}, "awarded":{}});
+    receipts.insert(id, (input, receipt.clone()));
+    if state.lose_reply.swap(false, Ordering::SeqCst) {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    Ok(Json(receipt))
+}
+async fn artifact(
+    State(state): State<Station>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    state.authorize(&headers).await?;
+    let receipts = state.receipts.lock().await;
+    let (delivery, _) = receipts
+        .values()
+        .find(|(_, receipt)| receipt["attestation"]["evidence"] == id)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(
+        json!({"profiles":delivery["profiles"],"telemetry":delivery["telemetry"]}),
+    ))
+}
+struct Fixture {
+    directory: tempfile::TempDir,
+    site: SkinSite,
+    station: Station,
+    tasks: JoinSet<()>,
+}
+fn private(path: &std::path::Path, value: &str) -> Result<()> {
+    std::fs::write(path, value)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+impl Fixture {
+    async fn new() -> Result<Self> {
+        let directory = tempfile::tempdir()?;
+        let token = "central-host-session-abcdefghijklmnopqrstuvwxyz".to_string();
+        private(&directory.path().join("host.session"), &token)?;
+        private(&directory.path().join("paper.token"), TOKEN)?;
+        let station = Station {
+            token: Arc::new(tokio::sync::Mutex::new(token)),
+            enabled: Arc::new(AtomicBool::new(true)),
+            lose_reply: Arc::new(AtomicBool::new(false)),
+            reject_delivery: Arc::new(AtomicBool::new(false)),
+            owns_profile: Arc::new(AtomicBool::new(true)),
+            receipts: Arc::default(),
         };
-        let mut nodes = Vec::new();
-        for _ in 0..3 {
-            nodes.push(Arc::new(
-                node::Node::start(
-                    Identity::generate(),
-                    node::NodeConfig::new(node::protocol::Namespace::builtin()),
-                )
-                .await?,
-            ));
-        }
-        let peers: BTreeMap<_, _> = nodes
-            .iter()
-            .enumerate()
-            .map(|(index, node)| {
-                (
-                    (index + 1) as u64,
-                    Peer {
-                        peer: node.peer_id().to_string(),
-                        addresses: node.addresses().iter().map(ToString::to_string).collect(),
-                    },
-                )
-            })
-            .collect();
-        let mut clusters = Vec::new();
-        let mut serving = tokio::task::JoinSet::new();
-        for (index, node) in nodes.iter().enumerate() {
-            let cluster = Cluster::start(
-                (index + 1) as u64,
-                node.clone(),
-                &fixture.directory.path().join(format!("replica-{index}")),
-                genesis.clone(),
-                peers.clone(),
-                (log.clone(), view.clone()),
-            )
-            .await?;
-            serving.spawn(cluster.clone().serve(client::journal::PROTOCOL));
-            clusters.push(cluster);
-        }
-        tokio::task::yield_now().await;
-        clusters[0].initialize().await?;
-        let leader_index = loop {
-            let mut ready = None;
-            for (index, cluster) in clusters.iter().enumerate() {
-                if cluster.raft.ensure_linearizable().await.is_ok() {
-                    ready = Some(index);
-                    break;
-                }
-            }
-            if let Some(index) = ready {
-                break index;
-            }
-            tokio::task::yield_now().await;
-        };
-        let leader = Authority::Replicated(clusters[leader_index].clone());
-        let follower = Authority::Replicated(clusters[(leader_index + 1) % clusters.len()].clone());
-        assert!(follower.effect_epoch().is_none());
-        let prepared = crate::ai_worker::prepare(crate::ai_worker::Config {
-            key: fixture.directory.path().join("worker.key"),
-            providers: vec![llm_gateway::Provider {
-                id: "follower-fixture".into(),
-                protocol: llm_gateway::ApiDialect::ChatCompletions,
-                url,
-                key_env: None,
-                key_file: None,
-                authentication: None,
-                models: ["fixture".into()].into(),
-                capabilities: BTreeSet::new(),
-                context_tokens: 8192,
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let site = SkinSite::try_from(format!("http://{}", listener.local_addr()?))?;
+        let router = Router::new()
+            .route("/api/hosted-activity-sources", get(assignments))
+            .route("/api/points/activity-deliveries", post(delivery))
+            .route("/api/artifacts/{id}/content", get(artifact))
+            .with_state(station.clone());
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        Ok(Self {
+            directory,
+            site,
+            station,
+            tasks,
+        })
+    }
+    fn config(&self) -> Config {
+        Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            skin_site: self.site.clone(),
+            session_token: self.directory.path().join("host.session"),
+            spool: self.directory.path().join("pending.json"),
+            probes: vec![Probe {
+                source: "survival".into(),
+                resource: "world".into(),
+                token: self.directory.path().join("paper.token"),
             }],
-            concurrency: 1,
-        })?;
-        let mut updates = leader.watch().await;
-        let worker = tokio::spawn(crate::ai_worker::serve(follower.clone(), prepared));
-        loop {
-            updates.borrow_and_update();
-            if leader
-                .state(fixture.keys[0].peer_id())
-                .await?
-                .domain
-                .ai_workers
-                .contains_key("worker")
-            {
-                break;
-            }
-            updates.changed().await?;
         }
-        follower
-            .apply(
-                &fixture.keys[3],
-                A::Domain(F::RequestAi {
-                    id: "follower-job".into(),
-                    input,
-                    worker: "worker".into(),
-                    model: "fixture".into(),
-                    max_tokens: 32,
-                    max_points: 4,
-                }),
-            )
-            .await?;
-        let result = loop {
-            updates.borrow_and_update();
-            let state = leader.state(fixture.keys[0].peer_id()).await?;
-            if state
-                .domain
-                .flows
-                .get("follower-job")
-                .is_some_and(|f| f.status == flows::Status::Executed)
-            {
-                break state;
-            }
-            updates.changed().await?;
-        };
-        assert_eq!(result.domain.inner.organization.points["a"]["player"], 8);
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            league::points::output(&result, "follower-job", 0)?,
-            "A verified activity report."
-        );
-        worker.abort();
-        let _ = worker.await;
-        provider.await?;
-        drop(updates);
-        drop(leader);
-        drop(follower);
-        serving.shutdown().await;
-        for cluster in &clusters {
-            cluster.raft.shutdown().await?;
-        }
-        drop(clusters);
-        for mut node in nodes {
-            // Aborted RPC handlers release their cluster references when cancellation is polled.
-            let node = loop {
-                match Arc::try_unwrap(node) {
-                    Ok(node) => break node,
-                    Err(retained) => {
-                        node = retained;
-                        tokio::task::yield_now().await;
-                    }
+    }
+}
+async fn send(
+    client: &reqwest::Client,
+    oracle: &RunningOracle,
+    operation: &str,
+    body: Option<&ProbeReport>,
+    token: &str,
+) -> Result<u16> {
+    let mut request = client
+        .post(format!(
+            "http://{}/v1/activity/survival/{operation}",
+            oracle.address()
+        ))
+        .bearer_auth(token);
+    if let Some(body) = body {
+        request = request.json(body);
+    }
+    Ok(request.send().await?.status().as_u16())
+}
+// A separate runtime lets a simulated process crash cancel every HTTP connection
+// task, including keepalive connections holding the router and spool lock.
+struct RunningOracle {
+    address: SocketAddr,
+    control: tokio::sync::oneshot::Sender<bool>,
+    thread: std::thread::JoinHandle<Result<()>>,
+}
+impl RunningOracle {
+    async fn start(config: Config, witnesses: Witnesses) -> Result<Self> {
+        let (ready, address) = tokio::sync::oneshot::channel();
+        let (control, command) = tokio::sync::oneshot::channel();
+        let thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(async {
+                let oracle = Oracle::start(config, witnesses).await?;
+                let _ = ready.send(oracle.address());
+                if command.await.unwrap_or(false) {
+                    oracle.stop().await?;
                 }
-            };
-            node.shutdown().await?;
-        }
-        Ok::<(), anyhow::Error>(())
-    })
-    .await?
+                // Runtime destruction cancels the server and its connection tasks.
+                Ok(())
+            })
+        });
+        Ok(Self {
+            address: address.await?,
+            control,
+            thread,
+        })
+    }
+    fn address(&self) -> SocketAddr {
+        self.address
+    }
+    async fn finish(self, graceful: bool) -> Result<()> {
+        let _ = self.control.send(graceful);
+        tokio::task::spawn_blocking(move || self.thread.join())
+            .await?
+            .map_err(|_| anyhow::anyhow!("adapter thread panicked"))??;
+        Ok(())
+    }
+}
+fn report(start: u64, active: bool) -> ProbeReport {
+    let mut measured = metrics();
+    if !active {
+        measured.look_samples = 0;
+    }
+    ProbeReport {
+        window_start_ms: start,
+        window_end_ms: start + ACTIVITY_SLICE_MS,
+        players: [
+            (PROFILE.into(), measured),
+            ("000000000000000000000000000000ff".into(), metrics()),
+        ]
+        .into(),
+    }
+}
+#[tokio::test]
+async fn central_delivery_preserves_gateway_proofs_through_crashes_uncertain_commit_and_revocation()
+-> Result<()> {
+    let mut fixture = Fixture::new().await?;
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let end = now_ms()? / ACTIVITY_SLICE_MS * ACTIVITY_SLICE_MS;
+    let start = end - 8 * ACTIVITY_SLICE_MS;
+    let witnesses = Witnesses::default();
+    let guard = witnesses.begin_at("world", PROFILE, "account-alice", start)?;
+    guard.touch_at(start + ACTIVITY_SLICE_MS - 1);
+    guard.touch_at(start + 2 * ACTIVITY_SLICE_MS - 1);
+    let first = report(start, true);
+    let second = report(start + ACTIVITY_SLICE_MS, false);
+    let oracle = RunningOracle::start(fixture.config(), witnesses).await?;
+    assert_eq!(
+        send(&client, &oracle, "slice", Some(&first), "wrong-token").await?,
+        401
+    );
+    assert_eq!(
+        send(&client, &oracle, "slice", Some(&first), TOKEN).await?,
+        204
+    );
+    assert_eq!(
+        send(&client, &oracle, "slice", Some(&second), TOKEN).await?,
+        204
+    );
+    assert!(fixture.station.receipts.lock().await.is_empty());
+    oracle.finish(false).await?;
+    drop(guard);
+    let oracle = RunningOracle::start(fixture.config(), Witnesses::default()).await?;
+    fixture
+        .station
+        .reject_delivery
+        .store(true, Ordering::SeqCst);
+    assert_eq!(send(&client, &oracle, "flush", None, TOKEN).await?, 400);
+    // Failure of the frozen older batch must not quarantine a new Paper report.
+    let next = report(start + 2 * ACTIVITY_SLICE_MS, true);
+    assert_eq!(
+        send(&client, &oracle, "slice", Some(&next), TOKEN).await?,
+        503
+    );
+    fixture
+        .station
+        .reject_delivery
+        .store(false, Ordering::SeqCst);
+    fixture.station.lose_reply.store(true, Ordering::SeqCst);
+    assert_eq!(send(&client, &oracle, "flush", None, TOKEN).await?, 503);
+    assert_eq!(fixture.station.receipts.lock().await.len(), 1);
+    fixture.station.owns_profile.store(false, Ordering::SeqCst);
+    oracle.finish(false).await?;
+    let rotated = "renewed-central-session-abcdefghijklmnopqrstuvwxyz";
+    private(&fixture.directory.path().join("host.session"), rotated)?;
+    *fixture.station.token.lock().await = rotated.into();
+    let oracle = RunningOracle::start(fixture.config(), Witnesses::default()).await?;
+    assert_eq!(send(&client, &oracle, "flush", None, TOKEN).await?, 204);
+    assert_eq!(
+        send(&client, &oracle, "slice", Some(&first), TOKEN).await?,
+        204
+    );
+    let (delivery, receipt) = fixture
+        .station
+        .receipts
+        .lock()
+        .await
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        delivery["players"],
+        json!({"account-alice":{"activeSlices":1,"afkSlices":1,"bonusPoints":"0"}})
+    );
+    assert_eq!(delivery["profiles"], json!({PROFILE:"account-alice"}));
+    let proof: Proof = serde_json::from_str(delivery["telemetry"].as_str().unwrap())?;
+    assert_eq!(proof.slices[0].witnesses[PROFILE].account, "account-alice");
+    let mut changed = first.clone();
+    changed.players.get_mut(PROFILE).unwrap().movement_steps += 1;
+    assert_eq!(
+        send(&client, &oracle, "slice", Some(&changed), TOKEN).await?,
+        409
+    );
+    let evidence = receipt["attestation"]["evidence"].as_str().unwrap();
+    let response = client
+        .get(format!(
+            "http://{}/v1/activity/survival/evidence/{evidence}",
+            oracle.address()
+        ))
+        .bearer_auth(TOKEN)
+        .send()
+        .await?;
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.json::<Value>().await?["telemetry"],
+        delivery["telemetry"]
+    );
+    let response = client
+        .get(format!(
+            "http://{}/v1/activity/survival/evidence/unrelated",
+            oracle.address()
+        ))
+        .bearer_auth(TOKEN)
+        .send()
+        .await?;
+    assert_eq!(response.status(), 404);
+    // A complete later batch without native witnesses archives telemetry without minting points.
+    for index in 2..8 {
+        assert_eq!(
+            send(
+                &client,
+                &oracle,
+                "slice",
+                Some(&report(start + index * ACTIVITY_SLICE_MS, true)),
+                TOKEN
+            )
+            .await?,
+            204
+        );
+    }
+    assert_eq!(fixture.station.receipts.lock().await.len(), 2);
+    let receipts = fixture.station.receipts.lock().await;
+    let (unwitnessed, _) = receipts
+        .values()
+        .find(|(value, _)| value["windowStartMs"] == start + 2 * ACTIVITY_SLICE_MS)
+        .unwrap();
+    assert_eq!(unwitnessed["players"], json!({}));
+    drop(receipts);
+    fixture.station.enabled.store(false, Ordering::SeqCst);
+    assert_eq!(
+        send(&client, &oracle, "slice", Some(&first), TOKEN).await?,
+        403
+    );
+    oracle.finish(true).await?;
+    fixture.tasks.shutdown().await;
+    Ok(())
 }

@@ -1,7 +1,6 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 //! Shared embedded and standalone Minecraft room runtime.
 pub mod activity;
-mod activity_evidence;
 mod bearer;
 mod central;
 pub mod forwarding;
@@ -23,6 +22,11 @@ mod skin_contracts {
 #[allow(dead_code, clippy::unwrap_used, clippy::possible_missing_else)]
 mod game_contracts {
     include!(concat!(env!("OUT_DIR"), "/game_contracts.rs"));
+}
+
+#[allow(dead_code, clippy::unwrap_used, clippy::possible_missing_else)]
+mod point_contracts {
+    include!(concat!(env!("OUT_DIR"), "/point_contracts.rs"));
 }
 
 pub use node::{Error, Result};

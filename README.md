@@ -69,8 +69,40 @@ Assignment changes close the previous connections before serving the new game.
 Active admission is refreshed each second. Connections close when an admission
 request fails or the last accepted decision is ten seconds old. Routing updates
 transfer clients between waiting and arena rooms, including seat replacement
-and pause changes. This path no longer feeds the federation activity oracle;
-central activity delivery is the following consumer migration.
+and pause changes. Arena play records activity witnesses with the authenticated
+account, UUID, and centrally assigned resource. Configuration, waiting, and
+closed connections do not supply continuous-play evidence.
+
+## Activity delivery
+
+The Paper adapter accepts `POST /v1/activity/:source/slice` and
+`POST /v1/activity/:source/flush` on loopback. Configure `services.activity_oracle`
+with `bind`, `skin_site`, `session_token`, `spool`, and `probes`. Each probe has
+`source`, `resource`, and `token`; resource IDs come from the central game resource.
+Credential and spool paths resolve relative to the host configuration file.
+Keep credentials and the owner-only spool outside the repository. The session
+file contains the central host account's Yggdrasil session and is reread for
+requests; each Paper token is loaded at startup.
+
+Current source assignments come from `GET /api/hosted-activity-sources`.
+Only native gateway play that covers the entire five-minute slice, with client
+traffic during its final minute, supplies an account/UUID witness. Multiple
+profiles cannot credit an account twice in a slice. Look variation and at least
+two movement, interaction, or progress dimensions determine active versus AFK
+slices. Unwitnessed telemetry remains in the private proof without credits.
+
+Reports aggregate for up to thirty minutes, with earlier delivery on gaps,
+proof limits, explicit flush, or shutdown. Acknowledgments follow durable spool
+writes. The exact request is frozen on disk before central delivery; uncertain
+responses and restarts resend that request to the atomic central endpoint.
+Completed requests support one day of exact report retries.
+The skin station owns private evidence, current profile ownership checks, and
+point accounting. `GET /v1/activity/:source/evidence/:id` exposes only that
+source's retained central artifact through its Paper bearer.
+
+The adapter starts independently of governance and shares native gateway
+witnesses. Central delivery types and limits are generated from the skin
+station's points and office contracts.
 
 ## Setup and structure
 
@@ -101,10 +133,9 @@ membership evidence remains `institutional_email`.
 The host selects `node::attribute_session(league::GAME_PROFILE)`. Trusted game
 sessions require the binding and close when it changes or is removed; other
 identity checks still apply. Admission claims carry `TrustAdmission.attributes`.
-Native and room connections validate the game attribute and compare it with the
-actual Minecraft login UUID before forwarding. Scoring exposes only valid game
-profiles, and activity processing checks the same attribute against witnessed
-play. Format validation belongs to these game consumers; the identity core accepts
+Federation room connections validate the game attribute and compare it with the
+actual Minecraft login UUID before forwarding. Central TCP login, scoring, and
+activity delivery use the skin station authority described above. Format validation belongs to these game consumers; the identity core accepts
 generic attribute values. Existing signed identity logs require a separate
 migration to the new action schema.
 

@@ -1,31 +1,29 @@
 //! Server-side gateway witnesses and an authenticated, event-driven Paper oracle adapter.
+use crate::{
+    central::Central,
+    point_contracts::{
+        ACTIVITY_SLICE_MS, ActivityDelivery, ActivityReceipt, ActivitySourceList, ActivityTotals,
+        DAY_MS, MAX_EVIDENCE_BYTES, MAX_REPORT_PLAYERS, PointAmount,
+    },
+    skins::SkinSite,
+};
 use anyhow::{Context, Result, ensure};
-use authority::{authority::Authority, journal::now_ms};
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
-use identity::Identity;
-use league::events::points::{ACTIVITY_SLICE_MS, ActivityTotals, Attestation, DAY_MS};
+use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
     path::PathBuf,
-    pin::Pin,
     sync::{Arc, Mutex},
-    task::{Context as TaskContext, Poll},
 };
-use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
-    sync::oneshot,
-};
-type Application = league::application::Application;
+use tokio::sync::oneshot;
 const MAX_SESSIONS: usize = 65_536;
-// ActivityOutbox.MAX_REPORT_PLAYERS in the Paper producer uses the same limit.
-const MAX_REPORT_PLAYERS: usize = 256;
 const MAX_REPORT_BYTES: usize = 512 * 1024;
 const MAX_SPOOL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PACKET_SILENCE_MS: u64 = 60_000;
@@ -73,11 +71,9 @@ pub struct ProbeReport {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct Witness {
-    service: String,
+    resource: String,
     uuid: String,
-    member: String,
-    device: String,
-    clubs: BTreeSet<String>,
+    account: String,
     connected_ms: u64,
     last_packet_ms: u64,
     closed_ms: Option<u64>,
@@ -97,33 +93,35 @@ pub struct WitnessGuard {
 }
 impl Witnesses {
     #[cfg(test)]
-    pub(crate) fn recorded(&self, service: &str, member: &str, uuid: &str) -> bool {
+    pub(crate) fn recorded(&self, resource: &str, account: &str, uuid: &str) -> bool {
         self.0.lock().is_ok_and(|store| {
             store
                 .sessions
                 .values()
-                .any(|w| w.service == service && w.member == member && w.uuid == uuid)
+                .any(|w| w.resource == resource && w.account == account && w.uuid == uuid)
         })
     }
-    pub fn begin(
-        &self,
-        service: &str,
-        uuid: &str,
-        member: &str,
-        device: &str,
-        clubs: BTreeSet<String>,
-    ) -> Result<WitnessGuard> {
-        self.begin_at(service, uuid, member, device, clubs, now_ms()?)
+    pub(crate) fn begin(&self, resource: &str, uuid: &str, account: &str) -> Result<WitnessGuard> {
+        self.begin_at(resource, uuid, account, now_ms()?)
     }
     fn begin_at(
         &self,
-        service: &str,
+        resource: &str,
         uuid: &str,
-        member: &str,
-        device: &str,
-        clubs: BTreeSet<String>,
+        account: &str,
         now: u64,
     ) -> Result<WitnessGuard> {
+        ensure!(
+            !resource.is_empty() && !account.is_empty(),
+            "activity identity required"
+        );
+        ensure!(
+            uuid.len() == 32
+                && uuid
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "invalid activity UUID"
+        );
         let mut store = self
             .0
             .lock()
@@ -144,11 +142,9 @@ impl Witnesses {
         store.sessions.insert(
             id,
             Witness {
-                service: service.into(),
+                resource: resource.into(),
                 uuid: uuid.into(),
-                member: member.into(),
-                device: device.into(),
-                clubs,
+                account: account.into(),
                 connected_ms: now,
                 last_packet_ms: now,
                 closed_ms: None,
@@ -162,7 +158,7 @@ impl Witnesses {
     }
     fn covering(
         &self,
-        service: &str,
+        resource: &str,
         uuid: &str,
         start: u64,
         end: u64,
@@ -173,7 +169,7 @@ impl Witnesses {
             .lock()
             .map_err(|_| anyhow::anyhow!("witness store unavailable"))?;
         Ok(store.sessions.values().find_map(|w| {
-            if w.service != service
+            if w.resource != resource
                 || w.uuid != uuid
                 || w.connected_ms > start
                 || w.closed_ms.unwrap_or(now) < end
@@ -223,87 +219,71 @@ impl Drop for WitnessGuard {
         }
     }
 }
-pub struct Witnessed<T> {
-    pub stream: T,
-    pub witness: Option<WitnessGuard>,
-}
-impl<T: AsyncRead + Unpin> AsyncRead for Witnessed<T> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-        let before = buf.filled().len();
-        let result = Pin::new(&mut this.stream).poll_read(cx, buf);
-        if matches!(&result, Poll::Ready(Ok(())))
-            && buf.filled().len() > before
-            && let Some(witness) = &this.witness
-        {
-            witness.touch();
-        }
-        result
-    }
-}
-impl<T: AsyncWrite + Unpin> AsyncWrite for Witnessed<T> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        bytes: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.get_mut().stream).poll_write(cx, bytes)
-    }
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().stream).poll_flush(cx)
-    }
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
-    }
+fn now_ms() -> Result<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis()
+        .try_into()?)
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub bind: SocketAddr,
-    pub key: PathBuf,
+    pub skin_site: SkinSite,
+    pub session_token: PathBuf,
     pub spool: PathBuf,
-    pub evidence_directory: PathBuf,
     pub probes: Vec<Probe>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Probe {
     pub source: String,
-    pub service: String,
+    pub resource: String,
     pub token: PathBuf,
 }
 struct Binding {
-    service: String,
+    resource: String,
     token: Vec<u8>,
 }
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 struct VerifiedSlice {
     report: ProbeReport,
-    members: BTreeMap<String, String>,
     witnesses: BTreeMap<String, Witness>,
 }
 #[derive(Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Pending {
-    start: u64,
-    end: u64,
+    slices: Vec<VerifiedSlice>,
+    delivery: Option<ActivityDelivery>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Completed {
+    delivery: ActivityDelivery,
+    receipt: ActivityReceipt,
+}
+#[derive(Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceState {
+    pending: Pending,
+    completed: Vec<Completed>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Proof {
     slices: Vec<VerifiedSlice>,
 }
 struct OracleContext {
-    authority: Authority<Application>,
-    identity: Identity,
+    central: Central,
     witnesses: Witnesses,
     bindings: BTreeMap<String, Binding>,
-    pending: tokio::sync::Mutex<BTreeMap<String, Pending>>,
+    pending: tokio::sync::Mutex<BTreeMap<String, SourceState>>,
     spool: PathBuf,
     _spool_lock: std::fs::File,
-    evidence: crate::activity_evidence::EvidenceStore,
 }
 impl OracleContext {
-    fn persist(&self, pending: &BTreeMap<String, Pending>) -> Result<()> {
+    fn persist(&self, pending: &BTreeMap<String, SourceState>) -> Result<()> {
         use std::io::Write;
         let bytes = serde_json::to_vec(pending)?;
         ensure!(
@@ -327,6 +307,141 @@ impl OracleContext {
         }
         Ok(())
     }
+    async fn source(&self, source: &str) -> Result<u64, StatusCode> {
+        let binding = self.bindings.get(source).ok_or(StatusCode::NOT_FOUND)?;
+        let bytes = self
+            .central
+            .request(Method::GET, &["api", "hosted-activity-sources"], None)
+            .await?;
+        let list: ActivitySourceList =
+            serde_json::from_slice(&bytes).map_err(|_| StatusCode::BAD_GATEWAY)?;
+        let assigned = list
+            .sources
+            .into_iter()
+            .find(|s| {
+                s.config.id.as_str() == source
+                    && s.config.enabled
+                    && s.config.resource.as_str() == binding.resource
+            })
+            .ok_or(StatusCode::FORBIDDEN)?;
+        u64::try_from(assigned.last_window_end_ms).map_err(|_| StatusCode::BAD_GATEWAY)
+    }
+    async fn deliver(&self, delivery: &ActivityDelivery) -> Result<ActivityReceipt, StatusCode> {
+        let bytes = self
+            .central
+            .request(
+                Method::POST,
+                &["api", "points", "activity-deliveries"],
+                Some(
+                    serde_json::to_value(delivery)
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+                ),
+            )
+            .await?;
+        let receipt: ActivityReceipt =
+            serde_json::from_slice(&bytes).map_err(|_| StatusCode::BAD_GATEWAY)?;
+        if receipt.attestation.source.as_str() != delivery.source.as_str()
+            || receipt.attestation.window_start_ms != delivery.window_start_ms
+            || receipt.attestation.window_end_ms != delivery.window_end_ms
+            || serde_json::to_value(&receipt.attestation.players)
+                .map_err(|_| StatusCode::BAD_GATEWAY)?
+                != serde_json::to_value(&delivery.players).map_err(|_| StatusCode::BAD_GATEWAY)?
+        {
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+        Ok(receipt)
+    }
+    fn delivery(source: &str, slices: &[VerifiedSlice]) -> Result<ActivityDelivery> {
+        let mut profiles = std::collections::HashMap::new();
+        let mut players: std::collections::HashMap<String, ActivityTotals> =
+            std::collections::HashMap::new();
+        for slice in slices {
+            let mut seen = BTreeSet::new();
+            for (uuid, witness) in &slice.witnesses {
+                if let Some(previous) = profiles.insert(uuid.clone(), witness.account.clone()) {
+                    ensure!(
+                        previous == witness.account,
+                        "profile account changed within activity window"
+                    );
+                }
+                if !seen.insert(&witness.account) {
+                    continue;
+                }
+                let metrics = slice
+                    .report
+                    .players
+                    .get(uuid)
+                    .context("witnessed telemetry missing")?;
+                let total = players
+                    .entry(witness.account.clone())
+                    .or_insert(ActivityTotals {
+                        active_slices: 0,
+                        afk_slices: 0,
+                        bonus_points: PointAmount::try_from("0")?,
+                    });
+                if metrics.active() {
+                    total.active_slices += 1;
+                } else {
+                    total.afk_slices += 1;
+                }
+            }
+        }
+        ensure!(
+            profiles.len() <= MAX_REPORT_PLAYERS && players.len() <= MAX_REPORT_PLAYERS,
+            "activity batch player limit"
+        );
+        let telemetry = serde_json::to_string(&Proof {
+            slices: slices.to_vec(),
+        })?;
+        ensure!(
+            serde_json::to_vec(&serde_json::json!({"profiles":profiles,"telemetry":telemetry}))?
+                .len()
+                <= MAX_EVIDENCE_BYTES,
+            "activity evidence exceeds artifact limit"
+        );
+        Ok(serde_json::from_value(serde_json::json!({
+            "source": source,
+            "windowStartMs": slices.first().context("empty activity batch")?.report.window_start_ms,
+            "windowEndMs": slices.last().context("empty activity batch")?.report.window_end_ms,
+            "profiles": profiles, "players": players, "telemetry": telemetry,
+        }))?)
+    }
+    async fn flush(
+        &self,
+        source: &str,
+        pending: &mut BTreeMap<String, SourceState>,
+    ) -> Result<(), StatusCode> {
+        let Some(current) = pending.get_mut(source) else {
+            return Ok(());
+        };
+        if current.pending.slices.is_empty() {
+            return Ok(());
+        }
+        self.source(source).await?;
+        let current = pending
+            .get_mut(source)
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+        let delivery = match &current.pending.delivery {
+            Some(delivery) => delivery.clone(),
+            None => {
+                let delivery = Self::delivery(source, &current.pending.slices)
+                    .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+                current.pending.delivery = Some(delivery.clone());
+                delivery
+            }
+        };
+        // Freeze the exact handoff before any request can reach the central ledger.
+        self.persist(pending)
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        let receipt = self.deliver(&delivery).await?;
+        let current = pending
+            .get_mut(source)
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+        current.completed.push(Completed { delivery, receipt });
+        current.pending = Pending::default();
+        self.persist(pending)
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+    }
     async fn submit(
         &self,
         source: &str,
@@ -339,245 +454,133 @@ impl OracleContext {
         if !report.window_start_ms.is_multiple_of(ACTIVITY_SLICE_MS)
             || report.window_start_ms.checked_add(ACTIVITY_SLICE_MS) != Some(report.window_end_ms)
             || report.window_end_ms > now
+            || report.players.len() > MAX_REPORT_PLAYERS
         {
             return Err(StatusCode::UNPROCESSABLE_ENTITY);
         }
         if now.saturating_sub(report.window_end_ms) > MAX_REPORT_LAG_MS {
             return Err(StatusCode::GONE);
         }
-        if report.players.len() > MAX_REPORT_PLAYERS {
-            return Err(StatusCode::UNPROCESSABLE_ENTITY);
-        }
+        let cursor = self.source(source).await?;
         let mut pending = self.pending.lock().await;
-        let state = self
-            .authority
-            .state(self.identity.peer_id())
-            .await
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        let config = state
-            .domain
-            .organization
-            .oracle_sources
-            .get(source)
-            .ok_or(StatusCode::FORBIDDEN)?;
-        if !config.config.enabled
-            || config.config.oracle_device != self.identity.peer_id().to_string()
-            || config.config.service != binding.service
-        {
-            return Err(StatusCode::FORBIDDEN);
+        for current in pending.values_mut() {
+            current.completed.retain(|c| {
+                u64::try_from(c.delivery.window_end_ms)
+                    .is_ok_and(|end| end.saturating_add(DAY_MS) >= now)
+            });
         }
-        if let Some(current) = pending.get_mut(source)
-            && !current.slices.is_empty()
-            && current.end <= config.last_window_end_ms
-        {
-            self.flush(source, current)
+        if pending.get(source).is_some_and(|s| {
+            s.pending.delivery.is_some()
+                || s.pending
+                    .slices
+                    .last()
+                    .is_some_and(|slice| slice.report.window_end_ms <= cursor)
+        }) {
+            self.flush(source, &mut pending)
                 .await
                 .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-            self.persist(&pending)
-                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         }
-        if report.window_end_ms <= config.last_window_end_ms {
-            // An HTTP retry is acknowledged only for the exact report already pinned in evidence.
-            for receipt in state
-                .domain
-                .organization
-                .activity_receipts
-                .values()
-                .filter(|r| {
-                    r.attestation.source == source
-                        && r.attestation.window_start_ms <= report.window_start_ms
-                        && r.attestation.window_end_ms >= report.window_end_ms
-                })
-            {
-                let evidence = self
-                    .evidence
-                    .read(source, &receipt.evidence)
-                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-                let proof: serde_json::Value = serde_json::from_slice(&evidence)
-                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-                let slices: Vec<VerifiedSlice> = serde_json::from_value(proof["slices"].clone())
-                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-                if slices.iter().any(|s| s.report == report) {
+        if let Some(current) = pending.get(source) {
+            for completed in &current.completed {
+                if u64::try_from(completed.delivery.window_start_ms)
+                    .is_ok_and(|start| start <= report.window_start_ms)
+                    && u64::try_from(completed.delivery.window_end_ms)
+                        .is_ok_and(|end| end >= report.window_end_ms)
+                {
+                    let proof: Proof = serde_json::from_str(&completed.delivery.telemetry)
+                        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+                    if !proof.slices.iter().any(|slice| slice.report == report) {
+                        return Err(StatusCode::CONFLICT);
+                    }
+                    self.deliver(&completed.delivery)
+                        .await
+                        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+                    self.persist(&pending)
+                        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
                     return Ok(StatusCode::NO_CONTENT);
                 }
             }
+            if let Some(previous) = current
+                .pending
+                .slices
+                .iter()
+                .find(|s| s.report.window_start_ms == report.window_start_ms)
+            {
+                if previous.report != report {
+                    return Err(StatusCode::CONFLICT);
+                }
+                self.persist(&pending)
+                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+                return Ok(StatusCode::NO_CONTENT);
+            }
+            if current
+                .pending
+                .slices
+                .last()
+                .is_some_and(|slice| slice.report.window_end_ms > report.window_start_ms)
+            {
+                return Err(StatusCode::CONFLICT);
+            }
+        }
+        if report.window_start_ms < cursor {
             return Err(StatusCode::CONFLICT);
         }
-        if report.window_start_ms < config.last_window_end_ms {
-            return Err(StatusCode::CONFLICT);
-        }
-        let trust = self
-            .authority
-            .identity_view()
-            .state()
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        let core = state
-            .identity_core(&trust)
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        let mut members = BTreeMap::new();
         let mut witnesses = BTreeMap::new();
         for uuid in report.players.keys() {
-            if league::validate_game_profile(uuid).is_err() {
-                continue;
-            }
-            let uuid = uuid.clone();
-            let witness = self
+            if let Some(witness) = self
                 .witnesses
                 .covering(
-                    &binding.service,
-                    &uuid,
+                    &binding.resource,
+                    uuid,
                     report.window_start_ms,
                     report.window_end_ms,
                     now,
                 )
-                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-            if let Some(witness) = witness
-                && let Some(member) = core.members.get(&witness.member)
-                && witness.clubs.contains(&member.club)
-                && trust.member_for_device(&witness.device) == Some(witness.member.as_str())
-                && trust.is_member(&witness.member, &member.club)
-                && trust.attribute(&witness.member, league::GAME_PROFILE) == Some(uuid.as_str())
+                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
             {
-                let mut witness = witness;
-                witness.clubs = [member.club.clone()].into();
-                members.insert(uuid.clone(), witness.member.clone());
-                witnesses.insert(uuid, witness);
+                witnesses.insert(uuid.clone(), witness);
             }
         }
+        let slice = VerifiedSlice { report, witnesses };
         let current = pending.entry(source.into()).or_default();
-        if let Some(previous) = current
-            .slices
-            .iter()
-            .find(|s| s.report.window_start_ms == report.window_start_ms)
+        let mut candidate = current.pending.slices.clone();
+        candidate.push(slice.clone());
+        if !current.pending.slices.is_empty()
+            && (current
+                .pending
+                .slices
+                .last()
+                .is_some_and(|s| s.report.window_end_ms != slice.report.window_start_ms)
+                || Self::delivery(source, &candidate).is_err())
         {
-            if previous.report != report {
-                return Err(StatusCode::CONFLICT);
-            }
-            if current.end.saturating_sub(current.start) >= BATCH_WINDOW_MS {
-                self.flush(source, current)
-                    .await
-                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-            }
-            self.persist(&pending)
-                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-            return Ok(StatusCode::NO_CONTENT);
-        }
-        if !current.slices.is_empty() && report.window_start_ms < current.end {
-            return Err(StatusCode::CONFLICT);
-        }
-        if !current.slices.is_empty() && report.window_start_ms != current.end {
-            self.flush(source, current)
+            self.flush(source, &mut pending)
                 .await
                 .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         }
-        if current.slices.is_empty() {
-            current.start = report.window_start_ms;
-        }
-        current.end = report.window_end_ms;
-        current.slices.push(VerifiedSlice {
-            report,
-            members,
-            witnesses,
-        });
-        if current.end.saturating_sub(current.start) >= BATCH_WINDOW_MS {
-            self.flush(source, current)
+        let current = pending.entry(source.into()).or_default();
+        current.pending.slices.push(slice);
+        let first = current
+            .pending
+            .slices
+            .first()
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?
+            .report
+            .window_start_ms;
+        let last = current
+            .pending
+            .slices
+            .last()
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?
+            .report
+            .window_end_ms;
+        if last.saturating_sub(first) >= BATCH_WINDOW_MS {
+            self.flush(source, &mut pending)
                 .await
                 .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         }
         self.persist(&pending)
             .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         Ok(StatusCode::NO_CONTENT)
-    }
-    async fn flush(&self, source: &str, pending: &mut Pending) -> Result<()> {
-        if pending.slices.is_empty() {
-            return Ok(());
-        }
-        let state = self.authority.state(self.identity.peer_id()).await?;
-        for receipt in state
-            .domain
-            .organization
-            .activity_receipts
-            .values()
-            .filter(|r| {
-                r.attestation.source == source
-                    && r.attestation.window_start_ms == pending.start
-                    && r.attestation.window_end_ms == pending.end
-            })
-        {
-            let bytes = self.evidence.read(source, &receipt.evidence)?;
-            let proof: serde_json::Value = serde_json::from_slice(&bytes)?;
-            let slices: Vec<VerifiedSlice> = serde_json::from_value(proof["slices"].clone())?;
-            if slices == pending.slices {
-                *pending = Pending::default();
-                return Ok(());
-            }
-        }
-        let trust = self.authority.identity_view().state()?;
-        let core = state.identity_core(&trust)?;
-        let mut players: BTreeMap<String, ActivityTotals> = BTreeMap::new();
-        for slice in &pending.slices {
-            let mut seen = BTreeSet::new();
-            for (uuid, member) in &slice.members {
-                let Some(witness) = slice.witnesses.get(uuid) else {
-                    continue;
-                };
-                if !core.members.contains_key(member)
-                    || league::validate_game_profile(uuid).is_err()
-                    || trust.member_for_device(&witness.device) != Some(member.as_str())
-                    || trust.attribute(member, league::GAME_PROFILE) != Some(uuid.as_str())
-                {
-                    continue;
-                }
-                if !seen.insert(member) {
-                    continue;
-                }
-                let metrics = slice
-                    .report
-                    .players
-                    .get(uuid)
-                    .context("canonical profile missing from report")?;
-                let total = players.entry(member.clone()).or_default();
-                if metrics.active() {
-                    total.active_slices = total
-                        .active_slices
-                        .checked_add(1)
-                        .context("activity count overflow")?;
-                } else {
-                    total.afk_slices = total
-                        .afk_slices
-                        .checked_add(1)
-                        .context("activity count overflow")?;
-                }
-            }
-        }
-        let attestation = Attestation {
-            source: source.into(),
-            window_start_ms: pending.start,
-            window_end_ms: pending.end,
-            players,
-        };
-        let evidence = serde_json::to_vec(
-            &serde_json::json!({"attestation":attestation,"slices":pending.slices}),
-        )?;
-        let header = self.evidence.put(&attestation, &evidence)?;
-        self.authority
-            .apply(
-                &self.identity,
-                league::application::Action::Domain(flows::FlowAction::Inner(
-                    league::events::EventAction::Organization(
-                        league::events::workflows::OrganizationAction::ActivityAttest {
-                            source: source.into(),
-                            window_start_ms: pending.start,
-                            window_end_ms: pending.end,
-                            players: attestation.players,
-                            evidence: header,
-                        },
-                    ),
-                )),
-            )
-            .await?;
-        *pending = Pending::default();
-        Ok(())
     }
 }
 async fn report(
@@ -595,33 +598,35 @@ async fn flush(
 ) -> Result<StatusCode, StatusCode> {
     let binding = context.bindings.get(&source).ok_or(StatusCode::NOT_FOUND)?;
     crate::bearer::require_bearer(&headers, &binding.token)?;
+    context.source(&source).await?;
     let mut pending = context.pending.lock().await;
-    if let Some(current) = pending.get_mut(&source) {
-        context
-            .flush(&source, current)
-            .await
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    }
-    context
-        .persist(&pending)
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    context.flush(&source, &mut pending).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 async fn evidence(
     State(context): State<Arc<OracleContext>>,
-    Path((source, cid)): Path<(String, String)>,
+    Path((source, id)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let binding = context.bindings.get(&source).ok_or(StatusCode::NOT_FOUND)?;
     crate::bearer::require_bearer(&headers, &binding.token)?;
-    let cid = cid.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+    context.source(&source).await?;
+    let pending = context.pending.lock().await;
+    if !pending.get(&source).is_some_and(|s| {
+        s.completed
+            .iter()
+            .any(|c| c.receipt.attestation.evidence.as_str() == id)
+    }) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    drop(pending);
     let bytes = context
-        .evidence
-        .read(&source, &cid)
-        .map_err(|_| StatusCode::NOT_FOUND)?;
+        .central
+        .request(Method::GET, &["api", "artifacts", &id, "content"], None)
+        .await?;
     serde_json::from_slice(&bytes)
         .map(Json)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|_| StatusCode::BAD_GATEWAY)
 }
 pub struct Oracle {
     stop: Option<oneshot::Sender<()>>,
@@ -630,11 +635,7 @@ pub struct Oracle {
     address: SocketAddr,
 }
 impl Oracle {
-    pub async fn start(
-        config: Config,
-        authority: Authority<Application>,
-        witnesses: Witnesses,
-    ) -> Result<Self> {
+    pub async fn start(config: Config, witnesses: Witnesses) -> Result<Self> {
         ensure!(
             config.bind.ip().is_loopback(),
             "activity adapter must bind loopback"
@@ -643,30 +644,24 @@ impl Oracle {
             !config.probes.is_empty() && config.probes.len() <= MAX_REPORT_PLAYERS,
             "invalid activity probe count"
         );
-        let identity = Identity::load(&config.key)?;
+        let central = Central::new(config.skin_site, config.session_token)?;
         let mut bindings = BTreeMap::new();
         for probe in config.probes {
-            node::protocol::validate_identifier(&probe.source)?;
-            let _: node::ServiceId = probe.service.parse()?;
+            ensure!(
+                !probe.source.is_empty()
+                    && probe.source.len() <= 128
+                    && !probe.resource.is_empty()
+                    && probe.resource.len() <= 128,
+                "invalid activity assignment"
+            );
             crate::bootstrap::require_private(&probe.token, "activity probe token")?;
-            ensure!(
-                std::fs::metadata(&probe.token)?.len() <= 256,
-                "activity token too large"
-            );
-            let token = std::fs::read_to_string(probe.token)?
-                .trim()
-                .as_bytes()
-                .to_vec();
-            ensure!(
-                (32..=256).contains(&token.len()) && token.iter().all(u8::is_ascii_graphic),
-                "invalid activity probe token"
-            );
+            let token = crate::central::credential(&probe.token, 256)?.into_bytes();
             ensure!(
                 bindings
                     .insert(
                         probe.source,
                         Binding {
-                            service: probe.service,
+                            resource: probe.resource,
                             token
                         }
                     )
@@ -688,7 +683,7 @@ impl Oracle {
         }
         let lock = options.open(config.spool.with_extension("lock"))?;
         lock.try_lock().context("activity spool already open")?;
-        let pending = if config.spool.exists() {
+        let pending: BTreeMap<String, SourceState> = if config.spool.exists() {
             crate::bootstrap::require_private(&config.spool, "activity evidence spool")?;
             ensure!(
                 std::fs::metadata(&config.spool)?.len() <= MAX_SPOOL_BYTES as u64,
@@ -698,22 +693,24 @@ impl Oracle {
         } else {
             BTreeMap::new()
         };
+        ensure!(
+            pending.keys().all(|source| bindings.contains_key(source)),
+            "activity spool has unconfigured sources"
+        );
         let context = Arc::new(OracleContext {
-            authority,
-            identity,
+            central,
             witnesses,
             bindings,
             pending: tokio::sync::Mutex::new(pending),
             spool: config.spool,
             _spool_lock: lock,
-            evidence: crate::activity_evidence::EvidenceStore::new(config.evidence_directory)?,
         });
         let listener = tokio::net::TcpListener::bind(config.bind).await?;
         let address = listener.local_addr()?;
         let router = Router::new()
             .route("/v1/activity/{source}/slice", post(report))
             .route("/v1/activity/{source}/flush", post(flush))
-            .route("/v1/activity/{source}/evidence/{cid}", get(evidence))
+            .route("/v1/activity/{source}/evidence/{id}", get(evidence))
             .layer(DefaultBodyLimit::max(MAX_REPORT_BYTES))
             .with_state(context.clone());
         let (stop, stopping) = oneshot::channel();
@@ -727,9 +724,11 @@ impl Oracle {
                 .await?;
             let mut pending = context.pending.lock().await;
             let mut failure = None;
-            for (source, pending) in pending.iter_mut() {
-                if let Err(error) = context.flush(source, pending).await {
-                    failure = Some(error);
+            for source in pending.keys().cloned().collect::<Vec<_>>() {
+                if let Err(error) = context.flush(&source, &mut pending).await {
+                    failure = Some(anyhow::anyhow!(
+                        "central activity delivery rejected: {error}"
+                    ));
                 }
             }
             context.persist(&pending)?;
@@ -769,7 +768,6 @@ impl Drop for Oracle {
         }
     }
 }
-
 #[cfg(test)]
 #[path = "activity_tests.rs"]
 mod tests;

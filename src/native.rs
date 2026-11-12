@@ -1,5 +1,6 @@
 //! Central-authority Minecraft TCP gateway with encrypted Yggdrasil login.
 use crate::{
+    activity::Witnesses,
     central::Central,
     forwarding::Profile,
     game_contracts::{
@@ -106,6 +107,7 @@ struct Active {
 struct Runtime {
     central: Central,
     config: Config,
+    witnesses: Witnesses,
     healthy: bool,
     presence_lock: Arc<Mutex<()>>,
     active: BTreeMap<String, Active>,
@@ -428,6 +430,15 @@ async fn session(
     )
     .await??;
     let admitted = admission(&central, &config.league, &profile.uuid.simple().to_string()).await?;
+    let checked = Instant::now();
+    let league: Competition = serde_json::from_slice(
+        &central
+            .league(Method::GET, &config.league, "", None)
+            .await
+            .map_err(|code| anyhow::anyhow!("competition unavailable: {code}"))?,
+    )?;
+    ensure!(league.id == config.league, "unexpected competition");
+    let resource = league.resource;
     let member = admitted.account.clone();
     let (id, selected, backend) = {
         let mut runtime = shared.lock().await;
@@ -456,7 +467,7 @@ async fn session(
                 id,
                 uuid: profile.uuid.simple().to_string(),
                 route: Some(selected.clone()),
-                checked: Instant::now(),
+                checked,
                 health: default_health(recovery),
             },
         );
@@ -487,6 +498,7 @@ async fn session(
         let mut negotiation = crate::forwarding::LoginNegotiation::default();
         let mut keepalive: Option<(Vec<u8>, Instant)> = None;
         let mut announced = false;
+        let mut witness = None;
         let mut started = Instant::now();
         loop {
             room(&*shared.lock().await, &member)?;
@@ -498,6 +510,7 @@ async fn session(
             {
                 // Fence the old connection before issuing transfer; a reconnect may race
                 // this task's final cleanup, which is guarded by the session generation.
+                drop(witness.take());
                 finish(&shared, &member, id).await?;
                 let mut body = vec![];
                 protocol::string(&config.transfer.host, &mut body)?;
@@ -541,6 +554,14 @@ async fn session(
                     Stage::ConfigurationAck if p.id == 3 => {
                         ensure!(p.body.is_empty(), "invalid configuration acknowledgment");
                         stage = Stage::Play;
+                        if matches!(selected, Room::Arena(_)) {
+                            witness = Some(shared.lock().await.witnesses.begin(
+                                &resource,
+                                &profile.uuid.simple().to_string(),
+                                &member,
+                            )?);
+                        }
+
                         if !announced {
                             let health = shared.lock().await.active[&member].health.clone();
                             presence(&shared, &member, true, health).await?;
@@ -568,6 +589,9 @@ async fn session(
                     }
                 }
                 protocol::write_frame(&mut bw, &raw).await?;
+                if let Some(witness) = &witness {
+                    witness.touch();
+                }
             } else {
                 let raw = raw.ok_or_else(|| anyhow::anyhow!("backend closed"))??;
                 let p = Packet::decode(&raw, compression)?;
@@ -596,6 +620,7 @@ async fn session(
                     }
                     Stage::Play if p.id == protocol::PLAY_RECONFIGURE => {
                         ensure!(p.body.is_empty(), "invalid start configuration");
+                        witness = None;
                         stage = Stage::ReconfigurationAck;
                         started = Instant::now();
                     }
@@ -619,18 +644,19 @@ async fn session(
     finish(&shared, &member, id).await?;
     result
 }
-pub async fn serve(config: Config) -> Result<()> {
+pub async fn serve(config: Config, witnesses: Witnesses) -> Result<()> {
     config.validate()?;
     let central = Central::new(config.skin_site.clone(), config.session_token.clone())?;
     let key = tokio::task::spawn_blocking(|| RsaPrivateKey::new(&mut OsRng, 1024)).await??;
     let listener = Arc::new(TcpListener::bind(config.bind).await?);
-    serve_scheduled(config, central, Arc::new(key), listener).await
+    serve_scheduled(config, central, Arc::new(key), listener, witnesses).await
 }
 async fn serve_scheduled(
     config: Config,
     central: Central,
     key: Arc<RsaPrivateKey>,
     listener: Arc<TcpListener>,
+    witnesses: Witnesses,
 ) -> Result<()> {
     if config.league != "auto" {
         action(
@@ -640,7 +666,7 @@ async fn serve_scheduled(
         )
         .await?;
         let (_stop, stopped) = oneshot::channel();
-        return serve_listener(config, central, key, listener, stopped).await;
+        return serve_listener(config, central, key, listener, witnesses, stopped).await;
     }
     let mut tasks = JoinSet::new();
     let mut selected = String::new();
@@ -690,6 +716,7 @@ async fn serve_scheduled(
             let mut current = config.clone();
             current.league = selected.clone();
             let (central, key, listener) = (central.clone(), key.clone(), listener.clone());
+            let witnesses = witnesses.clone();
             let (stop, stopped) = oneshot::channel();
             route_stop = Some(stop);
             tasks.spawn(async move {
@@ -699,7 +726,7 @@ async fn serve_scheduled(
                     serde_json::json!({"action":"infrastructure","healthy":false}),
                 )
                 .await?;
-                serve_listener(current, central, key, listener, stopped).await
+                serve_listener(current, central, key, listener, witnesses, stopped).await
             });
         }
     }
@@ -709,11 +736,13 @@ async fn serve_listener(
     central: Central,
     key: Arc<RsaPrivateKey>,
     listener: Arc<TcpListener>,
+    witnesses: Witnesses,
     mut stopped: oneshot::Receiver<()>,
 ) -> Result<()> {
     let runtime = Runtime {
         central,
         config,
+        witnesses,
         healthy: false,
         presence_lock: Arc::new(Mutex::new(())),
         active: BTreeMap::new(),

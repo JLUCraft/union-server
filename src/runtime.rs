@@ -291,9 +291,8 @@ impl Config {
             relative(base, &mut a.key);
         }
         if let Some(oracle) = &mut config.services.activity_oracle {
-            relative(base, &mut oracle.key);
+            relative(base, &mut oracle.session_token);
             relative(base, &mut oracle.spool);
-            relative(base, &mut oracle.evidence_directory);
             for probe in &mut oracle.probes {
                 relative(base, &mut probe.token);
             }
@@ -413,7 +412,6 @@ impl Config {
             mcp.validate()?;
         }
         let needs_governance = self.services.ai_worker.is_some()
-            || self.services.activity_oracle.is_some()
             || (self.services.identity.is_none()
                 && (self.services.operations.is_some() || self.services.documents.is_some()));
         ensure!(
@@ -587,12 +585,18 @@ impl Host {
     }
     async fn prepare(&mut self, mut services: Services) -> Result<()> {
         if let Some(proxy) = services.league_proxy.take() {
-            self.tasks.spawn(crate::native::serve(proxy.config));
+            self.tasks
+                .spawn(crate::native::serve(proxy.config, self.witnesses.clone()));
             self.services.push("league_proxy".into());
         }
         if let Some(scoring) = services.scoring.take() {
             self.tasks.spawn(crate::scoring::serve(scoring));
             self.services.push("scoring".into());
+        }
+        if let Some(config) = services.activity_oracle.take() {
+            self.oracle =
+                Some(crate::activity::Oracle::start(config, self.witnesses.clone()).await?);
+            self.services.push("activity_oracle".into());
         }
         if let Some(config) = services.identity.take() {
             let genesis = match config.root {
@@ -679,16 +683,8 @@ impl Host {
                 .context("identity missing")?
                 .1
                 .clone();
-            self.rooms.push(
-                rooms::LocalRoom::start(
-                    self.node()?,
-                    incoming,
-                    config,
-                    view,
-                    Some(self.witnesses.clone()),
-                )
-                .await?,
-            );
+            self.rooms
+                .push(rooms::LocalRoom::start(self.node()?, incoming, config, view).await?);
             self.services.push(format!("room:{service}"));
         }
 
@@ -785,13 +781,6 @@ impl Host {
     }
     async fn start_governance(&mut self, g: &Governance, services: &mut Services) -> Result<()> {
         let authority = self.open_authority::<Application>(g).await?;
-        if let Some(config) = services.activity_oracle.take() {
-            self.oracle = Some(
-                crate::activity::Oracle::start(config, authority.clone(), self.witnesses.clone())
-                    .await?,
-            );
-            self.services.push("activity_oracle".into());
-        }
         if let Some(config) = services.report_board.take() {
             self.tasks
                 .spawn(crate::report_board::serve(authority.clone(), config));

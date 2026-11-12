@@ -448,3 +448,432 @@ fn office_document_attachments_resolve_deduplicate_and_reject_unsupported_files(
     assert!(document_attachments(&files, b"plain input")?.0.is_empty());
     Ok(())
 }
+
+// Paid AI consumers remain here until their central migration.
+mod member_payments {
+    use super::*;
+    use authority::{authority::Authority, trust::TrustLog};
+    use std::collections::{BTreeMap, BTreeSet};
+    type A = league::application::Action;
+
+    struct Fixture {
+        directory: tempfile::TempDir,
+        keys: Vec<Identity>,
+        authority: Authority<Application>,
+        genesis: state::State<Application>,
+    }
+    impl Fixture {
+        async fn new() -> Result<Self> {
+            let directory = tempfile::tempdir()?;
+            let keys: Vec<_> = (0..5).map(|_| Identity::generate()).collect();
+            let identities = crate::test_identity::Identities::new(
+                &[
+                    (&keys[0], "admin", "a"),
+                    (&keys[1], "oracle", "a"),
+                    (&keys[2], "worker", "a"),
+                    (&keys[3], "player", "a"),
+                    (&keys[4], "ghost", "b"),
+                ],
+                "admin",
+            );
+            let mut genesis = identities.genesis::<Application>();
+            genesis
+                .domain
+                .inner
+                .organization
+                .points
+                .insert("a".into(), [("player".into(), 60)].into());
+            let mut log = TrustLog::open_with_namespace(
+                &directory.path().join("identity"),
+                identities.log.genesis(),
+                &identities.binding.genesis,
+                node::protocol::Namespace::builtin(),
+            )?;
+            for record in identities.log.history_since(None)?.records {
+                log.append(record)?;
+            }
+            log.mark_current()?;
+            let view = log.view(std::time::Duration::from_secs(60))?;
+            let journal = Journal::open_with_namespace(
+                directory.path().join("application"),
+                genesis.clone(),
+                node::protocol::Namespace::builtin(),
+            )?;
+            keys[2].save_new(directory.path().join("worker.key"))?;
+            Ok(Self {
+                directory,
+                keys,
+                genesis,
+                authority: Authority::Local {
+                    journal: Arc::new(Mutex::new(journal)),
+                    log: Arc::new(Mutex::new(log)),
+                    view,
+                },
+            })
+        }
+        async fn apply(&self, key: usize, action: F) -> Result<()> {
+            self.authority
+                .apply(&self.keys[key], A::Domain(action))
+                .await?;
+            Ok(())
+        }
+        async fn file(&self, bytes: &[u8]) -> Result<node::protocol::Cid> {
+            let state = self.authority.state(self.keys[0].peer_id()).await?;
+            let (cid, blocks) = state.domain.inner.files.version(None, bytes)?;
+            for block in blocks {
+                self.apply(3, F::Inner(league::events::EventAction::PutBlock { block }))
+                    .await?;
+            }
+            Ok(cid)
+        }
+        async fn balance(&self) -> Result<u64> {
+            Ok(self
+                .authority
+                .state(self.keys[0].peer_id())
+                .await?
+                .domain
+                .inner
+                .organization
+                .points
+                .get("a")
+                .and_then(|m| m.get("player"))
+                .copied()
+                .unwrap_or(0))
+        }
+    }
+    async fn provider() -> Result<(String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>)> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}/v1/chat/completions", listener.local_addr()?);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                header.push(stream.read_u8().await.unwrap());
+                assert!(header.len() < 16_384);
+            }
+            let header = String::from_utf8(header).unwrap();
+            let length = header
+                .lines()
+                .find_map(|v| {
+                    v.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|n| n.trim().parse::<usize>().ok())
+                })
+                .unwrap();
+            let mut bytes = vec![0; length];
+            stream.read_exact(&mut bytes).await.unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(request["model"], "fixture");
+            assert_eq!(request["stream_options"]["include_usage"], true);
+            count.fetch_add(1, Ordering::SeqCst);
+            let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"A verified activity report.\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":16,\"completion_tokens\":8,\"total_tokens\":24}}\n\ndata: [DONE]\n\n";
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+        });
+        Ok((url, calls, task))
+    }
+    #[tokio::test]
+    async fn a_normal_member_funds_local_inference_settles_and_replays() -> Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let fixture = Fixture::new().await?;
+            let (url, calls, provider) = provider().await?;
+            fixture
+                .apply(
+                    0,
+                    F::AiPricing {
+                        model: "fixture".into(),
+                        pricing: flows::ai::AiPricing {
+                            base_points: 1,
+                            input_points_per_1k: 2,
+                            output_points_per_1k: 3,
+                            max_input_tokens: 1000,
+                            settlement: flows::ai::Settlement::Burn,
+                        },
+                    },
+                )
+                .await?;
+            fixture
+                .apply(
+                    2,
+                    F::AiWorker {
+                        models: ["fixture".into()].into(),
+                        active: true,
+                    },
+                )
+                .await?;
+            let input = fixture.file(b"Summarize my activity.").await?;
+            let request = F::RequestAi {
+                id: "paid-member-job".into(),
+                input,
+                worker: "worker".into(),
+                model: "fixture".into(),
+                max_tokens: 32,
+                max_points: 4,
+            };
+            fixture.apply(3, request).await?;
+            assert_eq!(fixture.balance().await?, 56);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            let prepared = crate::ai_worker::prepare(crate::ai_worker::Config {
+                key: fixture.directory.path().join("worker.key"),
+                providers: vec![llm_gateway::Provider {
+                    id: "local-fixture".into(),
+                    protocol: llm_gateway::ApiDialect::ChatCompletions,
+                    url,
+                    key_env: None,
+                    key_file: None,
+                    authentication: None,
+                    models: ["fixture".into()].into(),
+                    capabilities: BTreeSet::new(),
+                    context_tokens: 8192,
+                }],
+                concurrency: 1,
+            })?;
+            let worker = tokio::spawn(crate::ai_worker::serve(fixture.authority.clone(), prepared));
+            let mut updates = fixture.authority.watch().await;
+            let snapshot = loop {
+                updates.borrow_and_update();
+                let snapshot = fixture.authority.state(fixture.keys[0].peer_id()).await?;
+                if snapshot.domain.flows["paid-member-job"].status == flows::Status::Executed {
+                    break snapshot;
+                }
+                updates.changed().await?;
+            };
+            assert_eq!(fixture.balance().await?, 58);
+            assert_eq!(snapshot.domain.ai_burned_points, 2);
+            let flow = &snapshot.domain.flows["paid-member-job"];
+            assert_eq!(flow.payer.member, "player");
+            assert_eq!(flow.records[0].escrowed_points, 0);
+            assert_eq!(flow.records[0].ai_runs[0].charged_points, 2);
+            assert_eq!(flow.records[0].ai_runs[0].refunded_points, 2);
+            assert_eq!(
+                league::points::output(&snapshot, "paid-member-job", 0)?,
+                "A verified activity report."
+            );
+            let trust = fixture.authority.identity_view().state()?;
+            let view = snapshot.identity_presentation(&trust)?;
+            let presentation = league::points::present(
+                &snapshot,
+                &view,
+                &fixture.keys[3],
+                &fixture.authority.genesis_hash().await,
+                now_ms()?,
+            )?
+            .context("missing point view")?;
+            assert_eq!(presentation.overview.available_points, "58");
+            assert_eq!(presentation.overview.frozen_points, "0");
+            assert_eq!(presentation.overview.earned_today, "0");
+            assert!(fixture.keys[3].public_key().verify(
+                presentation.statement.payload.as_bytes(),
+                &presentation.statement.signature
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            provider.await?;
+            worker.abort();
+            let _ = worker.await;
+            let stored = fixture.authority.stored_state().await;
+            let path = fixture.directory.path().join("application");
+            let Fixture {
+                authority,
+                genesis,
+                directory,
+                ..
+            } = fixture;
+            drop(authority);
+            let replay = Journal::<Application>::open_with_namespace(
+                path,
+                genesis,
+                node::protocol::Namespace::builtin(),
+            )?;
+            assert_eq!(replay.state(), &stored);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            drop(replay);
+            drop(directory);
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?
+    }
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn an_assigned_provider_executes_from_a_follower_replica() -> Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            use authority::consensus::{Cluster, Peer};
+            let fixture = Fixture::new().await?;
+            let (url, calls, provider) = provider().await?;
+            let mut genesis = fixture.genesis.clone();
+            genesis
+                .domain
+                .inner
+                .organization
+                .points
+                .insert("a".into(), [("player".into(), 10)].into());
+            genesis.domain.ai_pricing.insert(
+                "fixture".into(),
+                flows::ai::AiPricing {
+                    base_points: 1,
+                    input_points_per_1k: 2,
+                    output_points_per_1k: 3,
+                    max_input_tokens: 1000,
+                    settlement: flows::ai::Settlement::Burn,
+                },
+            );
+            let (input, blocks) = genesis
+                .domain
+                .inner
+                .files
+                .version(None, b"Follower provider task")?;
+            for block in blocks {
+                genesis.domain.inner.files.put(block)?;
+            }
+            let (log, view) = match &fixture.authority {
+                Authority::Local { log, view, .. } => (log.clone(), view.clone()),
+                _ => unreachable!(),
+            };
+            let mut nodes = Vec::new();
+            for _ in 0..3 {
+                nodes.push(Arc::new(
+                    node::Node::start(
+                        Identity::generate(),
+                        node::NodeConfig::new(node::protocol::Namespace::builtin()),
+                    )
+                    .await?,
+                ));
+            }
+            let peers: BTreeMap<_, _> = nodes
+                .iter()
+                .enumerate()
+                .map(|(index, node)| {
+                    (
+                        (index + 1) as u64,
+                        Peer {
+                            peer: node.peer_id().to_string(),
+                            addresses: node.addresses().iter().map(ToString::to_string).collect(),
+                        },
+                    )
+                })
+                .collect();
+            let mut clusters = Vec::new();
+            let mut serving = tokio::task::JoinSet::new();
+            for (index, node) in nodes.iter().enumerate() {
+                let cluster = Cluster::start(
+                    (index + 1) as u64,
+                    node.clone(),
+                    &fixture.directory.path().join(format!("replica-{index}")),
+                    genesis.clone(),
+                    peers.clone(),
+                    (log.clone(), view.clone()),
+                )
+                .await?;
+                serving.spawn(cluster.clone().serve(client::journal::PROTOCOL));
+                clusters.push(cluster);
+            }
+            tokio::task::yield_now().await;
+            clusters[0].initialize().await?;
+            let leader_index = loop {
+                let mut ready = None;
+                for (index, cluster) in clusters.iter().enumerate() {
+                    if cluster.raft.ensure_linearizable().await.is_ok() {
+                        ready = Some(index);
+                        break;
+                    }
+                }
+                if let Some(index) = ready {
+                    break index;
+                }
+                tokio::task::yield_now().await;
+            };
+            let leader = Authority::Replicated(clusters[leader_index].clone());
+            let follower =
+                Authority::Replicated(clusters[(leader_index + 1) % clusters.len()].clone());
+            assert!(follower.effect_epoch().is_none());
+            let prepared = crate::ai_worker::prepare(crate::ai_worker::Config {
+                key: fixture.directory.path().join("worker.key"),
+                providers: vec![llm_gateway::Provider {
+                    id: "follower-fixture".into(),
+                    protocol: llm_gateway::ApiDialect::ChatCompletions,
+                    url,
+                    key_env: None,
+                    key_file: None,
+                    authentication: None,
+                    models: ["fixture".into()].into(),
+                    capabilities: BTreeSet::new(),
+                    context_tokens: 8192,
+                }],
+                concurrency: 1,
+            })?;
+            let mut updates = leader.watch().await;
+            let worker = tokio::spawn(crate::ai_worker::serve(follower.clone(), prepared));
+            loop {
+                updates.borrow_and_update();
+                if leader
+                    .state(fixture.keys[0].peer_id())
+                    .await?
+                    .domain
+                    .ai_workers
+                    .contains_key("worker")
+                {
+                    break;
+                }
+                updates.changed().await?;
+            }
+            follower
+                .apply(
+                    &fixture.keys[3],
+                    A::Domain(F::RequestAi {
+                        id: "follower-job".into(),
+                        input,
+                        worker: "worker".into(),
+                        model: "fixture".into(),
+                        max_tokens: 32,
+                        max_points: 4,
+                    }),
+                )
+                .await?;
+            let result = loop {
+                updates.borrow_and_update();
+                let state = leader.state(fixture.keys[0].peer_id()).await?;
+                if state
+                    .domain
+                    .flows
+                    .get("follower-job")
+                    .is_some_and(|f| f.status == flows::Status::Executed)
+                {
+                    break state;
+                }
+                updates.changed().await?;
+            };
+            assert_eq!(result.domain.inner.organization.points["a"]["player"], 8);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                league::points::output(&result, "follower-job", 0)?,
+                "A verified activity report."
+            );
+            worker.abort();
+            let _ = worker.await;
+            provider.await?;
+            drop(updates);
+            drop(leader);
+            drop(follower);
+            serving.shutdown().await;
+            for cluster in &clusters {
+                cluster.raft.shutdown().await?;
+            }
+            drop(clusters);
+            for mut node in nodes {
+                // Aborted RPC handlers release their cluster references when cancellation is polled.
+                let node = loop {
+                    match Arc::try_unwrap(node) {
+                        Ok(node) => break node,
+                        Err(retained) => {
+                            node = retained;
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                };
+                node.shutdown().await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?
+    }
+}
