@@ -160,6 +160,13 @@ impl Fleet {
                     OperationsAction::Restart => service.restart().await?,
                 }
             }
+            OperationsOperation::Kill(operation) => {
+                if service.process_id().await.map(u64::from) != Some(operation.pid.into()) {
+                    return Err(Error::Conflict);
+                }
+                managed.expected_running.store(false, Ordering::SeqCst);
+                service.kill().await?;
+            }
             OperationsOperation::Console(operation) => {
                 if !managed.console {
                     return Err(Error::Invalid(

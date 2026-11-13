@@ -2,18 +2,20 @@
 
 use federated_server::{
     operation_contracts::{
-        OPERATIONS_LEASE_SECONDS, OPERATIONS_SCOPE_HEADER, OperationsDispatch, OperationsJob,
-        OperationsJobPage, OperationsJobState, OperationsLogPage, OperationsObservation,
-        OperationsSnapshot,
+        OPERATIONS_CLAIM_HEADER, OPERATIONS_LEASE_SECONDS, OPERATIONS_SCOPE_HEADER,
+        OperationsDispatch, OperationsJob, OperationsJobPage, OperationsJobState,
+        OperationsLogPage, OperationsObservation, OperationsSnapshot,
     },
     operations::{Config, Supervisor},
 };
 use reqwest::{Client, StatusCode};
 use serde_json::json;
 use std::{
+    collections::BTreeMap,
     io::Write,
     path::Path,
     sync::Arc,
+    sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Notify;
@@ -49,7 +51,11 @@ async fn completed(
     .await?
 }
 
-fn configuration(root: &Path, credential: &str) -> anyhow::Result<std::path::PathBuf> {
+fn configuration(
+    root: &Path,
+    credential: &str,
+    authority: &str,
+) -> anyhow::Result<std::path::PathBuf> {
     use std::os::unix::fs::OpenOptionsExt;
     let key = root.join("credential");
     let mut output = std::fs::OpenOptions::new()
@@ -62,7 +68,7 @@ fn configuration(root: &Path, credential: &str) -> anyhow::Result<std::path::Pat
     std::fs::write(
         &config,
         serde_json::to_vec(&json!({
-            "bind":"127.0.0.1:0", "data":root.join("data"), "credential_file":key,
+            "bind":"127.0.0.1:0", "data":root.join("data"), "credential_file":key,"host":"host-a","authority":authority,
             "instances":{"gateway":{"start_command":"cat","stop_command":"","kind":"service","auto_start":false},"world":{"start_command":"sh -c 'echo early-start; cat'","stop_command":"","kind":"bedrock","auto_start":false}}
         }))?,
     )?;
@@ -76,12 +82,59 @@ fn dispatch(id: &str, action: &str) -> anyhow::Result<OperationsDispatch> {
     }))?)
 }
 
+type Grants = Arc<Mutex<BTreeMap<String, OperationsDispatch>>>;
+fn grant(grants: &Grants, dispatch: &OperationsDispatch) -> anyhow::Result<()> {
+    grants
+        .lock()
+        .map_err(|_| anyhow::anyhow!("grants poisoned"))?
+        .insert(dispatch.intent.id.to_string(), dispatch.clone());
+    Ok(())
+}
+async fn authority(
+    grants: Grants,
+    credential: String,
+) -> anyhow::Result<(String, tokio::task::JoinHandle<std::io::Result<()>>)> {
+    use axum::{Json, Router, extract::State, http::HeaderMap, routing::post};
+    async fn claim(
+        State((grants, credential)): State<(Grants, String)>,
+        headers: HeaderMap,
+        Json(body): Json<serde_json::Value>,
+    ) -> Result<Json<OperationsDispatch>, StatusCode> {
+        if headers
+            .get(OPERATIONS_CLAIM_HEADER)
+            .and_then(|value| value.to_str().ok())
+            != Some(credential.as_str())
+        {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        let id = body
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(StatusCode::BAD_REQUEST)?;
+        grants
+            .lock()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .get(id)
+            .cloned()
+            .map(Json)
+            .ok_or(StatusCode::FORBIDDEN)
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let origin = format!("http://{}", listener.local_addr()?);
+    let router = Router::new()
+        .route("/internal/operations/host-a/claim", post(claim))
+        .with_state((grants, credential));
+    let task = tokio::spawn(async move { axum::serve(listener, router).await });
+    Ok((origin, task))
+}
 #[tokio::test]
 async fn supervisor_keeps_authorized_jobs_and_remains_available_when_the_managed_service_stops()
 -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
     let credential = "a".repeat(64);
-    let config = configuration(directory.path(), &credential)?;
+    let grants = Arc::new(Mutex::new(BTreeMap::new()));
+    let (authority, authority_task) = authority(Arc::clone(&grants), credential.clone()).await?;
+    let config = configuration(directory.path(), &credential, &authority)?;
     let supervisor = Supervisor::start(Config::load(&config)?).await?;
     let origin = format!("http://{}", supervisor.address()?);
     let stop = Arc::new(Notify::new());
@@ -97,6 +150,7 @@ async fn supervisor_keeps_authorized_jobs_and_remains_available_when_the_managed
         StatusCode::UNAUTHORIZED
     );
     let start = dispatch("start-gateway", "start")?;
+    grant(&grants, &start)?;
     let submitted = client
         .post(format!("{origin}/jobs"))
         .bearer_auth(&credential)
@@ -135,6 +189,7 @@ async fn supervisor_keeps_authorized_jobs_and_remains_available_when_the_managed
     );
     let mut world = serde_json::to_value(dispatch("start-world", "start")?)?;
     world["intent"]["command"]["instance"] = "world".into();
+    grant(&grants, &serde_json::from_value(world.clone())?)?;
     client
         .post(format!("{origin}/jobs"))
         .bearer_auth(&credential)
@@ -150,6 +205,7 @@ async fn supervisor_keeps_authorized_jobs_and_remains_available_when_the_managed
     ));
     world["intent"]["id"] = "console-world".into();
     world["intent"]["command"]["operation"] = json!({"action":"console","input":"say hello"});
+    grant(&grants, &serde_json::from_value(world.clone())?)?;
     client
         .post(format!("{origin}/jobs"))
         .bearer_auth(&credential)
@@ -195,7 +251,43 @@ async fn supervisor_keeps_authorized_jobs_and_remains_available_when_the_managed
         .json::<OperationsJobPage>()
         .await?;
     assert_eq!(history.jobs.len(), 2);
+    let mut kill = world.clone();
+    kill["intent"]["id"] = "kill-world".into();
+    kill["intent"]["command"]["operation"] = json!({"action":"kill","pid":observed.instance.pid});
+    kill["approval"] = json!({"account":"administrator","request":"kill-world","approvedAt":SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()});
+    client
+        .post(format!("{origin}/jobs"))
+        .bearer_auth(&credential)
+        .json(&kill)
+        .send()
+        .await?
+        .error_for_status()?;
+    assert!(matches!(
+        completed(&client, &origin, &credential, "kill-world")
+            .await?
+            .state,
+        OperationsJobState::Failed
+    ));
+    let mut approved = kill;
+    approved["intent"]["id"] = "approved-kill".into();
+    approved["approval"]["request"] = "approved-kill".into();
+    grant(&grants, &serde_json::from_value(approved.clone())?)?;
+    client
+        .post(format!("{origin}/jobs"))
+        .bearer_auth(&credential)
+        .json(&approved)
+        .send()
+        .await?
+        .error_for_status()?;
+    assert!(matches!(
+        completed(&client, &origin, &credential, "approved-kill")
+            .await?
+            .state,
+        OperationsJobState::Succeeded
+    ));
+
     let stop_job = dispatch("stop-gateway", "stop")?;
+    grant(&grants, &stop_job)?;
     client
         .post(format!("{origin}/jobs"))
         .bearer_auth(&credential)
@@ -246,5 +338,6 @@ async fn supervisor_keeps_authorized_jobs_and_remains_available_when_the_managed
     );
     stop.notify_one();
     server.await??;
+    authority_task.abort();
     Ok(())
 }

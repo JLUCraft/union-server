@@ -16,6 +16,8 @@ pub struct Config {
     pub bind: SocketAddr,
     pub data: PathBuf,
     pub credential_file: PathBuf,
+    pub host: String,
+    pub authority: String,
     pub instances: BTreeMap<String, InstanceSettings>,
 }
 
@@ -73,6 +75,8 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        identifier(&self.host)?;
+        super::authority::endpoint(&self.authority)?;
         if !self.bind.ip().is_loopback() || !self.data.is_absolute() {
             return Err(Error::Invalid(
                 "supervisor requires a loopback listener and absolute data directory".into(),

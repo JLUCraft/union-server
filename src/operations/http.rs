@@ -26,6 +26,7 @@ use std::{
 use tokio::net::TcpListener;
 
 struct Executor {
+    authority: super::authority::Authority,
     credential: Vec<u8>,
     fleet: Arc<Fleet>,
     jobs: Arc<Jobs>,
@@ -46,6 +47,10 @@ impl IntoResponse for Error {
             Error::Conflict => (StatusCode::CONFLICT, "Operation conflicts with saved state"),
             Error::Expired => (StatusCode::UNAUTHORIZED, "Operation authorization expired"),
             Error::Unauthorized => (StatusCode::UNAUTHORIZED, "Executor authorization required"),
+            Error::Authorization => (
+                StatusCode::FORBIDDEN,
+                "Central execution authorization denied",
+            ),
             Error::NotFound => (StatusCode::NOT_FOUND, "Operation not found"),
             Error::Stopping => (StatusCode::SERVICE_UNAVAILABLE, "Supervisor is stopping"),
             _ => {
@@ -236,7 +241,11 @@ async fn execute(executor: Arc<Executor>, dispatch: OperationsDispatch) -> Resul
         return Ok(());
     };
     let intent = &current.intent;
-    let result = executor.fleet.apply(&intent.command).await;
+    let result = async {
+        executor.authority.authorize(&current).await?;
+        executor.fleet.apply(&intent.command).await
+    }
+    .await;
     let (state, error) = match result {
         Ok(()) => (OperationsJobState::Succeeded, None),
         Err(error) => (OperationsJobState::Failed, Some(error.to_string())),
@@ -262,9 +271,12 @@ async fn submit(
     executor
         .fleet
         .instance(&dispatch.intent.command.instance.to_string())?;
-    let (job, fresh) = executor
-        .jobs
-        .submit(dispatch.intent.clone(), dispatch.expires_at, at)?;
+    let (job, fresh) = executor.jobs.submit(
+        dispatch.intent.clone(),
+        dispatch.approval.clone(),
+        dispatch.expires_at,
+        at,
+    )?;
     if fresh {
         tokio::spawn(async move {
             if let Err(error) = execute(executor, dispatch).await {
@@ -298,8 +310,10 @@ impl Supervisor {
             Error::Invalid(format!("supervisor data directory is locked: {error}"))
         })?;
         let jobs = Arc::new(Jobs::open(&config.data.join("operations.sqlite"), now()?)?);
+        let authority = super::authority::Authority::new(&config, &credential)?;
         let fleet = Fleet::start(&config, &jobs).await?;
         let executor = Arc::new(Executor {
+            authority,
             credential,
             fleet: fleet.clone(),
             jobs,

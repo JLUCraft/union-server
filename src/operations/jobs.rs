@@ -1,8 +1,8 @@
 use super::{Error, Result, capture::Output};
 use crate::operation_contracts::{
     OPERATIONS_MAX_PAGE_ROWS, OPERATIONS_MAX_REQUEST_BYTES, OperationsActor, OperationsCursor,
-    OperationsIntent, OperationsJob, OperationsJobPage, OperationsJobState, OperationsLogPage,
-    OperationsLogRecord,
+    OperationsHumanApproval, OperationsIntent, OperationsJob, OperationsJobPage,
+    OperationsJobState, OperationsLogPage, OperationsLogRecord,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use std::sync::atomic::Ordering;
@@ -85,6 +85,7 @@ impl Jobs {
     pub fn submit(
         &self,
         intent: OperationsIntent,
+        approval: Option<OperationsHumanApproval>,
         expires_at: u64,
         at: u64,
     ) -> Result<(OperationsJob, bool)> {
@@ -96,7 +97,9 @@ impl Jobs {
             .optional()?;
         if let Some(body) = previous {
             let mut previous: OperationsJob = serde_json::from_str(&body)?;
-            if serde_json::to_value(&previous.intent)? != serde_json::to_value(&intent)? {
+            if serde_json::to_value(&previous.intent)? != serde_json::to_value(&intent)?
+                || serde_json::to_value(&previous.approval)? != serde_json::to_value(&approval)?
+            {
                 return Err(Error::Conflict);
             }
             if matches!(previous.state, OperationsJobState::Queued)
@@ -114,6 +117,7 @@ impl Jobs {
         }
         let job = OperationsJob {
             intent,
+            approval,
             state: OperationsJobState::Queued,
             created_at: at,
             updated_at: at,
@@ -402,9 +406,9 @@ mod tests {
             "id":"queued-job", "actor":{"account":"administrator","client":null,"request":"original-call"},
             "scope":"global", "command":{"instance":"gateway","operation":{"action":"start"}}
         }))?;
-        let (_, fresh) = jobs.submit(intent.clone(), 105, 100)?;
+        let (_, fresh) = jobs.submit(intent.clone(), None, 105, 100)?;
         assert!(fresh);
-        let (renewed, fresh) = jobs.submit(intent, 110, 104)?;
+        let (renewed, fresh) = jobs.submit(intent, None, 110, 104)?;
         assert!(!fresh);
         assert_eq!(renewed.expires_at, 110);
         let started = jobs
@@ -416,7 +420,7 @@ mod tests {
         pending.id = "cancelled-job"
             .parse()
             .map_err(|_| Error::Invalid("test job ID".into()))?;
-        jobs.submit(pending.clone(), 110, 106)?;
+        jobs.submit(pending.clone(), None, 110, 106)?;
         let cancelled = jobs.cancel("cancelled-job", pending.actor, 107)?;
         assert!(matches!(cancelled.state, OperationsJobState::Cancelled));
         assert!(cancelled.cancelled_by.is_some());

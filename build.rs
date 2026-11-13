@@ -25,9 +25,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .as_object_mut()
                 .ok_or("invalid operations contract")?
                 .remove("title");
+            let approval_actions =
+                serde_json::to_string(&schema["definitions"]["OperationsSensitiveAction"]["enum"])?;
+            constants.push_str(&format!(
+                "pub const OPERATIONS_APPROVAL_ACTIONS: &[&str] = &{approval_actions};\n"
+            ));
             let protocol = &schema["definitions"]["OperationsProtocol"]["properties"];
             for (name, property, kind) in [
                 ("OPERATIONS_LEASE_SECONDS", "leaseSeconds", "u64"),
+                ("OPERATIONS_APPROVAL_SECONDS", "approvalSeconds", "u64"),
                 ("OPERATIONS_MAX_PAGE_ROWS", "maxPageRows", "usize"),
                 ("OPERATIONS_WATCH_SECONDS", "watchSeconds", "u64"),
                 ("OPERATIONS_MAX_REQUEST_BYTES", "maxRequestBytes", "usize"),
@@ -39,6 +45,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             for (name, property) in [
                 ("EXECUTOR_SNAPSHOT_PATH", "snapshotPath"),
+                ("OPERATIONS_CLAIM_PATH", "claimPath"),
+                ("OPERATIONS_CLAIM_HEADER", "claimHeader"),
                 ("EXECUTOR_JOBS_PATH", "jobsPath"),
                 ("EXECUTOR_INSTANCES_PATH", "instancesPath"),
                 ("OPERATIONS_SCOPE_HEADER", "scopeHeader"),

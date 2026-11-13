@@ -149,6 +149,8 @@ federated-server supervise --config /srv/jlucraft/supervisor.json
   "bind": "127.0.0.1:26010",
   "data": "/srv/jlucraft/managed",
   "credential_file": "/srv/jlucraft/ops.credential",
+  "host": "campus",
+  "authority": "https://skin.jlucraft.com",
   "instances": {
     "gateway": {
       "start_command": "federated-server run --config /srv/jlucraft/host.json",
@@ -172,6 +174,13 @@ environment. Keep the loopback executor behind an HTTPS reverse proxy when the
 skin station runs remotely. The skin station checks account identity, OAuth
 scope, and the instance's central permission binding. A site administrator assigns
 each instance to the appropriate club or global scope.
+
+`host` identifies this executor in the skin station's operations configuration.
+`authority` is the skin station origin. Before starting each queued job, the
+executor authenticates to its private claim route with the same host credential.
+The central service rechecks the saved request's live authorization and any
+required human confirmation. A claim failure leaves the job failed without
+executing its command. Forced termination is bound to the approved instance PID.
 
 The supervisor owns a data-directory lock and a SQLite job journal. Duplicate
 job IDs preserve the original request, and a different payload under the same

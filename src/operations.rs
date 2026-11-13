@@ -1,4 +1,5 @@
 //! Execution of centrally authorized operations in a separate supervisor process.
+mod authority;
 mod capture;
 mod config;
 mod fleet;
@@ -19,6 +20,10 @@ pub enum Error {
     Expired,
     #[error("executor authorization required")]
     Unauthorized,
+    #[error("central execution authorization denied")]
+    Authorization,
+    #[error("authority request: {0}")]
+    Request(#[from] reqwest::Error),
     #[error("operation not found")]
     NotFound,
     #[error("supervisor is stopping")]
