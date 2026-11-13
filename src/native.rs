@@ -11,8 +11,9 @@ use crate::{
     skins::SkinSite,
 };
 use anyhow::{Result, bail, ensure};
+use rand::rngs::SysRng;
 use reqwest::Method;
-use rsa::{RsaPrivateKey, rand_core::OsRng};
+use rsa::PrivateKey;
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
@@ -392,7 +393,7 @@ async fn status<S: GameStream>(stream: &mut S, online: usize) -> Result<()> {
 async fn session(
     mut client: TcpStream,
     shared: Shared,
-    key: Arc<RsaPrivateKey>,
+    key: Arc<PrivateKey>,
     mut changed: watch::Receiver<()>,
 ) -> Result<()> {
     client.set_nodelay(true)?;
@@ -647,7 +648,7 @@ async fn session(
 pub async fn start(config: Config, witnesses: Witnesses) -> Result<crate::Service> {
     config.validate()?;
     let central = Central::new(config.skin_site.clone(), config.session_token.clone())?;
-    let key = tokio::task::spawn_blocking(|| RsaPrivateKey::new(&mut OsRng, 1024)).await??;
+    let key = tokio::task::spawn_blocking(|| PrivateKey::new(&mut SysRng, 1024)).await??;
     let listener = Arc::new(TcpListener::bind(config.bind).await?);
     let address = listener.local_addr()?;
     Ok(crate::Service::spawn(
@@ -668,7 +669,7 @@ pub async fn start(config: Config, witnesses: Witnesses) -> Result<crate::Servic
 async fn serve_scheduled(
     config: Config,
     central: Central,
-    key: Arc<RsaPrivateKey>,
+    key: Arc<PrivateKey>,
     listener: Arc<TcpListener>,
     witnesses: Witnesses,
     mut stopping: oneshot::Receiver<()>,
@@ -755,7 +756,7 @@ async fn serve_scheduled(
 async fn serve_listener(
     config: Config,
     central: Central,
-    key: Arc<RsaPrivateKey>,
+    key: Arc<PrivateKey>,
     listener: Arc<TcpListener>,
     witnesses: Witnesses,
     mut stopped: oneshot::Receiver<()>,

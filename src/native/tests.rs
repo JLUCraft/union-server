@@ -6,13 +6,19 @@ use axum::{
     routing::{get, post},
 };
 use hmac::{Hmac, KeyInit, Mac};
-use rsa::{Pkcs1v15Encrypt, RsaPublicKey, pkcs8::DecodePublicKey};
+use rsa::{PublicKey, pkcs8::DecodePublicKey};
 use serde_json::{Value, json};
 use sha2::Sha256;
 use std::{
     collections::BTreeSet,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
+enum LoginResponse {
+    Valid,
+    ForgedChallenge,
+    ShortSecret,
+}
+
 async fn paper_connection(
     mut stream: TcpStream,
     secret: Vec<u8>,
@@ -112,6 +118,7 @@ struct Station {
     mode: Arc<AtomicUsize>,
     down: Arc<AtomicBool>,
     joined: Arc<Mutex<BTreeSet<String>>>,
+    join_requests: Arc<AtomicUsize>,
     token: Arc<Mutex<String>>,
     uuid: uuid::Uuid,
 }
@@ -134,6 +141,7 @@ async fn station_join(
     State(state): State<Station>,
     Query(query): Query<BTreeMap<String, String>>,
 ) -> std::result::Result<Json<Value>, StatusCode> {
+    state.join_requests.fetch_add(1, Ordering::SeqCst);
     if query.get("username").map(String::as_str) != Some("Alice")
         || !state
             .joined
@@ -194,6 +202,7 @@ impl Fixture {
             mode: Arc::new(AtomicUsize::new(0)),
             down: Arc::new(AtomicBool::new(false)),
             joined: Arc::default(),
+            join_requests: Arc::default(),
             token: Arc::new(Mutex::new(initial)),
             uuid: uuid::Uuid::from_u128(7),
         };
@@ -286,7 +295,7 @@ impl Fixture {
     async fn encrypted(
         &self,
         uuid: uuid::Uuid,
-        corrupt_challenge: bool,
+        response: LoginResponse,
     ) -> Result<crate::login::Encrypted<TcpStream>> {
         let socket = tokio::net::TcpSocket::new_v4()?;
         socket.bind("127.0.0.2:0".parse()?)?;
@@ -317,13 +326,18 @@ impl Fixture {
             .lock()
             .await
             .insert(crate::login::server_id(&secret, &public));
-        if corrupt_challenge {
+        if matches!(response, LoginResponse::ForgedChallenge) {
             challenge[0] ^= 1;
         }
-        let key = RsaPublicKey::from_public_key_der(&public)?;
+        let key = PublicKey::from_public_key_der(&public)?;
         let mut body = Vec::new();
-        for bytes in [&secret[..], &challenge] {
-            let encrypted = key.encrypt(&mut OsRng, Pkcs1v15Encrypt, bytes)?;
+        let payload = if matches!(response, LoginResponse::ShortSecret) {
+            &secret[..secret.len() - 1]
+        } else {
+            &secret[..]
+        };
+        for bytes in [payload, &challenge] {
+            let encrypted = key.pkcs1v15_encrypt_with_rng(&mut SysRng, bytes)?;
             protocol::varint(encrypted.len() as u32, &mut body);
             body.extend(encrypted);
         }
@@ -331,7 +345,9 @@ impl Fixture {
         Ok(crate::login::Encrypted::new(stream, &secret))
     }
     async fn play(&self) -> Result<crate::login::Encrypted<TcpStream>> {
-        let mut stream = self.encrypted(self.station.uuid, false).await?;
+        let mut stream = self
+            .encrypted(self.station.uuid, LoginResponse::Valid)
+            .await?;
         let compression = Packet::decode(&protocol::read_frame(&mut stream).await?, None)?;
         assert_eq!(compression.id, 3);
         let success = Packet::decode(&protocol::read_frame(&mut stream).await?, Some(128))?;
@@ -416,8 +432,8 @@ async fn encrypted_gateway_rejects_profile_substitution_challenge_forgery_and_du
 -> Result<()> {
     let mut fixture = Fixture::new().await?;
     for (uuid, corrupt) in [
-        (uuid::Uuid::from_u128(8), false),
-        (fixture.station.uuid, true),
+        (uuid::Uuid::from_u128(8), LoginResponse::Valid),
+        (fixture.station.uuid, LoginResponse::ForgedChallenge),
     ] {
         let mut client = fixture.encrypted(uuid, corrupt).await?;
         assert!(
@@ -426,8 +442,26 @@ async fn encrypted_gateway_rejects_profile_substitution_challenge_forgery_and_du
                 .is_err()
         );
     }
+    let before = fixture.station.join_requests.load(Ordering::SeqCst);
+    let mut malformed = fixture
+        .encrypted(fixture.station.uuid, LoginResponse::ShortSecret)
+        .await?;
+    assert!(
+        timeout(
+            Duration::from_secs(12),
+            protocol::read_frame(&mut malformed)
+        )
+        .await?
+        .is_err()
+    );
+    assert_eq!(
+        fixture.station.join_requests.load(Ordering::SeqCst),
+        before + 1
+    );
     let mut player = fixture.play().await?;
-    let mut duplicate = fixture.encrypted(fixture.station.uuid, false).await?;
+    let mut duplicate = fixture
+        .encrypted(fixture.station.uuid, LoginResponse::Valid)
+        .await?;
     assert!(
         timeout(
             Duration::from_secs(12),

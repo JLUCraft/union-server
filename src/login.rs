@@ -6,18 +6,15 @@ use crate::{
 };
 use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use anyhow::{Result, ensure};
-use rsa::{
-    Pkcs1v15Encrypt, RsaPrivateKey,
-    pkcs8::EncodePublicKey,
-    rand_core::{OsRng, RngCore},
-};
+use rand::{TryRng, rngs::SysRng};
+use rsa::{PrivateKey, PublicKey, pkcs8::EncodePublicKey};
 use sha1::{Digest, Sha1};
 use std::{
     io,
     pin::Pin,
     task::{Context, Poll},
 };
-use subtle::ConstantTimeEq;
+use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 const SECRET_BYTES: usize = 16;
@@ -135,10 +132,19 @@ fn byte_array(fields: &mut Fields<'_>, maximum: usize) -> Result<Vec<u8>> {
     ensure!(length <= maximum, "encryption field too large");
     Ok(fields.bytes(length)?.to_vec())
 }
+
+fn decrypt_field(key: &PrivateKey, ciphertext: &[u8]) -> Result<([u8; SECRET_BYTES], Choice)> {
+    let decoded = key.pkcs1v15_decrypt(ciphertext)?;
+    let mut field = [0u8; SECRET_BYTES];
+    for (index, byte) in field.iter_mut().enumerate() {
+        *byte = decoded.get(index).copied().unwrap_or_default();
+    }
+    Ok((field, decoded.len().ct_eq(&SECRET_BYTES)))
+}
 pub(crate) async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     login: &Packet,
-    key: &RsaPrivateKey,
+    key: &PrivateKey,
     site: &SkinSite,
 ) -> Result<(Encrypted<S>, Profile)> {
     ensure!(login.id == protocol::LOGIN_START, "expected login start");
@@ -147,10 +153,10 @@ pub(crate) async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
     let uuid = uuid::Uuid::from_slice(fields.bytes(16)?)?;
     fields.finish()?;
     crate::forwarding::validate_name(&name)?;
-    let public = key.to_public_key().to_public_key_der()?;
+    let public = PublicKey::from(key).to_public_key_der()?;
     let public = public.as_bytes();
     let mut token = [0u8; SECRET_BYTES];
-    OsRng.fill_bytes(&mut token);
+    SysRng.try_fill_bytes(&mut token)?;
     let mut body = Vec::new();
     protocol::string("", &mut body)?;
     for bytes in [public, &token] {
@@ -173,15 +179,19 @@ pub(crate) async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
     let secret = byte_array(&mut fields, 256)?;
     let challenge = byte_array(&mut fields, 256)?;
     fields.finish()?;
-    let secret = key.decrypt_blinded(&mut OsRng, Pkcs1v15Encrypt, &secret)?;
-    let challenge = key.decrypt_blinded(&mut OsRng, Pkcs1v15Encrypt, &challenge)?;
+    let (secret, secret_length) = decrypt_field(key, &secret)?;
+    let (challenge, challenge_length) = decrypt_field(key, &challenge)?;
     ensure!(
-        bool::from(challenge.as_slice().ct_eq(&token)),
+        bool::from(challenge.ct_eq(&token) & challenge_length),
         "invalid login challenge"
     );
-    let secret: [u8; SECRET_BYTES] = secret
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("invalid shared secret"))?;
+    // Authenticate malformed secrets through hasJoined using a random replacement.
+    let mut selected = [0u8; SECRET_BYTES];
+    SysRng.try_fill_bytes(&mut selected)?;
+    for (destination, decoded) in selected.iter_mut().zip(secret) {
+        *destination = u8::conditional_select(destination, &decoded, secret_length);
+    }
+    let secret = selected;
     let stream = Encrypted::new(stream, &secret);
     let profile = site
         .has_joined(uuid, &name, &server_id(&secret, public))
@@ -212,7 +222,7 @@ mod tests {
     -> Result<()> {
         let secret = [7u8; SECRET_BYTES];
         let mut plaintext = vec![0u8; WRITE_BUFFER * 2 + 17];
-        OsRng.fill_bytes(&mut plaintext);
+        SysRng.try_fill_bytes(&mut plaintext)?;
         let mut expected = plaintext.clone();
         Encryptor::new(&secret.into(), &secret.into()).encrypt(&mut expected);
         let (client, mut server) = tokio::io::duplex(7);
