@@ -70,9 +70,9 @@ fn configuration(
     std::fs::write(
         &config,
         serde_json::to_vec(&json!({
-            "bind":"127.0.0.1:0", "data":root.join("data"), "credential_file":key,"host":"host-a","authority":authority,
+            "artifact_origins":[],"bind":"127.0.0.1:0", "data":root.join("data"), "credential_file":key,"host":"host-a","authority":authority,
             "backups":{"retained":10,"retained_bytes":10485760,"archive_bytes":1048576,"entries":1000,"remote":null},
-            "instances":{"stubborn":{"start_command":r#"sh -c 'trap "exit 0" TERM; (trap "" TERM; echo stubborn-ready; exec sleep 60 >/dev/null 2>&1)& wait'"#,"stop_command":"","kind":"service","auto_start":false},"gateway":{"start_command":"cat","stop_command":"","kind":"service","auto_start":false},"world":{"start_command":"sh -c 'echo early-start; cat'","stop_command":"","kind":"bedrock","auto_start":false}}
+            "profiles":{"stubborn":{"start_command":r#"sh -c 'trap "exit 0" TERM; (trap "" TERM; echo stubborn-ready; exec sleep 60 >/dev/null 2>&1)& wait'"#,"stop_command":"","kind":"service","readiness":null},"gateway":{"start_command":"cat","stop_command":"","kind":"service","readiness":null},"world":{"start_command":"sh -c 'echo early-start; cat'","stop_command":"","kind":"bedrock","readiness":null}}
         }))?,
     )?;
     Ok(config)
@@ -83,6 +83,44 @@ fn dispatch(id: &str, action: &str) -> anyhow::Result<OperationsDispatch> {
         "intent":{"id":id,"actor":{"account":"administrator","client":"test-agent","request":"test-call"},"scope":"global","command":{"instance":"gateway","operation":{"action":action}}},
         "expiresAt":SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()+OPERATIONS_LEASE_SECONDS
     }))?)
+}
+
+async fn provision_profiles(
+    client: &Client,
+    origin: &str,
+    credential: &str,
+    grants: &Grants,
+    config: &Path,
+) -> anyhow::Result<()> {
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(config)?)?;
+    let profiles = value["profiles"]
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("profiles missing"))?;
+    for id in profiles.keys() {
+        let mut job = dispatch(&format!("provision-{id}"), "start")?;
+        job.intent.command.instance = id.clone().try_into().map_err(|e| anyhow::anyhow!("{e}"))?;
+        job.intent.command.operation = serde_json::from_value(
+            json!({"action":"provision","profile":id,"autoStart":false,"changes":[{"path":"fixture.txt","text":"managed fixture"}]}),
+        )?;
+        job.approval = Some(serde_json::from_value(
+            json!({"account":"administrator","request":job.intent.id,"approvedAt":SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()}),
+        )?);
+        grant(grants, &job)?;
+        client
+            .post(format!("{origin}/jobs"))
+            .bearer_auth(credential)
+            .json(&job)
+            .send()
+            .await?
+            .error_for_status()?;
+        let result = completed(client, origin, credential, &job.intent.id.to_string()).await?;
+        assert!(
+            matches!(result.state, OperationsJobState::Succeeded),
+            "{:?}",
+            result.error
+        );
+    }
+    Ok(())
 }
 
 type Grants = Arc<Mutex<BTreeMap<String, OperationsDispatch>>>;
@@ -144,6 +182,7 @@ async fn supervisor_keeps_authorized_jobs_and_remains_available_when_the_managed
     let signal = stop.clone();
     let server = tokio::spawn(supervisor.run(async move { signal.notified().await }));
     let client = Client::new();
+    provision_profiles(&client, &origin, &credential, &grants, &config).await?;
     assert_eq!(
         client
             .get(format!("{origin}/snapshot"))
@@ -253,7 +292,7 @@ async fn supervisor_keeps_authorized_jobs_and_remains_available_when_the_managed
         .error_for_status()?
         .json::<OperationsJobPage>()
         .await?;
-    assert_eq!(history.jobs.len(), 2);
+    assert_eq!(history.jobs.len(), 3);
     let mut kill = world.clone();
     kill["intent"]["id"] = "kill-world".into();
     kill["intent"]["command"]["operation"] = json!({"action":"kill","pid":observed.instance.pid});
@@ -460,6 +499,194 @@ async fn perform(
 }
 
 #[tokio::test]
+async fn declarative_deployment_persists_instances_and_rolls_back_unhealthy_service_updates()
+-> anyhow::Result<()> {
+    use axum::{Router, routing::get};
+    let directory = tempfile::tempdir()?;
+    let credential = "b".repeat(64);
+    let grants = Arc::new(Mutex::new(BTreeMap::new()));
+    let (authority, authority_task) = authority(Arc::clone(&grants), credential.clone()).await?;
+    let artifacts = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let artifact_origin = format!("http://{}", artifacts.local_addr()?);
+    let artifact_task = tokio::spawn(async move {
+        axum::serve(
+            artifacts,
+            Router::new().route("/plugin.jar", get(|| async { "plugin artifact" })),
+        )
+        .await
+    });
+    let config = configuration(directory.path(), &credential, &authority)?;
+    let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(&config)?)?;
+    value["profiles"] = json!({"service":{"start_command":"sh service.sh","stop_command":"","kind":"service","readiness":{"output":"service-ready","timeout_seconds":4,"stabilize_seconds":1}}});
+    value["artifact_origins"] = json!([artifact_origin]);
+    std::fs::write(&config, serde_json::to_vec(&value)?)?;
+    let supervisor = Supervisor::start(Config::load(&config)?).await?;
+    let origin = format!("http://{}", supervisor.address()?);
+    let stop = Arc::new(Notify::new());
+    let signal = Arc::clone(&stop);
+    let task = tokio::spawn(supervisor.run(async move { signal.notified().await }));
+    let client = Client::new();
+    let healthy = "trap 'exit 0' TERM\necho service-ready\nwhile :; do sleep 0.1; done\n";
+    let created = perform(&client,&origin,&credential,&grants,"create-service",json!({"action":"provision","profile":"service","autoStart":true,"changes":[{"path":"service.sh","text":healthy},{"path":"plugins/example.jar","url":format!("{artifact_origin}/plugin.jar")},{"path":"server.properties","text":"max-players=20"}]}),true).await?;
+    assert!(
+        matches!(created.state, OperationsJobState::Succeeded),
+        "{:?}",
+        created.error
+    );
+    let root = directory.path().join("data/instances/gateway");
+    assert_eq!(
+        std::fs::read(root.join("plugins/example.jar"))?,
+        b"plugin artifact"
+    );
+    for (id, changes) in [
+        (
+            "escape",
+            json!([{"path":"world/../../escape","text":"bad"}]),
+        ),
+        (
+            "remote-denied",
+            json!([{"path":"bad.jar","url":"https://unapproved.test/plugin.jar"}]),
+        ),
+    ] {
+        let rejected = perform(
+            &client,
+            &origin,
+            &credential,
+            &grants,
+            id,
+            json!({"action":"deploy_prepare","changes":changes}),
+            false,
+        )
+        .await?;
+        assert!(
+            matches!(rejected.state, OperationsJobState::Failed),
+            "{:?}",
+            rejected.error
+        );
+    }
+    let prepared = perform(&client,&origin,&credential,&grants,"prepare-unhealthy",json!({"action":"deploy_prepare","changes":[{"path":"service.sh","text":"trap 'exit 0' TERM\necho not-ready\nwhile :; do sleep 0.1; done\n"}]}),false).await?;
+    assert!(
+        matches!(prepared.state, OperationsJobState::Succeeded),
+        "{:?}",
+        prepared.error
+    );
+    std::fs::write(root.join("current-world"), b"written after preparation")?;
+    let denied = perform(
+        &client,
+        &origin,
+        &credential,
+        &grants,
+        "deploy-no-confirmation",
+        json!({"action":"deploy","preparation":"prepare-unhealthy"}),
+        false,
+    )
+    .await?;
+    assert!(matches!(denied.state, OperationsJobState::Failed));
+    let failed = perform(
+        &client,
+        &origin,
+        &credential,
+        &grants,
+        "deploy-unhealthy",
+        json!({"action":"deploy","preparation":"prepare-unhealthy"}),
+        true,
+    )
+    .await?;
+    assert!(
+        matches!(failed.state, OperationsJobState::Failed),
+        "{:?}",
+        failed.error
+    );
+    assert!(
+        failed
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("readiness deadline")),
+        "{:?}",
+        failed.error
+    );
+    assert_eq!(std::fs::read_to_string(root.join("service.sh"))?, healthy);
+    assert_eq!(
+        std::fs::read(root.join("current-world"))?,
+        b"written after preparation"
+    );
+    let prepared = perform(&client,&origin,&credential,&grants,"prepare-update",json!({"action":"deploy_prepare","changes":[{"path":"server.properties","text":"max-players=30"},{"path":"plugins/example.jar","remove":true},{"path":"mods/example.jar","url":format!("{artifact_origin}/plugin.jar")}]}),false).await?;
+    assert!(matches!(prepared.state, OperationsJobState::Succeeded));
+    let updated = perform(
+        &client,
+        &origin,
+        &credential,
+        &grants,
+        "deploy-update",
+        json!({"action":"deploy","preparation":"prepare-update"}),
+        true,
+    )
+    .await?;
+    assert!(
+        matches!(updated.state, OperationsJobState::Succeeded),
+        "{:?}",
+        updated.error
+    );
+    assert!(updated.result.and_then(|r| r.safety_archive).is_some());
+    assert_eq!(
+        std::fs::read(root.join("server.properties"))?,
+        b"max-players=30"
+    );
+    assert!(!root.join("plugins/example.jar").try_exists()?);
+    assert_eq!(
+        std::fs::read(root.join("mods/example.jar"))?,
+        b"plugin artifact"
+    );
+    stop.notify_one();
+    task.await??;
+    let supervisor = Supervisor::start(Config::load(&config)?).await?;
+    let origin = format!("http://{}", supervisor.address()?);
+    let signal = Arc::clone(&stop);
+    let task = tokio::spawn(supervisor.run(async move { signal.notified().await }));
+    let snapshot = client
+        .get(format!("{origin}/snapshot"))
+        .bearer_auth(&credential)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<OperationsSnapshot>()
+        .await?;
+    assert_eq!(snapshot.instances.len(), 1);
+    assert!(snapshot.instances[0].pid.is_some());
+    let deleted = perform(
+        &client,
+        &origin,
+        &credential,
+        &grants,
+        "delete-service",
+        json!({"action":"instance_delete"}),
+        true,
+    )
+    .await?;
+    assert!(
+        matches!(deleted.state, OperationsJobState::Succeeded),
+        "{:?}",
+        deleted.error
+    );
+    assert!(deleted.result.and_then(|r| r.safety_archive).is_some());
+    assert!(!root.try_exists()?);
+    let snapshot = client
+        .get(format!("{origin}/snapshot"))
+        .bearer_auth(&credential)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<OperationsSnapshot>()
+        .await?;
+    assert!(snapshot.instances.is_empty());
+    stop.notify_one();
+    task.await??;
+    authority_task.abort();
+    artifact_task.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn scoped_backups_survive_encrypted_transfer_and_transactional_restore() -> anyhow::Result<()>
 {
     use age::secrecy::ExposeSecret;
@@ -546,18 +773,20 @@ async fn scoped_backups_survive_encrypted_transfer_and_transactional_restore() -
     let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(&config)?)?;
     value["backups"]["retained"] = 2.into();
     value["backups"]["remote"] = json!({"endpoint":storage_origin,"credential_file":storage_credential,"recipient":key.to_public().to_string(),"identity_file":private});
-    value["instances"] = json!({"gateway":{"start_command":r#"sh -c 'while read line; do if [ "$line" = stop ]; then if [ -f reject-stop ]; then rm reject-stop; exit 23; fi; echo saved >> world/data; exit 0; fi; done'"#,"stop_command":"stop","kind":"bedrock","auto_start":false}});
+    value["profiles"] = json!({"gateway":{"start_command":r#"sh -c 'while read line; do if [ "$line" = stop ]; then if [ -f reject-stop ]; then rm reject-stop; exit 23; fi; echo saved >> world/data; exit 0; fi; done'"#,"stop_command":"stop","kind":"bedrock","readiness":null}});
     std::fs::write(&config, serde_json::to_vec(&value)?)?;
     let world = directory.path().join("data/instances/gateway/world");
-    std::fs::create_dir_all(world.join("empty"))?;
-    std::fs::write(world.join("data"), b"initial\n")?;
-    std::fs::set_permissions(world.join("data"), std::fs::Permissions::from_mode(0o600))?;
     let supervisor = Supervisor::start(Config::load(&config)?).await?;
     let origin = format!("http://{}", supervisor.address()?);
     let stop = Arc::new(Notify::new());
     let signal = Arc::clone(&stop);
     let supervisor_task = tokio::spawn(supervisor.run(async move { signal.notified().await }));
     let client = Client::new();
+    provision_profiles(&client, &origin, &credential, &grants, &config).await?;
+    std::fs::create_dir_all(world.join("empty"))?;
+    std::fs::write(world.join("data"), b"initial\n")?;
+    std::fs::set_permissions(world.join("data"), std::fs::Permissions::from_mode(0o600))?;
+
     let started = perform(
         &client,
         &origin,
@@ -831,6 +1060,56 @@ async fn scoped_backups_survive_encrypted_transfer_and_transactional_restore() -
     ));
     stop.notify_one();
     supervisor_task.await??;
+    value["data"] = json!(directory.path().join("recovered-host"));
+    std::fs::write(&config, serde_json::to_vec(&value)?)?;
+    let recovered = Supervisor::start(Config::load(&config)?).await?;
+    let recovered_origin = format!("http://{}", recovered.address()?);
+    let signal = Arc::clone(&stop);
+    let recovered_task = tokio::spawn(recovered.run(async move { signal.notified().await }));
+    provision_profiles(&client, &recovered_origin, &credential, &grants, &config).await?;
+    for (id, operation, approved) in [
+        (
+            "disaster-import",
+            json!({"action":"backup_import","archive":archive}),
+            false,
+        ),
+        (
+            "disaster-prepare",
+            json!({"action":"restore_prepare","archive":archive}),
+            false,
+        ),
+        (
+            "disaster-restore",
+            json!({"action":"restore","archive":archive,"preparation":"disaster-prepare"}),
+            true,
+        ),
+    ] {
+        let restored = perform(
+            &client,
+            &recovered_origin,
+            &credential,
+            &grants,
+            id,
+            operation,
+            approved,
+        )
+        .await?;
+        assert!(
+            matches!(restored.state, OperationsJobState::Succeeded),
+            "{:?}",
+            restored.error
+        );
+    }
+    assert_eq!(
+        std::fs::read(
+            directory
+                .path()
+                .join("recovered-host/instances/gateway/world/data")
+        )?,
+        b"initial\nsaved\n"
+    );
+    stop.notify_one();
+    recovered_task.await??;
     authority_task.abort();
     storage_task.abort();
     Ok(())

@@ -18,7 +18,8 @@ pub struct Config {
     pub credential_file: PathBuf,
     pub host: String,
     pub authority: String,
-    pub instances: BTreeMap<String, InstanceSettings>,
+    pub profiles: BTreeMap<String, InstanceSettings>,
+    pub artifact_origins: Vec<String>,
     pub backups: BackupSettings,
 }
 
@@ -40,13 +41,21 @@ pub struct RemoteSettings {
     pub identity_file: Option<PathBuf>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstanceSettings {
     pub start_command: String,
     pub stop_command: String,
     pub kind: InstanceKind,
-    pub auto_start: bool,
+    pub readiness: Option<Readiness>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Readiness {
+    pub output: String,
+    pub timeout_seconds: u64,
+    pub stabilize_seconds: u64,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -110,11 +119,25 @@ impl Config {
                 "supervisor requires a loopback listener and absolute data directory".into(),
             ));
         }
-        for (id, settings) in &self.instances {
+        for origin in &self.artifact_origins {
+            super::authority::endpoint(origin)?;
+        }
+        for (id, settings) in &self.profiles {
             identifier(id)?;
             if settings.start_command.is_empty() {
                 return Err(Error::Invalid(
                     "configure the instance command and server type".into(),
+                ));
+            }
+            if settings.readiness.as_ref().is_some_and(|ready| {
+                ready.output.is_empty()
+                    || ready.output.len() > 4096
+                    || ready.timeout_seconds == 0
+                    || ready.stabilize_seconds == 0
+                    || ready.stabilize_seconds >= ready.timeout_seconds
+            }) {
+                return Err(Error::Invalid(
+                    "configure a readiness output and bounded stabilization deadline".into(),
                 ));
             }
         }

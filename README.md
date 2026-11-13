@@ -158,19 +158,27 @@ federated-server supervise --config /srv/jlucraft/supervisor.json
     "entries": 100000,
     "remote": null
   },
-  "instances": {
+  "artifact_origins": ["https://artifacts.example.org"],
+  "profiles": {
     "gateway": {
-      "start_command": "federated-server run --config /srv/jlucraft/host.json",
+      "start_command": "bin/federated-server run --config host.json",
       "stop_command": "",
       "kind": "service",
-      "auto_start": true
+      "readiness": {
+        "output": "\"services\":",
+        "timeout_seconds": 60,
+        "stabilize_seconds": 5
+      }
     }
   }
 }
 ```
 
-Kinds are `java`, `bedrock`, and `service`. Place prepared instance files in
-`data/instances/<id>`. Commands come from the operator's configuration. The
+Kinds are `java`, `bedrock`, and `service`. Profiles define operator-controlled
+commands and readiness output. Set `readiness.output` to the service's startup
+message; the gateway example uses its emitted service status JSON. Set
+`readiness` to null for lifecycle-only profiles. Instance definitions persist
+inside `data/instances/<id>` and are loaded when the supervisor restarts. The
 executor accepts start, stop, and restart jobs from the central service; it does
 not expose a shell or accept game session credentials. Empty stop commands use
 SIGTERM on Unix, and `^C` uses SIGINT. Processes stop before lifecycle completion.
@@ -264,3 +272,40 @@ upload; import consumes the authenticated stream before publishing data and chec
 the instance and permission scope. Record archive IDs outside the host and set the
 remote store's retention and storage limits. Import restores the archive to the
 local catalog; preparation and human confirmation apply before replacing data.
+
+Reserve an instance through `POST /api/operations/hosts/<host>/instances` with
+`scope` and an idempotency `key`. Global administrators receive a server-generated
+instance ID and central permission binding. Submit a `provision` job for that ID
+with `profile`, `autoStart`, and `changes`. Provisioning requires scope management
+permission, global management permission, and fresh human confirmation. Each change has a relative `path` and one of `text`, `url`, or
+`remove: true`. Text and downloaded files accept `executable: true` for service
+binaries. Files are private by default. Artifact URLs must use an origin in
+`artifact_origins`; redirects are rejected. Byte and entry limits reuse the
+configured archive quotas. Put server binaries, configuration, mods, and plugins
+inside the managed instance directory. Operator profiles supply the commands.
+
+Use `deploy_prepare` with `changes` to download and stage an update while the
+service remains running. Preparation and activation require global management
+permission. Submit `deploy` with the preparation job ID and confirm that request
+in the skin station. The confirmation displays the staged changes from their
+recorded request. The admitted transaction stops the service,
+saves its current recovery archive, applies staged changes to a fresh candidate,
+and switches directories atomically. Readiness uses captured process output and
+a configured period of continued process life. A failed start or readiness
+deadline restores the previous directory and running state. If graceful shutdown
+fails, the supervisor retains process ownership and the recovery journal; resolve
+the process through the existing confirmed kill action before restarting the
+supervisor. A successful job returns `safetyArchive` for later rollback. A service
+that was stopped is started for readiness and stopped again before completion.
+Profiles with readiness settings also check restored services before committing.
+
+`instance_delete` saves a recovery archive, removes the stopped instance, and
+returns its archive ID. Deployment activation and deletion require scope
+management permission and fresh human confirmation. Recovery after host loss
+uses the same host identity and central instance binding: configure its profiles
+and remote archive credentials, provision the same instance ID, import the
+off-host archive, then prepare and confirm restoration. Preserve the supervisor
+configuration, host credentials, archive IDs, and offline decryption identity
+outside that host. Instance archive definitions must match the chosen profile
+and startup setting. The supervisor process itself is managed by the operating
+system service manager.

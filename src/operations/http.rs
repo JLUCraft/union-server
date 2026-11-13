@@ -284,9 +284,14 @@ async fn submit(
     if executor.fleet.closing.load(Ordering::SeqCst) {
         return Err(Error::Stopping);
     }
-    executor
-        .fleet
-        .instance(&dispatch.intent.command.instance.to_string())?;
+    if !matches!(
+        dispatch.intent.command.operation,
+        crate::operation_contracts::OperationsOperation::Provision(_)
+    ) {
+        executor
+            .fleet
+            .instance(&dispatch.intent.command.instance.to_string())?;
+    }
     let (job, fresh) = executor.jobs.submit(
         dispatch.intent.clone(),
         dispatch.approval.clone(),

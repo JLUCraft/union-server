@@ -3,6 +3,7 @@ mod authority;
 mod backups;
 mod capture;
 mod config;
+mod deployment;
 mod fleet;
 mod http;
 mod jobs;
