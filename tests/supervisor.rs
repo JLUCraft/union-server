@@ -71,6 +71,7 @@ fn configuration(
         &config,
         serde_json::to_vec(&json!({
             "bind":"127.0.0.1:0", "data":root.join("data"), "credential_file":key,"host":"host-a","authority":authority,
+            "backups":{"retained":10,"retained_bytes":10485760,"archive_bytes":1048576,"entries":1000,"remote":null},
             "instances":{"stubborn":{"start_command":r#"sh -c 'trap "exit 0" TERM; (trap "" TERM; echo stubborn-ready; exec sleep 60 >/dev/null 2>&1)& wait'"#,"stop_command":"","kind":"service","auto_start":false},"gateway":{"start_command":"cat","stop_command":"","kind":"service","auto_start":false},"world":{"start_command":"sh -c 'echo early-start; cat'","stop_command":"","kind":"bedrock","auto_start":false}}
         }))?,
     )?;
@@ -429,5 +430,408 @@ async fn supervisor_keeps_authorized_jobs_and_remains_available_when_the_managed
     stop.notify_one();
     server.await??;
     authority_task.abort();
+    Ok(())
+}
+
+async fn perform(
+    client: &Client,
+    origin: &str,
+    credential: &str,
+    grants: &Grants,
+    id: &str,
+    operation: serde_json::Value,
+    approved: bool,
+) -> anyhow::Result<OperationsJob> {
+    let mut value = serde_json::to_value(dispatch(id, "start")?)?;
+    value["intent"]["command"]["operation"] = operation;
+    if approved {
+        value["approval"] = json!({"account":"administrator","request":id,"approvedAt":SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()});
+    }
+    let value: OperationsDispatch = serde_json::from_value(value)?;
+    grant(grants, &value)?;
+    client
+        .post(format!("{origin}/jobs"))
+        .bearer_auth(credential)
+        .json(&value)
+        .send()
+        .await?
+        .error_for_status()?;
+    completed(client, origin, credential, id).await
+}
+
+#[tokio::test]
+async fn scoped_backups_survive_encrypted_transfer_and_transactional_restore() -> anyhow::Result<()>
+{
+    use age::secrecy::ExposeSecret;
+    use axum::{
+        Router,
+        body::Bytes,
+        extract::{Path as RoutePath, State},
+        http::HeaderMap,
+        routing::get,
+    };
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    type Objects = Arc<Mutex<BTreeMap<String, Vec<u8>>>>;
+    type Storage = (Objects, Arc<AtomicBool>);
+    async fn download(
+        State((objects, _reject)): State<Storage>,
+        headers: HeaderMap,
+        RoutePath(id): RoutePath<String>,
+    ) -> Result<Vec<u8>, StatusCode> {
+        if headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            != Some("Bearer fixture-storage-key")
+        {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        objects
+            .lock()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .get(&id)
+            .cloned()
+            .ok_or(StatusCode::NOT_FOUND)
+    }
+    async fn upload(
+        State((objects, reject)): State<Storage>,
+        headers: HeaderMap,
+        RoutePath(id): RoutePath<String>,
+        body: Bytes,
+    ) -> Result<StatusCode, StatusCode> {
+        if headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            != Some("Bearer fixture-storage-key")
+        {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        if reject.load(Ordering::SeqCst) {
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        objects
+            .lock()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .insert(id, body.to_vec());
+        Ok(StatusCode::NO_CONTENT)
+    }
+    let directory = tempfile::tempdir()?;
+    let credential = "3".repeat(64);
+    let grants = Arc::new(Mutex::new(BTreeMap::new()));
+    let (authority, authority_task) = authority(Arc::clone(&grants), credential.clone()).await?;
+    let objects: Objects = Arc::new(Mutex::new(BTreeMap::new()));
+    let reject_upload = Arc::new(AtomicBool::new(true));
+    let storage = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let storage_origin = format!("http://{}", storage.local_addr()?);
+    let storage_router = Router::new()
+        .route("/backups/{id}", get(download).put(upload))
+        .with_state((Arc::clone(&objects), Arc::clone(&reject_upload)));
+    let storage_task = tokio::spawn(async move { axum::serve(storage, storage_router).await });
+    let key = age::x25519::Identity::generate();
+    let private = directory.path().join("backup.identity");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&private)?
+        .write_all(key.to_string().expose_secret().as_bytes())?;
+    let storage_credential = directory.path().join("backup.credential");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&storage_credential)?
+        .write_all(b"fixture-storage-key")?;
+    let config = configuration(directory.path(), &credential, &authority)?;
+    let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(&config)?)?;
+    value["backups"]["retained"] = 2.into();
+    value["backups"]["remote"] = json!({"endpoint":storage_origin,"credential_file":storage_credential,"recipient":key.to_public().to_string(),"identity_file":private});
+    value["instances"] = json!({"gateway":{"start_command":r#"sh -c 'while read line; do if [ "$line" = stop ]; then if [ -f reject-stop ]; then rm reject-stop; exit 23; fi; echo saved >> world/data; exit 0; fi; done'"#,"stop_command":"stop","kind":"bedrock","auto_start":false}});
+    std::fs::write(&config, serde_json::to_vec(&value)?)?;
+    let world = directory.path().join("data/instances/gateway/world");
+    std::fs::create_dir_all(world.join("empty"))?;
+    std::fs::write(world.join("data"), b"initial\n")?;
+    std::fs::set_permissions(world.join("data"), std::fs::Permissions::from_mode(0o600))?;
+    let supervisor = Supervisor::start(Config::load(&config)?).await?;
+    let origin = format!("http://{}", supervisor.address()?);
+    let stop = Arc::new(Notify::new());
+    let signal = Arc::clone(&stop);
+    let supervisor_task = tokio::spawn(supervisor.run(async move { signal.notified().await }));
+    let client = Client::new();
+    let started = perform(
+        &client,
+        &origin,
+        &credential,
+        &grants,
+        "backup-start",
+        json!({"action":"start"}),
+        false,
+    )
+    .await?;
+    assert!(matches!(started.state, OperationsJobState::Succeeded));
+    let created = perform(
+        &client,
+        &origin,
+        &credential,
+        &grants,
+        "backup-create",
+        json!({"action":"backup","label":"consistent world"}),
+        false,
+    )
+    .await?;
+    assert!(
+        matches!(created.state, OperationsJobState::Succeeded),
+        "{:?}",
+        created.error
+    );
+    let archive = created
+        .result
+        .ok_or_else(|| anyhow::anyhow!("backup result missing"))?
+        .backup
+        .ok_or_else(|| anyhow::anyhow!("archive missing"))?
+        .id
+        .to_string();
+    let failed_export = perform(
+        &client,
+        &origin,
+        &credential,
+        &grants,
+        "backup-export-failed",
+        json!({"action":"backup_export","archive":archive}),
+        false,
+    )
+    .await?;
+    assert!(matches!(failed_export.state, OperationsJobState::Failed));
+    assert!(
+        std::fs::read_dir(directory.path().join("data/transfers"))?
+            .next()
+            .transpose()?
+            .is_none()
+    );
+    reject_upload.store(false, Ordering::SeqCst);
+    let exported = perform(
+        &client,
+        &origin,
+        &credential,
+        &grants,
+        "backup-export",
+        json!({"action":"backup_export","archive":archive}),
+        false,
+    )
+    .await?;
+    assert!(
+        matches!(exported.state, OperationsJobState::Succeeded),
+        "{:?}",
+        exported.error
+    );
+    assert_eq!(
+        objects
+            .lock()
+            .map_err(|_| anyhow::anyhow!("objects poisoned"))?
+            .len(),
+        1
+    );
+    let deleted = perform(
+        &client,
+        &origin,
+        &credential,
+        &grants,
+        "backup-delete",
+        json!({"action":"backup_delete","archive":archive}),
+        true,
+    )
+    .await?;
+    assert!(
+        matches!(deleted.state, OperationsJobState::Succeeded),
+        "{:?}",
+        deleted.error
+    );
+    rusqlite::Connection::open(directory.path().join("data/operations.sqlite"))?.execute(
+        "INSERT INTO backup_owners VALUES(?,?,?)",
+        rusqlite::params![archive, "gateway", "club:another"],
+    )?;
+    let imported = perform(
+        &client,
+        &origin,
+        &credential,
+        &grants,
+        "backup-import",
+        json!({"action":"backup_import","archive":archive}),
+        false,
+    )
+    .await?;
+    assert!(
+        matches!(imported.state, OperationsJobState::Succeeded),
+        "{:?}",
+        imported.error
+    );
+    let other = client
+        .get(format!("{origin}/instances/gateway/backups"))
+        .bearer_auth(&credential)
+        .header(OPERATIONS_SCOPE_HEADER, "club:another")
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<federated_server::operation_contracts::OperationsBackupPage>()
+        .await?;
+    assert!(other.backups.is_empty());
+    std::fs::write(world.join("data"), b"changed\n")?;
+    std::fs::write(world.join("obsolete"), b"old-only")?;
+    let preparation = perform(
+        &client,
+        &origin,
+        &credential,
+        &grants,
+        "restore-preparation",
+        json!({"action":"restore_prepare","archive":archive}),
+        false,
+    )
+    .await?;
+    assert!(
+        matches!(preparation.state, OperationsJobState::Succeeded),
+        "{:?}",
+        preparation.error
+    );
+    let prepared_state = client
+        .get(format!("{origin}/snapshot"))
+        .bearer_auth(&credential)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<OperationsSnapshot>()
+        .await?;
+    assert!(matches!(
+        prepared_state.instances[0].state,
+        federated_server::operation_contracts::OperationsInstanceState::Running
+    ));
+    std::fs::write(world.join("data"), b"latest\n")?;
+    let denied = perform(
+        &client,
+        &origin,
+        &credential,
+        &grants,
+        "restore-denied",
+        json!({"action":"restore","archive":archive,"preparation":"restore-preparation"}),
+        false,
+    )
+    .await?;
+    assert!(matches!(denied.state, OperationsJobState::Failed));
+    assert_eq!(std::fs::read(world.join("data"))?, b"latest\n");
+    std::fs::write(
+        world
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("world parent missing"))?
+            .join("reject-stop"),
+        b"reject",
+    )?;
+    let unclean = perform(
+        &client,
+        &origin,
+        &credential,
+        &grants,
+        "restore-unclean",
+        json!({"action":"restore","archive":archive,"preparation":"restore-preparation"}),
+        true,
+    )
+    .await?;
+    assert!(matches!(unclean.state, OperationsJobState::Failed));
+    assert_eq!(std::fs::read(world.join("data"))?, b"latest\n");
+    let restored = perform(
+        &client,
+        &origin,
+        &credential,
+        &grants,
+        "restore-approved",
+        json!({"action":"restore","archive":archive,"preparation":"restore-preparation"}),
+        true,
+    )
+    .await?;
+    assert!(
+        matches!(restored.state, OperationsJobState::Succeeded),
+        "{:?}",
+        restored.error
+    );
+    let safety = restored
+        .result
+        .and_then(|result| result.safety_archive)
+        .ok_or_else(|| anyhow::anyhow!("safety archive missing"))?
+        .to_string();
+    assert_eq!(std::fs::read(world.join("data"))?, b"initial\nsaved\n");
+    assert!(!world.join("obsolete").try_exists()?);
+    assert!(world.join("empty").is_dir());
+    assert_eq!(
+        std::fs::metadata(world.join("data"))?.permissions().mode() & 0o777,
+        0o600
+    );
+    let rollback_preparation = perform(
+        &client,
+        &origin,
+        &credential,
+        &grants,
+        "rollback-preparation",
+        json!({"action":"restore_prepare","archive":safety}),
+        false,
+    )
+    .await?;
+    assert!(
+        matches!(rollback_preparation.state, OperationsJobState::Succeeded),
+        "{:?}",
+        rollback_preparation.error
+    );
+    let rollback = perform(
+        &client,
+        &origin,
+        &credential,
+        &grants,
+        "restore-rollback",
+        json!({"action":"restore","archive":safety,"preparation":"rollback-preparation"}),
+        true,
+    )
+    .await?;
+    assert!(
+        matches!(rollback.state, OperationsJobState::Succeeded),
+        "{:?}",
+        rollback.error
+    );
+    assert_eq!(std::fs::read(world.join("data"))?, b"latest\nsaved\n");
+    assert_eq!(std::fs::read(world.join("obsolete"))?, b"old-only");
+    let retained = client
+        .get(format!("{origin}/instances/gateway/backups"))
+        .bearer_auth(&credential)
+        .header(OPERATIONS_SCOPE_HEADER, "global")
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<federated_server::operation_contracts::OperationsBackupPage>()
+        .await?;
+    assert_eq!(retained.backups.len(), 2);
+    std::fs::write(world.join("oversized"), vec![0u8; 2 * 1024 * 1024])?;
+    let oversized = perform(
+        &client,
+        &origin,
+        &credential,
+        &grants,
+        "backup-over-quota",
+        json!({"action":"backup","label":"oversized"}),
+        false,
+    )
+    .await?;
+    assert!(matches!(oversized.state, OperationsJobState::Failed));
+    let snapshot = client
+        .get(format!("{origin}/snapshot"))
+        .bearer_auth(&credential)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<OperationsSnapshot>()
+        .await?;
+    assert!(matches!(
+        snapshot.instances[0].state,
+        federated_server::operation_contracts::OperationsInstanceState::Running
+    ));
+    stop.notify_one();
+    supervisor_task.await??;
+    authority_task.abort();
+    storage_task.abort();
     Ok(())
 }

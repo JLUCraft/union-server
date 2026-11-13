@@ -2,7 +2,7 @@ use super::{Error, Result, capture::Output};
 use crate::operation_contracts::{
     OPERATIONS_MAX_PAGE_ROWS, OPERATIONS_MAX_REQUEST_BYTES, OperationsActor, OperationsCursor,
     OperationsHumanApproval, OperationsIntent, OperationsJob, OperationsJobPage,
-    OperationsJobState, OperationsLogPage, OperationsLogRecord,
+    OperationsJobState, OperationsLogPage, OperationsLogRecord, OperationsResult,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use std::sync::atomic::Ordering;
@@ -45,7 +45,7 @@ impl Jobs {
     pub fn open(path: &Path, at: u64) -> Result<Self> {
         let database = Connection::open(path)?;
         database.busy_timeout(DATABASE_TIMEOUT)?;
-        database.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, body TEXT NOT NULL CHECK(json_valid(body))); CREATE TABLE IF NOT EXISTS logs(sequence INTEGER PRIMARY KEY AUTOINCREMENT,instance TEXT NOT NULL,at INTEGER NOT NULL,data TEXT NOT NULL,clipped INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS logs_instance_sequence ON logs(instance,sequence); CREATE TABLE IF NOT EXISTS log_retention(instance TEXT PRIMARY KEY,pruned INTEGER NOT NULL,incomplete INTEGER NOT NULL);")?;
+        database.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, body TEXT NOT NULL CHECK(json_valid(body))); CREATE TABLE IF NOT EXISTS logs(sequence INTEGER PRIMARY KEY AUTOINCREMENT,instance TEXT NOT NULL,at INTEGER NOT NULL,data TEXT NOT NULL,clipped INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS logs_instance_sequence ON logs(instance,sequence); CREATE TABLE IF NOT EXISTS backup_owners(id TEXT PRIMARY KEY,instance TEXT NOT NULL,scope TEXT NOT NULL); CREATE INDEX IF NOT EXISTS backup_owner_scope ON backup_owners(instance,scope); CREATE TABLE IF NOT EXISTS log_retention(instance TEXT PRIMARY KEY,pruned INTEGER NOT NULL,incomplete INTEGER NOT NULL);")?;
         let jobs = Self(Mutex::new(database));
         let pending = {
             let database = jobs.0.lock().map_err(|_| Error::StorageUnavailable)?;
@@ -124,6 +124,7 @@ impl Jobs {
             error: None,
             expires_at,
             cancelled_by: None,
+            result: None,
         };
         transaction.execute(
             "INSERT INTO jobs VALUES(?,?)",
@@ -340,6 +341,57 @@ impl Jobs {
             page.entries.pop();
         }
         Ok(page)
+    }
+
+    pub fn has_backup(&self, instance: &str, scope: &str, id: &str) -> Result<bool> {
+        let database = self.0.lock().map_err(|_| Error::StorageUnavailable)?;
+        Ok(database.query_row(
+            "SELECT EXISTS(SELECT 1 FROM backup_owners WHERE id=? AND instance=? AND scope=?)",
+            params![id, instance, scope],
+            |row| row.get(0),
+        )?)
+    }
+    pub fn backup_ids(
+        &self,
+        instance: &str,
+        scope: &str,
+        existing: &[String],
+    ) -> Result<std::collections::BTreeSet<String>> {
+        let database = self.0.lock().map_err(|_| Error::StorageUnavailable)?;
+        let mut query = database.prepare("SELECT id FROM backup_owners WHERE instance=? AND scope=? AND id IN (SELECT value FROM json_each(?)) LIMIT ?")?;
+        Ok(query
+            .query_map(
+                params![
+                    instance,
+                    scope,
+                    serde_json::to_string(existing)?,
+                    sql_count(crate::operation_contracts::OPERATIONS_MAX_BACKUPS)?
+                ],
+                |row| row.get(0),
+            )?
+            .collect::<std::result::Result<_, _>>()?)
+    }
+    pub fn reserve_backup(&self, id: &str, instance: &str, scope: &str) -> Result<()> {
+        let database = self.0.lock().map_err(|_| Error::StorageUnavailable)?;
+        if database.execute("INSERT INTO backup_owners VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET id=excluded.id WHERE instance=excluded.instance AND scope=excluded.scope",params![id,instance,scope])? != 1 { return Err(Error::Conflict); }
+        Ok(())
+    }
+    pub fn prune_backup_owners(&self, instance: &str, retained: &[String]) -> Result<()> {
+        let database = self.0.lock().map_err(|_| Error::StorageUnavailable)?;
+        database.execute("DELETE FROM backup_owners WHERE instance=? AND id NOT IN (SELECT value FROM json_each(?))",params![instance,serde_json::to_string(retained)?])?;
+        Ok(())
+    }
+    pub fn forget_backup(&self, id: &str) -> Result<()> {
+        let database = self.0.lock().map_err(|_| Error::StorageUnavailable)?;
+        database.execute("DELETE FROM backup_owners WHERE id=?", [id])?;
+        Ok(())
+    }
+    pub fn complete(&self, id: &str, at: u64, result: OperationsResult) -> Result<OperationsJob> {
+        self.change(id, |job| {
+            advance(job, OperationsJobState::Succeeded, at, None)?;
+            job.result = Some(result);
+            Ok(job.clone())
+        })
     }
 
     pub fn transition(

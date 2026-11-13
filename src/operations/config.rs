@@ -19,6 +19,25 @@ pub struct Config {
     pub host: String,
     pub authority: String,
     pub instances: BTreeMap<String, InstanceSettings>,
+    pub backups: BackupSettings,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupSettings {
+    pub retained: usize,
+    pub retained_bytes: u64,
+    pub archive_bytes: u64,
+    pub entries: u64,
+    pub remote: Option<RemoteSettings>,
+}
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteSettings {
+    pub endpoint: String,
+    pub credential_file: PathBuf,
+    pub recipient: String,
+    pub identity_file: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -70,6 +89,15 @@ impl Config {
                 *value = parent.join(&*value);
             }
         }
+        if let Some(remote) = &mut config.backups.remote {
+            for path in
+                std::iter::once(&mut remote.credential_file).chain(remote.identity_file.iter_mut())
+            {
+                if path.is_relative() {
+                    *path = parent.join(&*path);
+                }
+            }
+        }
         config.validate()?;
         Ok(config)
     }
@@ -88,6 +116,28 @@ impl Config {
                 return Err(Error::Invalid(
                     "configure the instance command and server type".into(),
                 ));
+            }
+        }
+        if self.backups.retained == 0
+            || self.backups.retained > crate::operation_contracts::OPERATIONS_MAX_BACKUPS
+            || self.backups.archive_bytes == 0
+            || self.backups.retained_bytes < self.backups.archive_bytes
+            || self.backups.entries == 0
+        {
+            return Err(Error::Invalid(format!(
+                "configure positive archive quotas and retain 1 to {} backups",
+                crate::operation_contracts::OPERATIONS_MAX_BACKUPS
+            )));
+        }
+        if let Some(remote) = &self.backups.remote {
+            super::authority::endpoint(&remote.endpoint)?;
+            remote
+                .recipient
+                .parse::<age::x25519::Recipient>()
+                .map_err(|_| Error::Invalid("invalid age backup recipient".into()))?;
+            private_text(&remote.credential_file)?;
+            if let Some(path) = &remote.identity_file {
+                private_text(path)?;
             }
         }
         self.credential()?;
@@ -119,4 +169,28 @@ impl Config {
         }
         Ok(value.as_bytes().to_vec())
     }
+}
+
+pub(super) fn private_text(path: &Path) -> Result<String> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.is_symlink() || metadata.len() > CONFIG_BYTES {
+        return Err(Error::Invalid(
+            "secret must be a regular private file".into(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            return Err(Error::Invalid(
+                "secret file permissions must be 0600".into(),
+            ));
+        }
+    }
+    let value = std::fs::read_to_string(path)?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(Error::Invalid("secret file is empty".into()));
+    }
+    Ok(value.to_owned())
 }

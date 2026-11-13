@@ -30,12 +30,13 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time", "signal"] }
-reqwest = { version = "0.13", features = ["json", "query"] }
+reqwest = { version = "0.13", features = ["json", "query", "stream"] }
 regress = "0.11"
 futures = "0.3"
 minecraftd = { path = "../minecraftd" }
 rusqlite = { version = "0.42", features = ["bundled"] }
 sysinfo = "0.36.0"
+age = { git = "https://github.com/str4d/rage", rev = "b5b68c4f4f7ea5c368bc060f6fe0237549c3a13f", default-features = false }
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -55,3 +56,9 @@ prettyplease = "0.2"
 [[bin]]
 name = "federated-server"
 path = "src/main.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.31", features = ["fs"] }
+
+[patch.crates-io]
+i18n-config = { git = "https://github.com/kellpossible/cargo-i18n", rev = "11b49ea83a12d96bd3689b561262d4db47615311" }

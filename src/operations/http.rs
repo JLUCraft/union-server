@@ -118,6 +118,18 @@ async fn history(
         page_size(&query),
     )?))
 }
+async fn backups(
+    State(executor): State<Arc<Executor>>,
+    headers: HeaderMap,
+    Path(instance): Path<String>,
+) -> Result<Json<crate::operation_contracts::OperationsBackupPage>> {
+    require_bearer(&headers, &executor.credential).map_err(|_| Error::Unauthorized)?;
+    let scope = headers
+        .get(OPERATIONS_SCOPE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| Error::Invalid("scope required".into()))?;
+    Ok(Json(executor.fleet.backups(&instance, scope).await?))
+}
 async fn cancel(
     State(executor): State<Arc<Executor>>,
     headers: HeaderMap,
@@ -243,14 +255,18 @@ async fn execute(executor: Arc<Executor>, dispatch: OperationsDispatch) -> Resul
     let intent = &current.intent;
     let result = async {
         executor.authority.authorize(&current).await?;
-        executor.fleet.apply(&intent.command).await
+        executor.fleet.apply(&current, &executor.authority).await
     }
     .await;
-    let (state, error) = match result {
-        Ok(()) => (OperationsJobState::Succeeded, None),
-        Err(error) => (OperationsJobState::Failed, Some(error.to_string())),
+    let completed = match result {
+        Ok(result) => executor.jobs.complete(&id, now()?, result)?,
+        Err(error) => executor.jobs.transition(
+            &id,
+            OperationsJobState::Failed,
+            now()?,
+            Some(error.to_string()),
+        )?,
     };
-    let completed = executor.jobs.transition(&id, state, now()?, error)?;
     tracing::info!(job = %id, account = %intent.actor.account, client = ?intent.actor.client, request = %intent.actor.request, state = ?completed.state, "central operation completed");
     Ok(())
 }
@@ -324,6 +340,10 @@ impl Supervisor {
             .route(EXECUTOR_JOBS_PATH, post(submit))
             .route(&format!("{EXECUTOR_JOBS_PATH}/{{id}}"), get(job))
             .route(&format!("{EXECUTOR_JOBS_PATH}/{{id}}/cancel"), post(cancel))
+            .route(
+                &format!("{EXECUTOR_INSTANCES_PATH}/{{instance}}/backups"),
+                get(backups),
+            )
             .route(
                 &format!("{EXECUTOR_INSTANCES_PATH}/{{instance}}/jobs"),
                 get(history),

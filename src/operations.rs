@@ -1,5 +1,6 @@
 //! Execution of centrally authorized operations in a separate supervisor process.
 mod authority;
+mod backups;
 mod capture;
 mod config;
 mod fleet;
@@ -12,6 +13,12 @@ pub use http::Supervisor;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("{operation}; recovery failed: {recovery}")]
+    Recovery {
+        #[source]
+        operation: Box<Error>,
+        recovery: Box<Error>,
+    },
     #[error("invalid operations request: {0}")]
     Invalid(String),
     #[error("operation conflicts with the saved request")]
@@ -34,6 +41,10 @@ pub enum Error {
     Clock,
     #[error("operations I/O: {0}")]
     Io(#[from] std::io::Error),
+    #[error("archive operation: {0}")]
+    Archive(#[from] minecraftd::archive::ArchiveError),
+    #[error("backup encryption: {0}")]
+    Encryption(String),
     #[error("operations JSON: {0}")]
     Json(#[from] serde_json::Error),
     #[error("operations database: {0}")]
@@ -44,6 +55,18 @@ pub enum Error {
     Instance(#[from] minecraftd::service::instance::InstanceServiceError),
 }
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl Error {
+    fn with_recovery(self, result: Result<()>) -> Self {
+        match result {
+            Ok(()) => self,
+            Err(recovery) => Self::Recovery {
+                operation: Box::new(self),
+                recovery: Box::new(recovery),
+            },
+        }
+    }
+}
 
 fn now() -> Result<u64> {
     std::time::SystemTime::now()

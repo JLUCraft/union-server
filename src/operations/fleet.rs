@@ -4,8 +4,9 @@ use super::{
     config::Config,
 };
 use crate::operation_contracts::{
-    OperationsAction, OperationsCommand, OperationsInstance, OperationsInstanceState,
-    OperationsOperation, OperationsSnapshot,
+    OperationsAction, OperationsBackupPage, OperationsCommand, OperationsInstance,
+    OperationsInstanceState, OperationsJob, OperationsOperation, OperationsResult,
+    OperationsSnapshot,
 };
 use minecraftd::{
     core::{
@@ -34,6 +35,7 @@ pub(super) struct Managed {
     console: bool,
     pub expected_running: AtomicBool,
     pub health: Arc<Health>,
+    prepared: Mutex<Option<super::backups::Prepared>>,
 }
 
 const CLEANUP_RETRY_DELAY: Duration = Duration::from_secs(5);
@@ -43,9 +45,10 @@ pub(super) struct Fleet {
     pub closing: AtomicBool,
     capture: Arc<Capture>,
     pub root: PathBuf,
+    backups: super::backups::Backups,
 }
 
-fn directory(parent: &Path, name: &str) -> Result<PathBuf> {
+pub(super) fn directory(parent: &Path, name: &str) -> Result<PathBuf> {
     let path = parent.join(name);
     match std::fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.is_dir() && !metadata.is_symlink() => {}
@@ -57,6 +60,11 @@ fn directory(parent: &Path, name: &str) -> Result<PathBuf> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(&path)?,
         Err(error) => return Err(error.into()),
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+    }
     Ok(path)
 }
 
@@ -65,6 +73,12 @@ impl Fleet {
         std::fs::create_dir_all(&config.data)?;
         let data = config.data.canonicalize()?;
         let root = directory(&data, "instances")?;
+        let backups =
+            super::backups::Backups::new(&data, config.backups.clone(), Arc::clone(jobs))?;
+        for id in config.instances.keys() {
+            backups.recover(id, &root.join(id)).await?;
+            backups.reconcile(id).await?;
+        }
         let mut instances = BTreeMap::new();
         let spawner = LocalSpawner::with_group_observation()
             .map_err(|error| Error::Invalid(error.to_string()))?;
@@ -111,6 +125,7 @@ impl Fleet {
                     console: settings.kind.server_type() != "universal",
                     expected_running: AtomicBool::new(settings.auto_start),
                     health,
+                    prepared: Mutex::new(None),
                 },
             );
         }
@@ -119,6 +134,7 @@ impl Fleet {
             closing: AtomicBool::new(false),
             capture,
             root,
+            backups,
         });
         for (id, settings) in &config.instances {
             if settings.auto_start {
@@ -144,12 +160,47 @@ impl Fleet {
         Ok(self.instance(id)?.gate.clone().lock_owned().await)
     }
 
-    pub async fn apply(&self, command: &OperationsCommand) -> Result<()> {
+    pub async fn backups(&self, instance: &str, scope: &str) -> Result<OperationsBackupPage> {
+        let _guard = self.gate(instance).await?;
+        self.backups.list(instance, scope).await
+    }
+    pub async fn apply(
+        &self,
+        job: &OperationsJob,
+        authority: &super::authority::Authority,
+    ) -> Result<OperationsResult> {
+        let command: &OperationsCommand = &job.intent.command;
+        let scope = &job.intent.scope;
+        let id = command.instance.to_string();
+        let root = self.root.join(&id);
+        let mut result = OperationsResult {
+            backup: None,
+            safety_archive: None,
+        };
         if self.closing.load(Ordering::SeqCst) {
             return Err(Error::Invalid("supervisor is stopping".into()));
         }
         let managed = self.instance(&command.instance.to_string())?;
         let service = &managed.service;
+        if matches!(
+            command.operation,
+            OperationsOperation::Lifecycle(_)
+                | OperationsOperation::Console(_)
+                | OperationsOperation::Kill(_)
+                | OperationsOperation::BackupCreate(_)
+        ) {
+            if managed.prepared.lock().await.take().is_some() {
+                self.backups.discard(&id).await?;
+            }
+            if self.backups.pending(&id)?
+                && !(matches!(&command.operation, OperationsOperation::Kill(_))
+                    || matches!(&command.operation,OperationsOperation::Lifecycle(operation) if matches!(operation.action,OperationsAction::Stop)))
+            {
+                return Err(Error::Invalid(
+                    "unfinished restore requires supervisor recovery".into(),
+                ));
+            }
+        }
         match &command.operation {
             OperationsOperation::Lifecycle(operation) => {
                 match operation.action {
@@ -174,6 +225,130 @@ impl Fleet {
                 service.kill().await?;
                 managed.expected_running.store(false, Ordering::SeqCst);
             }
+            OperationsOperation::BackupCreate(operation) => {
+                let running = matches!(service.state(), InstanceState::Running);
+                if let Err(error) = Self::quiesce(managed).await {
+                    return Err(error.with_recovery(Self::resume(managed, running).await));
+                }
+                let created = self
+                    .backups
+                    .create(&id, scope, &root, &operation.label)
+                    .await;
+                let resumed = Self::resume(managed, running).await;
+                let record = match (created, resumed) {
+                    (Ok(record), Ok(())) => record,
+                    (Err(error), recovery) => return Err(error.with_recovery(recovery)),
+                    (Ok(_), Err(error)) => return Err(error),
+                };
+                result.backup = Some(super::backups::receipt(&record)?);
+            }
+            OperationsOperation::RestorePrepare(operation) => {
+                managed.prepared.lock().await.take();
+                self.backups.discard(&id).await?;
+                let (archive, transaction) = self
+                    .backups
+                    .prepare(&id, scope, &operation.archive.to_string(), &root)
+                    .await?;
+                authority.authorize(job).await?;
+                result.backup = Some(super::backups::receipt(&archive)?);
+                *managed.prepared.lock().await = Some(super::backups::Prepared {
+                    archive,
+                    scope: scope.clone(),
+                    request: job.intent.id.to_string(),
+                    transaction,
+                });
+            }
+            OperationsOperation::Restore(operation) => {
+                authority.authorize(job).await?;
+                let prepared = {
+                    let preparation = managed.prepared.lock().await;
+                    let prepared = preparation.as_ref().ok_or_else(|| {
+                        Error::Invalid("prepare this restore before requesting confirmation".into())
+                    })?;
+                    if prepared.archive.id != operation.archive.to_string()
+                        || prepared.request != operation.preparation.to_string()
+                        || prepared.scope != *scope
+                    {
+                        return Err(Error::Conflict);
+                    }
+                    prepared.clone()
+                };
+                let resume = matches!(service.state(), InstanceState::Running);
+                if let Err(error) = Self::quiesce(managed).await {
+                    return Err(error.with_recovery(Self::resume(managed, resume).await));
+                }
+                let safety = match self
+                    .backups
+                    .create(
+                        &id,
+                        scope,
+                        &root,
+                        &format!("before restore {}", *job.intent.id),
+                    )
+                    .await
+                {
+                    Ok(safety) => safety,
+                    Err(error) => {
+                        return Err(error.with_recovery(Self::resume(managed, resume).await));
+                    }
+                };
+                managed.prepared.lock().await.take();
+                if let Err(error) = self
+                    .backups
+                    .activate(&prepared.transaction, &root, &safety.id)
+                {
+                    let recovery = async {
+                        self.backups.recover(&id, &root).await?;
+                        Self::resume(managed, resume).await
+                    }
+                    .await;
+                    return Err(error.with_recovery(recovery));
+                }
+                if resume && let Err(error) = service.start().await {
+                    let recovery = async {
+                        Self::quiesce(managed).await?;
+                        self.backups.recover(&id, &root).await?;
+                        Self::resume(managed, true).await
+                    }
+                    .await;
+                    return Err(Error::from(error).with_recovery(recovery));
+                }
+                managed.expected_running.store(resume, Ordering::SeqCst);
+                self.backups.commit(&prepared.transaction).await?;
+                result.backup = Some(super::backups::receipt(&prepared.archive)?);
+                result.safety_archive = Some(super::config::identifier(&safety.id)?);
+            }
+            OperationsOperation::BackupExport(operation) => {
+                result.backup = Some(
+                    self.backups
+                        .export(
+                            &id,
+                            scope,
+                            &operation.archive.to_string(),
+                            &job.intent.id.to_string(),
+                        )
+                        .await?,
+                );
+            }
+            OperationsOperation::BackupImport(operation) => {
+                result.backup = Some(
+                    self.backups
+                        .import(
+                            &id,
+                            scope,
+                            &operation.archive.to_string(),
+                            &job.intent.id.to_string(),
+                        )
+                        .await?,
+                );
+            }
+            OperationsOperation::BackupDelete(operation) => {
+                result.backup = Some(
+                    self.backups
+                        .delete(&id, scope, &operation.archive.to_string())
+                        .await?,
+                );
+            }
             OperationsOperation::Console(operation) => {
                 if !managed.console {
                     return Err(Error::Invalid(
@@ -182,6 +357,24 @@ impl Fleet {
                 }
                 service.send_command(operation.input.to_string()).await?;
             }
+        }
+        Ok(result)
+    }
+
+    async fn resume(managed: &Managed, running: bool) -> Result<()> {
+        if running && managed.service.process_id().await.is_none() {
+            managed.service.start().await?;
+            managed.expected_running.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    async fn quiesce(managed: &Managed) -> Result<()> {
+        let exit = managed.service.stop_gracefully().await?;
+        if exit.is_some_and(|code| code != 0) {
+            return Err(Error::Invalid(
+                "instance did not complete a clean shutdown".into(),
+            ));
         }
         Ok(())
     }

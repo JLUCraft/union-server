@@ -151,6 +151,13 @@ federated-server supervise --config /srv/jlucraft/supervisor.json
   "credential_file": "/srv/jlucraft/ops.credential",
   "host": "campus",
   "authority": "https://skin.jlucraft.com",
+  "backups": {
+    "retained": 10,
+    "retained_bytes": 107374182400,
+    "archive_bytes": 10737418240,
+    "entries": 100000,
+    "remote": null
+  },
   "instances": {
     "gateway": {
       "start_command": "federated-server run --config /srv/jlucraft/host.json",
@@ -219,3 +226,41 @@ cargo test --locked
 ```
 
 Central lifecycle stop and restart use graceful termination. A timeout fails the job and preserves the managed process. Force termination uses the human-approved PID-bound kill action.
+
+The Linux supervisor supports `backup`, `restore_prepare`, `restore`,
+`backup_export`, `backup_import`, and `backup_delete` jobs. `backup` takes a
+`label`, stops the instance gracefully, archives the complete instance directory,
+and resumes an instance that was running. A failed or unclean stop prevents the
+archive. Keep all managed service data inside its instance directory. Limits
+bound archive bytes, expanded bytes, entry count, retained count, and retained
+compressed bytes per instance. Retention keeps the newly published archive.
+`GET /api/operations/hosts/<host>/instances/<instance>/backups` lists the caller's
+scoped archives through the skin station MCP. Completed jobs include their backup
+receipt.
+
+Run `restore_prepare` with an `archive` ID before requesting restoration. It
+extracts the candidate while the instance remains available. Its job ID identifies
+the preparation. Submit `restore` with `archive` and `preparation`; a human
+confirms that exact request in the skin station. Starting, stopping, restarting, commanding, or
+backing up the instance discards its preparation. Activation swaps the directories
+atomically. A durable journal restores the previous directory after an interrupted
+activation. Fresh authorization admits the restore transaction before it stops the
+instance. The admitted transaction saves the current safety archive, activates the
+candidate, and resumes an instance that was running. It completes without calling
+the authority while that managed service is stopped. The completed job returns
+`safetyArchive`.
+Use the same preparation and confirmation flow with a safety archive to roll back.
+Deleting a backup requires human confirmation.
+
+For encrypted off-host recovery, set `backups.remote` to an object with `endpoint`,
+`credential_file`, `recipient`, and optional `identity_file`. The endpoint is an
+HTTPS origin serving atomic authenticated `PUT` and `GET` at
+`/backups/<archive-id>.age`; numeric loopback HTTP supports local deployments.
+The credential file supplies the bearer credential. `recipient` is the public age
+X25519 recipient. Keep its private age identity offline; install its secret string
+in `identity_file` only when importing a recovery archive. Secret files require
+mode 0600 outside the repository. Export streams authenticated encryption before
+upload; import consumes the authenticated stream before publishing data and checks
+the instance and permission scope. Record archive IDs outside the host and set the
+remote store's retention and storage limits. Import restores the archive to the
+local catalog; preparation and human confirmation apply before replacing data.

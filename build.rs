@@ -30,6 +30,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             constants.push_str(&format!(
                 "pub const OPERATIONS_APPROVAL_ACTIONS: &[&str] = &{approval_actions};\n"
             ));
+            let backups =
+                schema["definitions"]["OperationsBackupPage"]["properties"]["backups"]["maxItems"]
+                    .as_u64()
+                    .ok_or("invalid backup page limit")?;
+            constants.push_str(&format!(
+                "pub const OPERATIONS_MAX_BACKUPS: usize = {backups};\n"
+            ));
             let protocol = &schema["definitions"]["OperationsProtocol"]["properties"];
             for (name, property, kind) in [
                 ("OPERATIONS_LEASE_SECONDS", "leaseSeconds", "u64"),
