@@ -217,3 +217,5 @@ cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
 ```
+
+Central lifecycle stop and restart use graceful termination. A timeout fails the job and preserves the managed process. Force termination uses the human-approved PID-bound kill action.

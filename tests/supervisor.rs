@@ -1,9 +1,11 @@
 #![cfg(unix)]
 
+use minecraftd::instance::server::DEFAULT_GRACEFUL_STOP_TIMEOUT_SECS;
+
 use federated_server::{
     operation_contracts::{
         OPERATIONS_CLAIM_HEADER, OPERATIONS_LEASE_SECONDS, OPERATIONS_SCOPE_HEADER,
-        OperationsDispatch, OperationsJob, OperationsJobPage, OperationsJobState,
+        OperationsAlert, OperationsDispatch, OperationsJob, OperationsJobPage, OperationsJobState,
         OperationsLogPage, OperationsObservation, OperationsSnapshot,
     },
     operations::{Config, Supervisor},
@@ -20,7 +22,7 @@ use std::{
 };
 use tokio::sync::Notify;
 
-const JOB_WAIT: Duration = Duration::from_secs(5);
+const JOB_WAIT: Duration = Duration::from_secs(DEFAULT_GRACEFUL_STOP_TIMEOUT_SECS + 5);
 const JOB_INTERVAL: Duration = Duration::from_millis(20);
 
 async fn completed(
@@ -69,7 +71,7 @@ fn configuration(
         &config,
         serde_json::to_vec(&json!({
             "bind":"127.0.0.1:0", "data":root.join("data"), "credential_file":key,"host":"host-a","authority":authority,
-            "instances":{"gateway":{"start_command":"cat","stop_command":"","kind":"service","auto_start":false},"world":{"start_command":"sh -c 'echo early-start; cat'","stop_command":"","kind":"bedrock","auto_start":false}}
+            "instances":{"stubborn":{"start_command":r#"sh -c 'trap "exit 0" TERM; (trap "" TERM; echo stubborn-ready; exec sleep 60 >/dev/null 2>&1)& wait'"#,"stop_command":"","kind":"service","auto_start":false},"gateway":{"start_command":"cat","stop_command":"","kind":"service","auto_start":false},"world":{"start_command":"sh -c 'echo early-start; cat'","stop_command":"","kind":"bedrock","auto_start":false}}
         }))?,
     )?;
     Ok(config)
@@ -281,6 +283,94 @@ async fn supervisor_keeps_authorized_jobs_and_remains_available_when_the_managed
         .error_for_status()?;
     assert!(matches!(
         completed(&client, &origin, &credential, "approved-kill")
+            .await?
+            .state,
+        OperationsJobState::Succeeded
+    ));
+
+    let mut stubborn = serde_json::to_value(dispatch("start-stubborn", "start")?)?;
+    stubborn["intent"]["command"]["instance"] = "stubborn".into();
+    grant(&grants, &serde_json::from_value(stubborn.clone())?)?;
+    client
+        .post(format!("{origin}/jobs"))
+        .bearer_auth(&credential)
+        .json(&stubborn)
+        .send()
+        .await?
+        .error_for_status()?;
+    assert!(matches!(
+        completed(&client, &origin, &credential, "start-stubborn")
+            .await?
+            .state,
+        OperationsJobState::Succeeded
+    ));
+    let mut stream = client
+        .get(format!("{origin}/instances/stubborn/logs/watch"))
+        .bearer_auth(&credential)
+        .send()
+        .await?
+        .error_for_status()?;
+    tokio::time::timeout(JOB_WAIT, async {
+        let mut output = String::new();
+        while let Some(chunk) = stream.chunk().await? {
+            output.push_str(&String::from_utf8_lossy(&chunk));
+            if output.contains("stubborn-ready") {
+                return Ok::<(), anyhow::Error>(());
+            }
+        }
+        anyhow::bail!("stubborn process output ended");
+    })
+    .await??;
+    drop(stream);
+    let owned = client
+        .get(format!("{origin}/instances/stubborn/observe"))
+        .bearer_auth(&credential)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<OperationsObservation>()
+        .await?;
+    for action in ["stop", "restart"] {
+        let id = format!("{action}-stubborn");
+        stubborn["intent"]["id"] = id.clone().into();
+        stubborn["intent"]["command"]["operation"] = json!({"action":action});
+        grant(&grants, &serde_json::from_value(stubborn.clone())?)?;
+        client
+            .post(format!("{origin}/jobs"))
+            .bearer_auth(&credential)
+            .json(&stubborn)
+            .send()
+            .await?
+            .error_for_status()?;
+        assert!(matches!(
+            completed(&client, &origin, &credential, &id).await?.state,
+            OperationsJobState::Failed
+        ));
+        let retained = client
+            .get(format!("{origin}/instances/stubborn/observe"))
+            .bearer_auth(&credential)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<OperationsObservation>()
+            .await?;
+        assert_eq!(retained.instance.pid, owned.instance.pid);
+        assert!(retained.alerts.contains(&OperationsAlert::ProcessStopped));
+        assert!(retained.instance.pid.is_some());
+    }
+    stubborn["intent"]["id"] = "kill-stubborn".into();
+    stubborn["intent"]["command"]["operation"] = json!({"action":"kill","pid":owned.instance.pid});
+    stubborn["approval"] = json!({"account":"administrator","request":"kill-stubborn","approvedAt":SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()});
+    grant(&grants, &serde_json::from_value(stubborn.clone())?)?;
+    client
+        .post(format!("{origin}/jobs"))
+        .bearer_auth(&credential)
+        .json(&stubborn)
+        .send()
+        .await?
+        .error_for_status()?;
+    assert!(matches!(
+        completed(&client, &origin, &credential, "kill-stubborn")
             .await?
             .state,
         OperationsJobState::Succeeded

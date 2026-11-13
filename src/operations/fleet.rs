@@ -66,6 +66,8 @@ impl Fleet {
         let data = config.data.canonicalize()?;
         let root = directory(&data, "instances")?;
         let mut instances = BTreeMap::new();
+        let spawner = LocalSpawner::with_group_observation()
+            .map_err(|error| Error::Invalid(error.to_string()))?;
         let capture = Capture::start(Arc::clone(jobs));
         for (id, settings) in &config.instances {
             let path = directory(&root, id)?;
@@ -92,7 +94,7 @@ impl Fleet {
                 }),
             );
             let instance = InstanceBuilder::new(id.clone(), InstancePath::new(path))
-                .spawner(LocalSpawner::new())
+                .spawner(spawner.clone())
                 .event_bus(bus)
                 .build_server(ServerConfig {
                     start_command: settings.start_command.clone(),
@@ -150,22 +152,27 @@ impl Fleet {
         let service = &managed.service;
         match &command.operation {
             OperationsOperation::Lifecycle(operation) => {
+                match operation.action {
+                    OperationsAction::Start => service.start().await?,
+                    OperationsAction::Stop => {
+                        service.stop_gracefully().await?;
+                    }
+                    OperationsAction::Restart => {
+                        service.stop_gracefully().await?;
+                        service.start().await?;
+                    }
+                }
                 managed.expected_running.store(
                     !matches!(operation.action, OperationsAction::Stop),
                     Ordering::SeqCst,
                 );
-                match operation.action {
-                    OperationsAction::Start => service.start().await?,
-                    OperationsAction::Stop => service.stop().await?,
-                    OperationsAction::Restart => service.restart().await?,
-                }
             }
             OperationsOperation::Kill(operation) => {
                 if service.process_id().await.map(u64::from) != Some(operation.pid.into()) {
                     return Err(Error::Conflict);
                 }
-                managed.expected_running.store(false, Ordering::SeqCst);
                 service.kill().await?;
+                managed.expected_running.store(false, Ordering::SeqCst);
             }
             OperationsOperation::Console(operation) => {
                 if !managed.console {
