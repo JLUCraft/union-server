@@ -34,6 +34,7 @@ regress = "0.11"
 futures = "0.3"
 minecraftd = { path = "../minecraftd" }
 rusqlite = { version = "0.42", features = ["bundled"] }
+sysinfo = "0.36.0"
 
 [lints.rust]
 unsafe_code = "forbid"

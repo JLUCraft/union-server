@@ -1,8 +1,10 @@
 //! Execution of centrally authorized operations in a separate supervisor process.
+mod capture;
 mod config;
 mod fleet;
 mod http;
 mod jobs;
+mod observe;
 
 pub use config::Config;
 pub use http::Supervisor;
@@ -31,6 +33,8 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("operations database: {0}")]
     Database(#[from] rusqlite::Error),
+    #[error("operations task: {0}")]
+    Task(#[from] tokio::task::JoinError),
     #[error("instance operation: {0}")]
     Instance(#[from] minecraftd::service::instance::InstanceServiceError),
 }

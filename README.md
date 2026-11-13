@@ -184,6 +184,19 @@ until all managed processes have been released. Run the supervisor under a
 system service with `Restart=on-failure` and `KillMode=control-group` so a process
 failure releases its managed process group before restart.
 
+The executor persists console output with monotonic resume cursors, retaining the
+latest 512 segments per instance. Output enters a bounded capture queue and
+is committed in batches outside the async workers. Queue overflow records a
+capture gap, and shutdown drains accepted output before releasing ownership. Responses stay within the central contract byte
+limit and report retention gaps or clipped segments. Console input is enabled for
+game instances and disabled for generic services. Queued jobs can be canceled;
+running commands keep their recorded execution state.
+
+Instance observations collect process memory, CPU samples, and storage space on
+request. CPU remains absent until a second sample is available. Alerts identify
+unexpected stops, process errors, lost log capture, and storage or memory with
+less than ten percent free capacity.
+
 Historical operations code in `src/ops.rs`, `src/ops_extended.rs`, and
 `src/rooms.rs` remains excluded from the build. The active execution path uses
 minecraftd and generated skin-station contracts.

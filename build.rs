@@ -28,6 +28,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             let protocol = &schema["definitions"]["OperationsProtocol"]["properties"];
             for (name, property, kind) in [
                 ("OPERATIONS_LEASE_SECONDS", "leaseSeconds", "u64"),
+                ("OPERATIONS_MAX_PAGE_ROWS", "maxPageRows", "usize"),
+                ("OPERATIONS_WATCH_SECONDS", "watchSeconds", "u64"),
                 ("OPERATIONS_MAX_REQUEST_BYTES", "maxRequestBytes", "usize"),
             ] {
                 let value = protocol[property]["const"]
@@ -38,6 +40,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             for (name, property) in [
                 ("EXECUTOR_SNAPSHOT_PATH", "snapshotPath"),
                 ("EXECUTOR_JOBS_PATH", "jobsPath"),
+                ("EXECUTOR_INSTANCES_PATH", "instancesPath"),
+                ("OPERATIONS_SCOPE_HEADER", "scopeHeader"),
             ] {
                 let value = protocol[property]["const"]
                     .as_str()
@@ -82,6 +86,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let mut types = typify::TypeSpace::default();
         types.add_root_schema(serde_json::from_value(schema)?)?;
         let mut syntax = syn::parse2(types.to_stream())?;
+        derive_default_structs(&mut syntax);
         FalliblePatterns.visit_file_mut(&mut syntax);
         fs::write(
             PathBuf::from(env::var("OUT_DIR")?).join(output),
@@ -89,6 +94,83 @@ fn main() -> Result<(), Box<dyn Error>> {
         )?;
     }
     Ok(())
+}
+
+fn derive_default_structs(file: &mut syn::File) {
+    let structures: std::collections::HashSet<String> = file
+        .items
+        .iter()
+        .filter_map(|item| {
+            if let syn::Item::Struct(item) = item {
+                Some(item.ident.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    let mut derived = std::collections::HashSet::new();
+    file.items.retain(|item| {
+        let syn::Item::Impl(item) = item else {
+            return true;
+        };
+        if !item.trait_.as_ref().is_some_and(|(_, path, _)| {
+            path.segments
+                .last()
+                .is_some_and(|part| part.ident == "Default")
+        }) {
+            return true;
+        }
+        let syn::Type::Path(target) = item.self_ty.as_ref() else {
+            return true;
+        };
+        let Some(name) = target
+            .path
+            .segments
+            .last()
+            .map(|part| part.ident.to_string())
+        else {
+            return true;
+        };
+        if !structures.contains(&name) {
+            return true;
+        }
+        let [syn::ImplItem::Fn(method)] = item.items.as_slice() else {
+            return true;
+        };
+        let [syn::Stmt::Expr(syn::Expr::Struct(value), None)] = method.block.stmts.as_slice()
+        else {
+            return true;
+        };
+        if !value.path.is_ident("Self") || value.rest.is_some() {
+            return true;
+        }
+        if !value.fields.iter().all(|field| {
+            let syn::Expr::Call(call) = &field.expr else {
+                return false;
+            };
+            let syn::Expr::Path(function) = call.func.as_ref() else {
+                return false;
+            };
+            call.args.is_empty()
+                && function
+                    .path
+                    .segments
+                    .iter()
+                    .map(|part| part.ident.to_string())
+                    .eq(["Default", "default"])
+        }) {
+            return true;
+        }
+        derived.insert(name);
+        false
+    });
+    for item in &mut file.items {
+        if let syn::Item::Struct(item) = item
+            && derived.contains(&item.ident.to_string())
+        {
+            item.attrs.push(syn::parse_quote!(#[derive(Default)]));
+        }
+    }
 }
 
 // Property references retain their canonical definitions in the producer schema.

@@ -2,7 +2,8 @@
 
 use federated_server::{
     operation_contracts::{
-        OPERATIONS_LEASE_SECONDS, OperationsDispatch, OperationsJob, OperationsJobState,
+        OPERATIONS_LEASE_SECONDS, OPERATIONS_SCOPE_HEADER, OperationsDispatch, OperationsJob,
+        OperationsJobPage, OperationsJobState, OperationsLogPage, OperationsObservation,
         OperationsSnapshot,
     },
     operations::{Config, Supervisor},
@@ -62,7 +63,7 @@ fn configuration(root: &Path, credential: &str) -> anyhow::Result<std::path::Pat
         &config,
         serde_json::to_vec(&json!({
             "bind":"127.0.0.1:0", "data":root.join("data"), "credential_file":key,
-            "instances":{"gateway":{"start_command":"cat","stop_command":"","kind":"service","auto_start":false}}
+            "instances":{"gateway":{"start_command":"cat","stop_command":"","kind":"service","auto_start":false},"world":{"start_command":"sh -c 'echo early-start; cat'","stop_command":"","kind":"bedrock","auto_start":false}}
         }))?,
     )?;
     Ok(config)
@@ -70,7 +71,7 @@ fn configuration(root: &Path, credential: &str) -> anyhow::Result<std::path::Pat
 
 fn dispatch(id: &str, action: &str) -> anyhow::Result<OperationsDispatch> {
     Ok(serde_json::from_value(json!({
-        "intent":{"id":id,"actor":{"account":"administrator","client":"test-agent","request":"test-call"},"scope":"global","command":{"instance":"gateway","action":action}},
+        "intent":{"id":id,"actor":{"account":"administrator","client":"test-agent","request":"test-call"},"scope":"global","command":{"instance":"gateway","operation":{"action":action}}},
         "expiresAt":SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()+OPERATIONS_LEASE_SECONDS
     }))?)
 }
@@ -132,6 +133,68 @@ async fn supervisor_keeps_authorized_jobs_and_remains_available_when_the_managed
             .status(),
         StatusCode::CONFLICT
     );
+    let mut world = serde_json::to_value(dispatch("start-world", "start")?)?;
+    world["intent"]["command"]["instance"] = "world".into();
+    client
+        .post(format!("{origin}/jobs"))
+        .bearer_auth(&credential)
+        .json(&world)
+        .send()
+        .await?
+        .error_for_status()?;
+    assert!(matches!(
+        completed(&client, &origin, &credential, "start-world")
+            .await?
+            .state,
+        OperationsJobState::Succeeded
+    ));
+    world["intent"]["id"] = "console-world".into();
+    world["intent"]["command"]["operation"] = json!({"action":"console","input":"say hello"});
+    client
+        .post(format!("{origin}/jobs"))
+        .bearer_auth(&credential)
+        .json(&world)
+        .send()
+        .await?
+        .error_for_status()?;
+    assert!(matches!(
+        completed(&client, &origin, &credential, "console-world")
+            .await?
+            .state,
+        OperationsJobState::Succeeded
+    ));
+    let streamed = client
+        .get(format!("{origin}/instances/world/logs/watch"))
+        .bearer_auth(&credential)
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    assert!(streamed.contains("early-start"));
+    assert!(streamed.contains("say hello"));
+    assert!(streamed.contains("event: done"));
+    let observed = client
+        .get(format!("{origin}/instances/world/observe"))
+        .bearer_auth(&credential)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<OperationsObservation>()
+        .await?;
+    assert!(observed.instance.pid.is_some());
+    assert!(observed.memory_bytes.is_some());
+    assert!(observed.cpu_percent.is_none());
+    let history = client
+        .get(format!("{origin}/instances/world/jobs"))
+        .bearer_auth(&credential)
+        .header(OPERATIONS_SCOPE_HEADER, "global")
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<OperationsJobPage>()
+        .await?;
+    assert_eq!(history.jobs.len(), 2);
     let stop_job = dispatch("stop-gateway", "stop")?;
     client
         .post(format!("{origin}/jobs"))
@@ -168,6 +231,19 @@ async fn supervisor_keeps_authorized_jobs_and_remains_available_when_the_managed
             .state,
         OperationsJobState::Succeeded
     ));
+    let logs = client
+        .get(format!("{origin}/instances/world/logs"))
+        .bearer_auth(&credential)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<OperationsLogPage>()
+        .await?;
+    assert!(
+        logs.entries
+            .iter()
+            .any(|entry| entry.data.contains("say hello"))
+    );
     stop.notify_one();
     server.await??;
     Ok(())
