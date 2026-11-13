@@ -32,6 +32,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-uti
 reqwest = { version = "0.13", features = ["json", "query"] }
 regress = "0.11"
 futures = "0.3"
+minecraftd = { path = "../minecraftd" }
+rusqlite = { version = "0.42", features = ["bundled"] }
 
 [lints.rust]
 unsafe_code = "forbid"

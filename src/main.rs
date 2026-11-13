@@ -11,6 +11,11 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Run the operations executor independently of managed game services.
+    Supervise {
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Start configured game services.
     Run {
         #[arg(long)]
@@ -42,6 +47,14 @@ async fn main() -> Result<()> {
         )
         .init();
     match Args::parse().command {
+        Command::Supervise { config } => {
+            let supervisor = federated_server::operations::Supervisor::start(
+                federated_server::operations::Config::load(&config)?,
+            )
+            .await?;
+            tracing::info!(address = %supervisor.address()?, "operations supervisor listening");
+            supervisor.run(stopping()).await?;
+        }
         Command::Check { config } => {
             Config::load(&config)?;
         }

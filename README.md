@@ -22,7 +22,7 @@ the scorer account and is read on every request so it can be replaced after
 renewal. `token` contains the separate 32–256 character Paper bearer loaded at
 startup. Keep both files outside the repository with owner-only permissions.
 Scoring no longer needs a device key, identity log, or governance journal.
-Operations M1–M6 are disabled while their source remains frozen.
+Central operations use a separate supervisor process controlled through the skin station MCP.
 
 ## Native Minecraft gateway
 
@@ -135,12 +135,58 @@ HTTP adapters finish active requests, and activity evidence is flushed from the
 spool. Explicit `Host::close` awaits shutdown. Dropping a host requests shutdown
 asynchronously. Startup failure closes services already opened before returning.
 
-Management and account recovery use the skin station's authenticated central MCP.
-Operations M1–M6 remain deferred. Their source in `src/ops.rs`,
-`src/ops_extended.rs`, and the instance helpers in `src/rooms.rs` is frozen and
-excluded from the build. The owner approved disabling those runtime entries
-until central operations are resumed separately. Paper process lifecycle is
-managed outside this host during that period.
+## Central operations supervisor
+
+Run the executor as a separate process so it remains available when the managed
+game host stops:
+
+```sh
+federated-server supervise --config /srv/jlucraft/supervisor.json
+```
+
+```json
+{
+  "bind": "127.0.0.1:26010",
+  "data": "/srv/jlucraft/managed",
+  "credential_file": "/srv/jlucraft/ops.credential",
+  "instances": {
+    "gateway": {
+      "start_command": "federated-server run --config /srv/jlucraft/host.json",
+      "stop_command": "",
+      "kind": "service",
+      "auto_start": true
+    }
+  }
+}
+```
+
+Kinds are `java`, `bedrock`, and `service`. Place prepared instance files in
+`data/instances/<id>`. Commands come from the operator's configuration. The
+executor accepts start, stop, and restart jobs from the central service; it does
+not expose a shell or accept game session credentials. Empty stop commands use
+SIGTERM on Unix, and `^C` uses SIGINT. Processes stop before lifecycle completion.
+
+Store the 32-byte hexadecimal credential outside the repository in a regular
+file with mode 0600. Configure its matching value in the skin station's private
+environment. Keep the loopback executor behind an HTTPS reverse proxy when the
+skin station runs remotely. The skin station checks account identity, OAuth
+scope, and the instance's central permission binding. A site administrator assigns
+each instance to the appropriate club or global scope.
+
+The supervisor owns a data-directory lock and a SQLite job journal. Duplicate
+job IDs preserve the original request, and a different payload under the same
+ID is rejected. Jobs retain administrator/client/call attribution. A lease must
+remain valid when queued work starts. A queued retry renews the stored lease;
+execution admission reads that lease in the same transaction as the state change.
+Interrupted jobs remain marked after a restart and require a new administrator
+decision. Shutdown retains the ownership lock and retries failed instance cleanup
+until all managed processes have been released. Run the supervisor under a
+system service with `Restart=on-failure` and `KillMode=control-group` so a process
+failure releases its managed process group before restart.
+
+Historical operations code in `src/ops.rs`, `src/ops_extended.rs`, and
+`src/rooms.rs` remains excluded from the build. The active execution path uses
+minecraftd and generated skin-station contracts.
 
 Project development rules are in `AGENTS.md`. Standard validation:
 

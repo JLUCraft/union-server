@@ -6,6 +6,7 @@ mod central;
 pub mod forwarding;
 mod login;
 pub mod native;
+pub mod operations;
 pub mod protocol;
 pub mod scoring;
 pub mod skins;
@@ -20,6 +21,10 @@ pub mod game_contracts {
 
 pub mod point_contracts {
     include!(concat!(env!("OUT_DIR"), "/point_contracts.rs"));
+}
+
+pub mod operation_contracts {
+    include!(concat!(env!("OUT_DIR"), "/operation_contracts.rs"));
 }
 
 mod service;

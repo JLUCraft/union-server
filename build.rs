@@ -8,6 +8,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         ("session-profile", None, "skin_contracts.rs"),
         ("league", Some("GameScoringSession"), "game_contracts.rs"),
         ("points", Some("ActivityDelivery"), "point_contracts.rs"),
+        ("operations", None, "operation_contracts.rs"),
     ] {
         let schema_path = contracts.join(format!("{filename}.schema.json"));
         println!("cargo:rerun-if-changed={}", schema_path.display());
@@ -18,6 +19,32 @@ fn main() -> Result<(), Box<dyn Error>> {
             schema["$ref"] = format!("#/definitions/{root}").into();
         }
         let mut constants = String::new();
+        if filename == "operations" {
+            // Wire messages are definitions; the document root is a bundle.
+            schema
+                .as_object_mut()
+                .ok_or("invalid operations contract")?
+                .remove("title");
+            let protocol = &schema["definitions"]["OperationsProtocol"]["properties"];
+            for (name, property, kind) in [
+                ("OPERATIONS_LEASE_SECONDS", "leaseSeconds", "u64"),
+                ("OPERATIONS_MAX_REQUEST_BYTES", "maxRequestBytes", "usize"),
+            ] {
+                let value = protocol[property]["const"]
+                    .as_u64()
+                    .ok_or("invalid operations limit")?;
+                constants.push_str(&format!("pub const {name}: {kind} = {value};\n"));
+            }
+            for (name, property) in [
+                ("EXECUTOR_SNAPSHOT_PATH", "snapshotPath"),
+                ("EXECUTOR_JOBS_PATH", "jobsPath"),
+            ] {
+                let value = protocol[property]["const"]
+                    .as_str()
+                    .ok_or("invalid operations path")?;
+                constants.push_str(&format!("pub const {name}: &str = {value:?};\n"));
+            }
+        }
         if filename == "points" {
             let office_path = contracts.join("office.schema.json");
             println!("cargo:rerun-if-changed={}", office_path.display());

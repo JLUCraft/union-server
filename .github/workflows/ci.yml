@@ -33,6 +33,11 @@ jobs:
           ref: refactor/central-skinstation-p0
           path: workspace/federated-skinstation
 
+      - uses: actions/checkout@v7
+        with:
+          repository: JLUCraft/minecraftd
+          path: workspace/minecraftd
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
