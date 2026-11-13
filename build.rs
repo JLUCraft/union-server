@@ -1,4 +1,5 @@
 use std::{env, error::Error, fs, path::PathBuf};
+use syn::visit_mut::{self, VisitMut};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let contracts = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?)
@@ -53,9 +54,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         let mut types = typify::TypeSpace::default();
         types.add_root_schema(serde_json::from_value(schema)?)?;
+        let mut syntax = syn::parse2(types.to_stream())?;
+        FalliblePatterns.visit_file_mut(&mut syntax);
         fs::write(
             PathBuf::from(env::var("OUT_DIR")?).join(output),
-            format!("{}\n{constants}", types.to_stream()),
+            format!("{}\n{constants}", prettyplease::unparse(&syntax)),
         )?;
     }
     Ok(())
@@ -90,4 +93,45 @@ fn expand_point_refs(
         _ => {}
     }
     Ok(())
+}
+
+// Keep schema pattern compilation fallible in the generated string parsers.
+struct FalliblePatterns;
+
+impl VisitMut for FalliblePatterns {
+    fn visit_item_static_mut(&mut self, item: &mut syn::ItemStatic) {
+        if item.ident == "PATTERN" {
+            *item.ty = syn::parse_quote! {
+                ::std::sync::LazyLock<::std::result::Result<::regress::Regex, ::regress::Error>>
+            };
+            PatternInitializer.visit_expr_mut(&mut item.expr);
+        }
+        visit_mut::visit_item_static_mut(self, item);
+    }
+
+    fn visit_expr_method_call_mut(&mut self, call: &mut syn::ExprMethodCall) {
+        if call.method == "find"
+            && matches!(&*call.receiver, syn::Expr::Path(path) if path.path.is_ident("PATTERN"))
+        {
+            *call.receiver = syn::parse_quote! {
+                PATTERN.as_ref().map_err(|error| {
+                    self::error::ConversionError::from(format!("invalid schema pattern: {error}"))
+                })?
+            };
+        }
+        visit_mut::visit_expr_method_call_mut(self, call);
+    }
+}
+
+struct PatternInitializer;
+
+impl VisitMut for PatternInitializer {
+    fn visit_expr_mut(&mut self, expression: &mut syn::Expr) {
+        if let syn::Expr::MethodCall(call) = expression
+            && call.method == "unwrap"
+        {
+            *expression = (*call.receiver).clone();
+        }
+        visit_mut::visit_expr_mut(self, expression);
+    }
 }

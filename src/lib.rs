@@ -10,18 +10,15 @@ pub mod protocol;
 pub mod scoring;
 pub mod skins;
 
-#[allow(dead_code)]
-mod skin_contracts {
+pub mod skin_contracts {
     include!(concat!(env!("OUT_DIR"), "/skin_contracts.rs"));
 }
 
-#[allow(dead_code, clippy::unwrap_used, clippy::possible_missing_else)]
-mod game_contracts {
+pub mod game_contracts {
     include!(concat!(env!("OUT_DIR"), "/game_contracts.rs"));
 }
 
-#[allow(dead_code, clippy::unwrap_used, clippy::possible_missing_else)]
-mod point_contracts {
+pub mod point_contracts {
     include!(concat!(env!("OUT_DIR"), "/point_contracts.rs"));
 }
 

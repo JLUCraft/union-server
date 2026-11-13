@@ -45,6 +45,8 @@ tempfile = "3"
 [build-dependencies]
 serde_json = "1"
 typify = "0.6"
+syn = { version = "2", features = ["full", "visit-mut"] }
+prettyplease = "0.2"
 
 [[bin]]
 name = "federated-server"
