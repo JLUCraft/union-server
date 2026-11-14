@@ -20,18 +20,18 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: workspace/federated-server
+        working-directory: workspace/union-server
     steps:
       # Shared contracts come from the sibling central service checkout.
       - uses: actions/checkout@v7
         with:
-          path: workspace/federated-server
+          path: workspace/union-server
 
       - uses: actions/checkout@v7
         with:
-          repository: JLUCraft/federated-skinstation
+          repository: JLUCraft/union-skinstation
           ref: refactor/central-skinstation-p0
-          path: workspace/federated-skinstation
+          path: workspace/union-skinstation
 
       - uses: actions/checkout@v7
         with:
@@ -45,7 +45,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: workspace/federated-server -> target
+          workspaces: workspace/union-server -> target
 
       - name: Check formatting
         run: cargo fmt --check

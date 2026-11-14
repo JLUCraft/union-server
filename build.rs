@@ -3,7 +3,7 @@ use syn::visit_mut::{self, VisitMut};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let contracts = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?)
-        .join("../federated-skinstation/shared/contracts");
+        .join("../union-skinstation/shared/contracts");
     for (filename, root, output) in [
         ("session-profile", None, "skin_contracts.rs"),
         ("league", Some("GameScoringSession"), "game_contracts.rs"),

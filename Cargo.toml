@@ -1,12 +1,12 @@
 [package]
-name = "federated-server"
-default-run = "federated-server"
+name = "union-server"
+default-run = "union-server"
 version = "0.2.0"
 edition = "2024"
 authors = ["JLUCraft"]
 description = "Central Minecraft gateway with skin station scoring and activity adapters"
 license = "GPL-3.0-only"
-repository = "https://github.com/JLUCraft/federated-server"
+repository = "https://github.com/JLUCraft/union-server"
 publish = false
 
 [dependencies]
@@ -54,7 +54,7 @@ syn = { version = "2", features = ["full", "visit-mut"] }
 prettyplease = "0.2"
 
 [[bin]]
-name = "federated-server"
+name = "union-server"
 path = "src/main.rs"
 
 [target.'cfg(target_os = "linux")'.dependencies]

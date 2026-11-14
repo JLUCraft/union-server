@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use federated_server::runtime::{Config, Host};
 use std::path::PathBuf;
+use union_server::runtime::{Config, Host};
 
 #[derive(Parser)]
 #[command(version, about = "JLUCraft central Minecraft game host")]
@@ -48,8 +48,8 @@ async fn main() -> Result<()> {
         .init();
     match Args::parse().command {
         Command::Supervise { config } => {
-            let supervisor = federated_server::operations::Supervisor::start(
-                federated_server::operations::Config::load(&config)?,
+            let supervisor = union_server::operations::Supervisor::start(
+                union_server::operations::Config::load(&config)?,
             )
             .await?;
             tracing::info!(address = %supervisor.address()?, "operations supervisor listening");

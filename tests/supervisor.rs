@@ -2,14 +2,6 @@
 
 use minecraftd::instance::server::DEFAULT_GRACEFUL_STOP_TIMEOUT_SECS;
 
-use federated_server::{
-    operation_contracts::{
-        OPERATIONS_CLAIM_HEADER, OPERATIONS_LEASE_SECONDS, OPERATIONS_SCOPE_HEADER,
-        OperationsAlert, OperationsDispatch, OperationsJob, OperationsJobPage, OperationsJobState,
-        OperationsLogPage, OperationsObservation, OperationsSnapshot,
-    },
-    operations::{Config, Supervisor},
-};
 use reqwest::{Client, StatusCode};
 use serde_json::json;
 use std::{
@@ -21,6 +13,14 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Notify;
+use union_server::{
+    operation_contracts::{
+        OPERATIONS_CLAIM_HEADER, OPERATIONS_LEASE_SECONDS, OPERATIONS_SCOPE_HEADER,
+        OperationsAlert, OperationsDispatch, OperationsJob, OperationsJobPage, OperationsJobState,
+        OperationsLogPage, OperationsObservation, OperationsSnapshot,
+    },
+    operations::{Config, Supervisor},
+};
 
 const JOB_WAIT: Duration = Duration::from_secs(DEFAULT_GRACEFUL_STOP_TIMEOUT_SECS + 5);
 const JOB_INTERVAL: Duration = Duration::from_millis(20);
@@ -901,7 +901,7 @@ async fn scoped_backups_survive_encrypted_transfer_and_transactional_restore() -
         .send()
         .await?
         .error_for_status()?
-        .json::<federated_server::operation_contracts::OperationsBackupPage>()
+        .json::<union_server::operation_contracts::OperationsBackupPage>()
         .await?;
     assert!(other.backups.is_empty());
     std::fs::write(world.join("data"), b"changed\n")?;
@@ -931,7 +931,7 @@ async fn scoped_backups_survive_encrypted_transfer_and_transactional_restore() -
         .await?;
     assert!(matches!(
         prepared_state.instances[0].state,
-        federated_server::operation_contracts::OperationsInstanceState::Running
+        union_server::operation_contracts::OperationsInstanceState::Running
     ));
     std::fs::write(world.join("data"), b"latest\n")?;
     let denied = perform(
@@ -1031,7 +1031,7 @@ async fn scoped_backups_survive_encrypted_transfer_and_transactional_restore() -
         .send()
         .await?
         .error_for_status()?
-        .json::<federated_server::operation_contracts::OperationsBackupPage>()
+        .json::<union_server::operation_contracts::OperationsBackupPage>()
         .await?;
     assert_eq!(retained.backups.len(), 2);
     std::fs::write(world.join("oversized"), vec![0u8; 2 * 1024 * 1024])?;
@@ -1056,7 +1056,7 @@ async fn scoped_backups_survive_encrypted_transfer_and_transactional_restore() -
         .await?;
     assert!(matches!(
         snapshot.instances[0].state,
-        federated_server::operation_contracts::OperationsInstanceState::Running
+        union_server::operation_contracts::OperationsInstanceState::Running
     ));
     stop.notify_one();
     supervisor_task.await??;

@@ -1373,7 +1373,7 @@ mod tests {
             directory: directory.path().join("instance"),
             backend: "127.0.0.1:25565".parse()?,
             server: ServerConfig {
-                start_command: "/nonexistent/federated-room-test".into(),
+                start_command: "/nonexistent/union-room-test".into(),
                 server_type: "minecraft/java".into(),
                 ..Default::default()
             },
@@ -1469,7 +1469,7 @@ mod tests {
                     directory: directory.path().join("instance"),
                     backend: "127.0.0.1:25565".parse()?,
                     server: ServerConfig {
-                        start_command: "/nonexistent/federated-room-network-test".into(),
+                        start_command: "/nonexistent/union-room-network-test".into(),
                         ..Default::default()
                     },
                 }],

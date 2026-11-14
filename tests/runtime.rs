@@ -5,7 +5,6 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
-use federated_server::runtime::{Config, Host};
 use serde_json::{Value, json};
 use std::{
     path::Path,
@@ -13,6 +12,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Mutex;
+use union_server::runtime::{Config, Host};
 const SESSION: &str = "host-session-token-abcdefghijklmnopqrstuvwxyz";
 const PAPER: &str = "paper-token-for-runtime-abcdefghijklmnopqrstuvwxyz";
 #[derive(Clone, Default)]
@@ -123,7 +123,7 @@ async fn central_host_delivers_reports_drains_on_close_and_recovers_from_partial
         204
     );
     let contract: Value = serde_json::from_str(include_str!(
-        "../../federated-skinstation/shared/contracts/points.schema.json"
+        "../../union-skinstation/shared/contracts/points.schema.json"
     ))?;
     let slice = contract["definitions"]["ActivityLimits"]["properties"]["sliceMs"]["const"]
         .as_u64()
@@ -162,7 +162,7 @@ async fn central_host_delivers_reports_drains_on_close_and_recovers_from_partial
     write(&path, &value)?;
     assert!(matches!(
         Host::start(Config::load(&path)?).await,
-        Err(federated_server::Error::Service {
+        Err(union_server::Error::Service {
             service: "activity_oracle",
             ..
         })
@@ -192,11 +192,11 @@ async fn central_host_delivers_reports_drains_on_close_and_recovers_from_partial
     let denied = Host::start(Config::load(&path)?).await?;
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(3), denied.run()).await?,
-        Err(federated_server::Error::ServiceStopped("league_proxy"))
+        Err(union_server::Error::ServiceStopped("league_proxy"))
     ));
     assert!(matches!(
         denied.close().await,
-        Err(federated_server::Error::Service {
+        Err(union_server::Error::Service {
             service: "league_proxy",
             ..
         })

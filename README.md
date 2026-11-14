@@ -1,11 +1,11 @@
-# Federated Server
+# Union Server
 
 The JLUCraft central Minecraft game host: encrypted native connections, Paper
 scoring, and measured activity delivery through the skin station.
 
 The skin station owns accounts, permissions, league state, organization workflows,
 AI jobs, and points. This host consumes generated central contracts. Keep the
-sibling `federated-skinstation` checkout available when building.
+sibling `union-skinstation` checkout available when building.
 
 Scoring now uses the skin station's league service. The local Paper adapter
 exposes `GET /v1/session/:id`, `POST /v1/score`, and `POST /v1/finish`.
@@ -28,8 +28,8 @@ Central operations use a separate supervisor process controlled through the skin
 
 `services.league_proxy.config` configures a standalone TCP listener. It uses a
 Yggdrasil session for the league's designated host account; the credential file
-is read on every central request. It does not publish a federation game service
-or require a federation node. Start the waiting and arena Paper processes
+is read on every central request. It does not publish a separate directory service
+or require additional nodes. Start the waiting and arena Paper processes
 separately before using the gateway.
 
 ```json
@@ -141,7 +141,7 @@ Run the executor as a separate process so it remains available when the managed
 game host stops:
 
 ```sh
-federated-server supervise --config /srv/jlucraft/supervisor.json
+union-server supervise --config /srv/jlucraft/supervisor.json
 ```
 
 ```json
@@ -161,7 +161,7 @@ federated-server supervise --config /srv/jlucraft/supervisor.json
   "artifact_origins": ["https://artifacts.example.org"],
   "profiles": {
     "gateway": {
-      "start_command": "bin/federated-server run --config host.json",
+      "start_command": "bin/union-server run --config host.json",
       "stop_command": "",
       "kind": "service",
       "readiness": {
